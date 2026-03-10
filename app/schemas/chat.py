@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str | None = None
+    messages: list[ChatMessage]
+    stream: bool = False
+    conversation_id: str | None = None
+    kb_ids: list[str] | None = None
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    fusion_mode: str | None = None
+    alpha: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class SourceItem(BaseModel):
+    source_location: str
+    content: str
+    score: float
+
+
+class ChatCompletionResponseMessage(BaseModel):
+    role: str = "assistant"
+    content: str
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int = 0
+    message: ChatCompletionResponseMessage
+    finish_reason: str = "stop"
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    model: str
+    conversation_id: str
+    choices: list[ChatCompletionChoice]
+    sources: list[SourceItem]
