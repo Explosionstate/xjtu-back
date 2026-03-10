@@ -12,3 +12,5 @@ rank-bm25>=0.2.2
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
 email-validator>=2.2.0
+sentence-transformers>=3.0.0
+swagger-ui-bundle>=1.1.0

@@ -8,6 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.document import DocumentChunk
+from app.models.knowledge_base import KnowledgeBase
+from app.services.embedding_service import embed_query
 from app.vectorstore.chroma_manager import search_similar_chunks
 
 
@@ -85,8 +87,21 @@ def hybrid_retrieve(
     dense_scores: dict[str, float] = {}
     dense_ranked: list[str] = []
     chunk_cache = {row.id: row for row in chunk_rows}
+    kb_model_map = {
+        item.id: item.embedding_model
+        for item in db.scalars(
+            select(KnowledgeBase).where(KnowledgeBase.id.in_(kb_ids))
+        ).all()
+    }
     for kb_id in kb_ids:
-        for item in search_similar_chunks(kb_id=kb_id, query=query, top_k=top_k * 2):
+        model_name = kb_model_map.get(kb_id, "bge-small-zh-v1.5")
+        query_embedding = embed_query(query=query, model_name=model_name)
+        for item in search_similar_chunks(
+            kb_id=kb_id,
+            query=query,
+            top_k=top_k * 2,
+            query_embedding=query_embedding,
+        ):
             chunk_id = item["chunk_id"]
             if chunk_id in chunk_cache:
                 dense_scores[chunk_id] = max(

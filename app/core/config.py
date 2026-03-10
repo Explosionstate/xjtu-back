@@ -28,12 +28,20 @@ class Settings:
     llm_model: str
     llm_temperature: float
     llm_enabled: bool
+    embedding_model_root: Path | None
+    local_modules_root: Path | None
+    chat_stream_delay_ms: int
+    default_log_retention_days: int
 
 
 def get_settings() -> Settings:
     project_root = Path(__file__).resolve().parents[2]
+    workspace_root = project_root.parent
     data_root = project_root / "data"
     data_root.mkdir(parents=True, exist_ok=True)
+
+    embedding_root_raw = os.getenv("EMBEDDING_MODEL_ROOT")
+    local_modules_raw = os.getenv("LOCAL_MODULES_ROOT")
 
     return Settings(
         app_name=os.getenv("APP_NAME", "xjtu-back"),
@@ -65,6 +73,14 @@ def get_settings() -> Settings:
         llm_model=os.getenv("LLM_MODEL", "qwen3.5-plus"),
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
         llm_enabled=os.getenv("LLM_ENABLED", "true").lower() in {"1", "true", "yes"},
+        embedding_model_root=Path(embedding_root_raw)
+        if embedding_root_raw
+        else (workspace_root / "local_modules" / "models"),
+        local_modules_root=Path(local_modules_raw)
+        if local_modules_raw
+        else (workspace_root / "local_modules"),
+        chat_stream_delay_ms=int(os.getenv("CHAT_STREAM_DELAY_MS", "10")),
+        default_log_retention_days=int(os.getenv("DEFAULT_LOG_RETENTION_DAYS", "30")),
     )
 
 

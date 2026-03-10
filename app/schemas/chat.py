@@ -18,6 +18,8 @@ class ChatCompletionRequest(BaseModel):
     score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     fusion_mode: str | None = None
     alpha: float | None = Field(default=None, ge=0.0, le=1.0)
+    context_max_rounds: int | None = Field(default=None, ge=1, le=100)
+    context_max_tokens: int | None = Field(default=None, ge=100, le=16000)
 
 
 class SourceItem(BaseModel):

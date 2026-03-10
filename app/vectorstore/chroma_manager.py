@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from app.core.config import settings
 
@@ -37,11 +37,19 @@ def upsert_chunks(
     chunk_ids: list[str],
     texts: list[str],
     metadatas: list[dict[str, Any]],
+    embeddings: list[list[float]] | None = None,
 ) -> None:
     collection = _get_collection(kb_id)
     if collection is None or not chunk_ids:
         return
-    collection.upsert(ids=chunk_ids, documents=texts, metadatas=metadatas)
+    payload: dict[str, Any] = {
+        "ids": chunk_ids,
+        "documents": texts,
+        "metadatas": cast(Any, metadatas),
+    }
+    if embeddings is not None:
+        payload["embeddings"] = embeddings
+    collection.upsert(**payload)
 
 
 def delete_chunks_by_document(kb_id: str, document_id: str) -> None:
@@ -51,15 +59,29 @@ def delete_chunks_by_document(kb_id: str, document_id: str) -> None:
     collection.delete(where={"document_id": document_id})
 
 
-def search_similar_chunks(kb_id: str, query: str, top_k: int) -> list[dict[str, Any]]:
+def search_similar_chunks(
+    kb_id: str,
+    query: str,
+    top_k: int,
+    query_embedding: list[float] | None = None,
+) -> list[dict[str, Any]]:
     collection = _get_collection(kb_id)
     if collection is None:
         return []
-    result = collection.query(query_texts=[query], n_results=top_k)
-    ids = result.get("ids", [[]])[0]
-    docs = result.get("documents", [[]])[0]
-    distances = result.get("distances", [[]])[0]
-    metadatas = result.get("metadatas", [[]])[0]
+    query_payload: dict[str, Any] = {"n_results": top_k}
+    if query_embedding is not None:
+        query_payload["query_embeddings"] = [query_embedding]
+    else:
+        query_payload["query_texts"] = [query]
+    result = collection.query(**query_payload)
+    ids_all = result.get("ids") or [[]]
+    docs_all = result.get("documents") or [[]]
+    distances_all = result.get("distances") or [[]]
+    metadatas_all = result.get("metadatas") or [[]]
+    ids = ids_all[0]
+    docs = docs_all[0]
+    distances = distances_all[0]
+    metadatas = metadatas_all[0]
     items: list[dict[str, Any]] = []
     for idx, chunk_id in enumerate(ids):
         dist = float(distances[idx]) if idx < len(distances) else 1.0

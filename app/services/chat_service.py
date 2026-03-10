@@ -12,7 +12,13 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
 from app.schemas.chat import ChatCompletionRequest, SourceItem
 from app.services.llm_service import answer_with_llm
+from app.services.retrieval_config_service import get_effective_retrieval_config
 from app.services.retrieval_service import hybrid_retrieve
+from app.services.system_config_service import (
+    DEFAULT_CONTEXT_MAX_ROUNDS,
+    DEFAULT_CONTEXT_MAX_TOKENS,
+    get_int_config,
+)
 
 
 def _get_latest_user_question(messages: list[dict]) -> str:
@@ -43,6 +49,37 @@ def _format_rule_answer(question: str) -> str | None:
     return None
 
 
+def _estimate_tokens(text: str) -> int:
+    # Lightweight token estimation for mixed Chinese/English text.
+    return max(1, len(text) // 2)
+
+
+def _truncate_history(
+    history: list[Message], max_rounds: int, max_tokens: int
+) -> list[Message]:
+    if not history:
+        return []
+    kept: list[Message] = []
+    token_sum = 0
+    max_messages = max_rounds * 2
+    for msg in reversed(history):
+        tokens = _estimate_tokens(msg.content)
+        if kept and (len(kept) >= max_messages or token_sum + tokens > max_tokens):
+            break
+        kept.append(msg)
+        token_sum += tokens
+    return list(reversed(kept))
+
+
+def _build_retrieval_query(history: list[Message], question: str) -> str:
+    if not history:
+        return question
+    snippets = [item.content for item in history[-4:] if item.content.strip()]
+    if not snippets:
+        return question
+    return "\n".join(snippets + [question])
+
+
 def chat_completion(
     db: Session,
     payload: ChatCompletionRequest,
@@ -56,20 +93,44 @@ def chat_completion(
             select(KnowledgeBase).where(KnowledgeBase.status == "active")
         ).all()
     ]
-    top_k = payload.top_k or settings.retrieval_top_k
-    score_threshold = (
-        payload.score_threshold
-        if payload.score_threshold is not None
-        else settings.retrieval_score_threshold
+    retrieval_config = get_effective_retrieval_config(
+        db=db,
+        conversation_id=conversation_id,
+        payload_top_k=payload.top_k,
+        payload_score_threshold=payload.score_threshold,
+        payload_fusion_mode=payload.fusion_mode,
+        payload_alpha=payload.alpha,
     )
-    fusion_mode = payload.fusion_mode or settings.retrieval_fusion_mode
-    alpha = payload.alpha if payload.alpha is not None else settings.retrieval_alpha
+    top_k = int(retrieval_config["retrieval_top_k"])
+    score_threshold = float(retrieval_config["score_threshold"])
+    fusion_mode = str(retrieval_config["fusion_mode"])
+    alpha = float(retrieval_config["alpha"])
+
+    configured_max_rounds = get_int_config(
+        db, "context_max_rounds", DEFAULT_CONTEXT_MAX_ROUNDS
+    )
+    configured_max_tokens = get_int_config(
+        db, "context_max_tokens", DEFAULT_CONTEXT_MAX_TOKENS
+    )
+    max_rounds = payload.context_max_rounds or configured_max_rounds
+    max_tokens = payload.context_max_tokens or configured_max_tokens
 
     _ensure_conversation(
         db=db,
         conversation_id=conversation_id,
         user_id=current_user.id if current_user else None,
     )
+    history = list(
+        db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+        ).all()
+    )
+    trimmed_history = _truncate_history(
+        history=history, max_rounds=max_rounds, max_tokens=max_tokens
+    )
+    retrieval_query = _build_retrieval_query(trimmed_history, question)
 
     start = perf_counter()
     rule_answer = _format_rule_answer(question)
@@ -79,7 +140,7 @@ def chat_completion(
     else:
         retrieved = hybrid_retrieve(
             db=db,
-            query=question,
+            query=retrieval_query,
             kb_ids=kb_ids,
             top_k=top_k,
             score_threshold=score_threshold,
@@ -123,5 +184,23 @@ def chat_completion(
         )
     )
     db.commit()
+
+    refreshed_history = list(
+        db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+        ).all()
+    )
+    trimmed_after = _truncate_history(
+        history=refreshed_history, max_rounds=max_rounds, max_tokens=max_tokens
+    )
+    keep_ids = {item.id for item in trimmed_after}
+    if keep_ids:
+        db.query(Message).filter(
+            Message.conversation_id == conversation_id,
+            ~Message.id.in_(keep_ids),
+        ).delete(synchronize_session=False)
+        db.commit()
 
     return conversation_id, answer, sources

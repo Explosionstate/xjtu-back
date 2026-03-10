@@ -50,3 +50,18 @@ class ChatLog(Base):
     score_threshold: Mapped[float] = mapped_column(Float, default=0.0)
     elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ConversationSetting(Base):
+    __tablename__ = "conversation_settings"
+
+    conversation_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    retrieval_top_k: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    score_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fusion_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    alpha: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
