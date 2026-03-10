@@ -184,8 +184,15 @@ python scripts/ops.py stop --port 8000
 ### 自动化测试
 
 - 最小回归测试文件：`tests/test_api_smoke.py`
-- 覆盖链路：登录、建库、上传、检索调试、问答、日志查询、批量删文档、删知识库
+- 覆盖链路（逻辑删除主流程）：登录、建库、上传、检索调试、问答、日志查询、批量删文档、逻辑删知识库
+- 物理删除专项：`tests/test_api_physical_delete.py`（验证物理删除+异步兜底）
 - 运行：`pytest -q`
+
+### 物理删除异步兜底
+
+- `DELETE /knowledge-bases/{kb_id}?physical=true` 会优先尝试立即删除向量目录。
+- 若遇到 Windows 文件锁，会返回 `cleanup_queued=true`，并将目录清理任务入队后台重试。
+- 知识库数据库记录会先删除，向量目录由后台任务最终清理。
 
 ## 快速示例
 

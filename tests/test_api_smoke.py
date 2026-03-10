@@ -104,7 +104,7 @@ def test_login_upload_chat_logs_flow() -> None:
 
         delete_kb = client.delete(
             f"/knowledge-bases/{kb_id}",
-            params={"physical": True},
+            params={"physical": False},
             headers=headers,
         )
         assert delete_kb.status_code == 200, delete_kb.text

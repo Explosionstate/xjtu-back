@@ -101,10 +101,10 @@ def search_similar_chunks(
     return items
 
 
-def delete_kb_vectorstore(kb_id: str) -> None:
+def delete_kb_vectorstore(kb_id: str, raise_on_failure: bool = True) -> bool:
     target_dir = kb_vectorstore_path(kb_id)
     if not target_dir.exists():
-        return
+        return True
 
     def _onerror(func, path, exc_info):
         # Windows may keep files readonly/locked briefly.
@@ -118,14 +118,15 @@ def delete_kb_vectorstore(kb_id: str) -> None:
     for _ in range(6):
         try:
             shutil.rmtree(target_dir, onerror=_onerror)
-            return
+            return True
         except PermissionError as exc:
             last_error = exc
             gc.collect()
             time.sleep(0.2)
 
-    if last_error is not None:
+    if last_error is not None and raise_on_failure:
         raise last_error
+    return False
 
 
 def clone_kb_vectorstore(source_kb_id: str, target_kb_id: str) -> None:

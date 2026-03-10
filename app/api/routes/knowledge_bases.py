@@ -93,8 +93,8 @@ def delete_kb(
     physical: bool = Query(default=False),
     _: object = Depends(require_roles("super_admin", "kb_admin")),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
-    delete_knowledge_base(
+) -> dict[str, str | bool]:
+    cleanup_queued = delete_knowledge_base(
         db=db, kb_id=kb_id, payload=KnowledgeBaseDeleteRequest(physical=physical)
     )
-    return {"status": "ok"}
+    return {"status": "ok", "cleanup_queued": cleanup_queued}

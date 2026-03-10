@@ -20,6 +20,7 @@ from app.vectorstore.chroma_manager import (
     delete_kb_vectorstore,
     ensure_kb_vectorstore,
 )
+from app.services.vectorstore_cleanup_service import enqueue_vectorstore_cleanup
 
 
 def create_knowledge_base(
@@ -116,7 +117,7 @@ def update_knowledge_base(
 
 def delete_knowledge_base(
     db: Session, kb_id: str, payload: KnowledgeBaseDeleteRequest
-) -> None:
+) -> bool:
     kb = db.get(KnowledgeBase, kb_id)
     if kb is None:
         raise BusinessError("知识库不存在", status_code=404)
@@ -130,11 +131,15 @@ def delete_knowledge_base(
         )
 
     if payload.physical:
-        delete_kb_vectorstore(kb_id)
+        cleanup_queued = not delete_kb_vectorstore(kb_id, raise_on_failure=False)
+        if cleanup_queued:
+            enqueue_vectorstore_cleanup(kb_id)
         db.delete(kb)
     else:
         kb.status = "deleted"
+        cleanup_queued = False
     db.commit()
+    return cleanup_queued
 
 
 def clone_knowledge_base(

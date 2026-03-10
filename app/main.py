@@ -20,6 +20,7 @@ from app.db.session import SessionLocal
 from app.services.auth_service import bootstrap_rbac
 from app.services.log_cleanup_service import run_periodic_log_cleanup
 from app.services.system_config_service import bootstrap_system_config
+from app.services.vectorstore_cleanup_service import run_periodic_vectorstore_cleanup
 from app import models  # noqa: F401
 
 
@@ -28,6 +29,7 @@ def create_app() -> FastAPI:
     app.openapi_version = "3.0.3"
     cleanup_stop = Event()
     cleanup_thread: Thread | None = None
+    vector_cleanup_thread: Thread | None = None
 
     register_exception_handlers(app)
     app.include_router(api_router)
@@ -40,7 +42,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def startup() -> None:
-        nonlocal cleanup_thread
+        nonlocal cleanup_thread, vector_cleanup_thread
         settings.chroma_root.mkdir(parents=True, exist_ok=True)
         settings.docs_root.mkdir(parents=True, exist_ok=True)
         Base.metadata.create_all(bind=engine)
@@ -58,11 +60,20 @@ def create_app() -> FastAPI:
         )
         cleanup_thread.start()
 
+        vector_cleanup_thread = Thread(
+            target=run_periodic_vectorstore_cleanup,
+            kwargs={"stop_event": cleanup_stop, "interval_seconds": 20},
+            daemon=True,
+        )
+        vector_cleanup_thread.start()
+
     @app.on_event("shutdown")
     def shutdown() -> None:
         cleanup_stop.set()
         if cleanup_thread and cleanup_thread.is_alive():
             cleanup_thread.join(timeout=2)
+        if vector_cleanup_thread and vector_cleanup_thread.is_alive():
+            vector_cleanup_thread.join(timeout=2)
 
     @app.get("/health")
     def health() -> dict[str, str]:

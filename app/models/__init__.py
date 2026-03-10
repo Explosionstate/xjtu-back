@@ -10,6 +10,7 @@ from app.models.rbac import (
     User,
 )
 from app.models.sys_config import SysConfig
+from app.models.cleanup_task import VectorstoreCleanupTask
 
 __all__ = [
     "KnowledgeBase",
@@ -26,4 +27,5 @@ __all__ = [
     "SysUserRole",
     "AuthLoginAttempt",
     "SysConfig",
+    "VectorstoreCleanupTask",
 ]
