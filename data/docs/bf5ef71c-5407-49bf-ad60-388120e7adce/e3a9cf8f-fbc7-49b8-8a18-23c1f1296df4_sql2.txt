@@ -1,0 +1,60 @@
+-- V20260309__backend_hardening.sql
+-- 目标库：springboot_demo
+-- 注意：执行前请备份数据库；涉及外键变更时请确认现存数据满足约束。
+
+USE springboot_demo;
+
+-- 1) 扩展 password 长度（BCrypt + 未来扩展更安全）
+ALTER TABLE `user`  MODIFY COLUMN `password` VARCHAR(255) NULL COMMENT 'BCrypt hash or legacy';
+-- users 表若存在
+ALTER TABLE `users` MODIFY COLUMN `password` VARCHAR(255) NULL COMMENT 'BCrypt hash or legacy';
+
+-- 2) advater -> avatar 兼容迁移：新增 avatar 列并回填（保留 advater 以兼容老数据）
+-- 若 avatar 已存在会报错；如你需要更稳健，可改用 information_schema + PREPARE 动态判断。
+ALTER TABLE `user`
+  ADD COLUMN `avatar` VARCHAR(512) NULL COMMENT '头像' AFTER `advater`;
+
+UPDATE `user`
+SET `avatar` = `advater`
+WHERE `avatar` IS NULL AND `advater` IS NOT NULL;
+
+-- 3) course.teacher_id 外键规范化：引用  users.id 
+-- 如你之前生成的 DDL 中 fk 名不同，请按实际 fk 名调整。
+-- 先尝试删除旧外键（可能不存在）
+-- ALTER TABLE `course` DROP FOREIGN KEY `fk_course_teacher_user`;
+
+-- 新增外键（要求 users 表存在）
+ALTER TABLE `course`
+  ADD INDEX `idx_course_teacher_id` (`teacher_id`);
+
+ALTER TABLE `course`
+  ADD CONSTRAINT `fk_course_teacher_users`
+  FOREIGN KEY (`teacher_id`) REFERENCES `users`(`id`)
+  ON UPDATE RESTRICT ON DELETE RESTRICT;
+
+-- 4) 审计表（若不存在则创建）
+CREATE TABLE IF NOT EXISTS `sys_audit_log` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+  `actor_type` VARCHAR(32) NULL COMMENT '操作者类型：admin/biz/anonymous',
+  `actor_id` BIGINT NULL COMMENT '操作者ID',
+  `request_method` VARCHAR(16) NULL COMMENT 'HTTP方法',
+  `request_path` VARCHAR(255) NULL COMMENT '请求路径',
+  `success` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否成功',
+  `error_message` VARCHAR(512) NULL COMMENT '错误摘要',
+  `cost_ms` INT NULL COMMENT '耗时ms',
+  `gmt_created` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (`id`),
+  INDEX `idx_audit_actor` (`actor_type`, `actor_id`),
+  INDEX `idx_audit_path` (`request_path`),
+  INDEX `idx_audit_created` (`gmt_created`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='审计日志';
+
+-- 5) JSON 索引：生成列 + 索引（要求 chapters/materials/task_points 为 JSON）
+-- 如列不是 JSON，请先 ALTER TABLE course MODIFY chapters JSON ... 再执行。
+ALTER TABLE `course`
+  ADD COLUMN `chapters_count` INT GENERATED ALWAYS AS (JSON_LENGTH(`chapters`)) STORED COMMENT '章节数(生成列)',
+  ADD COLUMN `materials_count` INT GENERATED ALWAYS AS (JSON_LENGTH(`materials`)) STORED COMMENT '资料数(生成列)',
+  ADD COLUMN `task_points_count` INT GENERATED ALWAYS AS (JSON_LENGTH(`task_points`)) STORED COMMENT '任务点数(生成列)',
+  ADD INDEX `idx_course_chapters_count` (`chapters_count`),
+  ADD INDEX `idx_course_materials_count` (`materials_count`),
+  ADD INDEX `idx_course_task_points_count` (`task_points_count`);
