@@ -11,7 +11,7 @@ from app.db.base import Base
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     login_name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     password: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(32), default="user", index=True)
@@ -32,7 +32,7 @@ class SysRole(Base):
     __tablename__ = "sys_role"
 
     role_id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True
+        Integer, primary_key=True, autoincrement=True
     )
     role_code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     role_name: Mapped[str] = mapped_column(String(128))
@@ -53,7 +53,7 @@ class SysPermission(Base):
     __tablename__ = "sys_permission"
 
     perm_id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True
+        Integer, primary_key=True, autoincrement=True
     )
     perm_code: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     perm_name: Mapped[str] = mapped_column(String(255))
@@ -75,10 +75,10 @@ class SysRolePermission(Base):
     __tablename__ = "sys_role_permission"
 
     role_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("sys_role.role_id", ondelete="CASCADE"), primary_key=True
+        Integer, ForeignKey("sys_role.role_id", ondelete="CASCADE"), primary_key=True
     )
     perm_id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         ForeignKey("sys_permission.perm_id", ondelete="CASCADE"),
         primary_key=True,
     )
@@ -91,10 +91,10 @@ class SysUserRole(Base):
     __tablename__ = "sys_user_role"
 
     users_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     role_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("sys_role.role_id", ondelete="CASCADE"), primary_key=True
+        Integer, ForeignKey("sys_role.role_id", ondelete="CASCADE"), primary_key=True
     )
 
     user: Mapped[User] = relationship(back_populates="user_roles")
