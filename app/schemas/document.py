@@ -44,3 +44,7 @@ class SplitPreviewResponse(BaseModel):
 class ReindexRequest(BaseModel):
     chunk_size: int | None = Field(default=None, ge=100, le=4000)
     chunk_overlap: int | None = Field(default=None, ge=0, le=1000)
+
+
+class DocumentBatchDeleteRequest(BaseModel):
+    document_ids: list[str] = Field(default_factory=list, min_length=1)

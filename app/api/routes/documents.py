@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import require_roles
 from app.db.session import get_db
 from app.schemas.document import (
+    DocumentBatchDeleteRequest,
     DocumentItem,
     DocumentListResponse,
     DocumentPreviewResponse,
@@ -15,6 +16,7 @@ from app.schemas.document import (
 )
 from app.services.document_service import (
     delete_document,
+    delete_documents_batch,
     get_document_preview,
     list_documents,
     reindex_document,
@@ -121,3 +123,18 @@ def delete_doc(
 ) -> dict[str, str]:
     delete_document(db=db, kb_id=kb_id, document_id=document_id)
     return {"status": "ok"}
+
+
+@router.post("/batch-delete")
+def batch_delete_docs(
+    kb_id: str,
+    payload: DocumentBatchDeleteRequest,
+    _: object = Depends(require_roles("super_admin", "kb_admin")),
+    db: Session = Depends(get_db),
+) -> dict[str, int]:
+    deleted = delete_documents_batch(
+        db=db,
+        kb_id=kb_id,
+        document_ids=payload.document_ids,
+    )
+    return {"deleted": deleted}

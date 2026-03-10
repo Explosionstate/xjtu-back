@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import gc
+import os
 import shutil
+import stat
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -99,8 +103,29 @@ def search_similar_chunks(
 
 def delete_kb_vectorstore(kb_id: str) -> None:
     target_dir = kb_vectorstore_path(kb_id)
-    if target_dir.exists():
-        shutil.rmtree(target_dir)
+    if not target_dir.exists():
+        return
+
+    def _onerror(func, path, exc_info):
+        # Windows may keep files readonly/locked briefly.
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+
+    last_error: Exception | None = None
+    for _ in range(6):
+        try:
+            shutil.rmtree(target_dir, onerror=_onerror)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            gc.collect()
+            time.sleep(0.2)
+
+    if last_error is not None:
+        raise last_error
 
 
 def clone_kb_vectorstore(source_kb_id: str, target_kb_id: str) -> None:

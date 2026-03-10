@@ -138,3 +138,10 @@ def bootstrap_system_config(db: Session) -> None:
         value_type="int",
         description="对话日志默认保留天数",
     )
+    upsert_system_config(
+        db=db,
+        config_key="sensitive_words",
+        config_value="",
+        value_type="string",
+        description="敏感词列表，逗号分隔",
+    )

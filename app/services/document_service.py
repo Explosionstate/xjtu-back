@@ -201,6 +201,24 @@ def delete_document(db: Session, kb_id: str, document_id: str) -> None:
     db.commit()
 
 
+def delete_documents_batch(db: Session, kb_id: str, document_ids: list[str]) -> int:
+    deleted = 0
+    for document_id in document_ids:
+        doc = db.get(Document, document_id)
+        if doc is None or doc.kb_id != kb_id:
+            continue
+        delete_chunks_by_document(kb_id=kb_id, document_id=document_id)
+        db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == document_id
+        ).delete()
+        if doc.file_path and Path(doc.file_path).exists():
+            Path(doc.file_path).unlink(missing_ok=True)
+        db.delete(doc)
+        deleted += 1
+    db.commit()
+    return deleted
+
+
 def reindex_document(
     db: Session,
     kb_id: str,
@@ -211,6 +229,9 @@ def reindex_document(
     doc = db.get(Document, document_id)
     if doc is None or doc.kb_id != kb_id:
         raise BusinessError("文档不存在", status_code=404)
+    kb = db.get(KnowledgeBase, kb_id)
+    if kb is None or kb.status == "deleted":
+        raise BusinessError("知识库不存在", status_code=404)
     text = _extract_text_from_path(Path(doc.file_path), f".{doc.file_type}")
     target_chunk_size = chunk_size or settings.default_chunk_size
     target_chunk_overlap = chunk_overlap or settings.default_chunk_overlap

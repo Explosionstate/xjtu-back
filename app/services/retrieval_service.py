@@ -62,11 +62,32 @@ def hybrid_retrieve(
     fusion_mode: str,
     alpha: float,
 ) -> list[dict]:
+    results, _ = hybrid_retrieve_with_debug(
+        db=db,
+        query=query,
+        kb_ids=kb_ids,
+        top_k=top_k,
+        score_threshold=score_threshold,
+        fusion_mode=fusion_mode,
+        alpha=alpha,
+    )
+    return results
+
+
+def hybrid_retrieve_with_debug(
+    db: Session,
+    query: str,
+    kb_ids: list[str],
+    top_k: int,
+    score_threshold: float,
+    fusion_mode: str,
+    alpha: float,
+) -> tuple[list[dict], list[dict]]:
     chunk_rows = list(
         db.scalars(select(DocumentChunk).where(DocumentChunk.kb_id.in_(kb_ids))).all()
     )
     if not chunk_rows:
-        return []
+        return [], []
 
     corpus = [row.content for row in chunk_rows]
     corpus_tokens = [_tokenize(text) for text in corpus]
@@ -75,6 +96,7 @@ def hybrid_retrieve(
     bm25_raw_scores = bm25.get_scores(query_tokens)
 
     bm25_scores: dict[str, float] = {}
+    bm25_norm: dict[str, float] = {}
     bm25_ranked: list[str] = []
     for idx, row in enumerate(chunk_rows):
         score = float(bm25_raw_scores[idx])
@@ -85,8 +107,10 @@ def hybrid_retrieve(
             bm25_scores.items(), key=lambda item: item[1], reverse=True
         )[: top_k * 2]
     ]
+    bm25_norm = _normalize_scores(bm25_scores)
 
     dense_scores: dict[str, float] = {}
+    dense_norm: dict[str, float] = {}
     dense_ranked: list[str] = []
     chunk_cache = {row.id: row for row in chunk_rows}
     kb_model_map = {
@@ -115,6 +139,7 @@ def hybrid_retrieve(
             dense_scores.items(), key=lambda item: item[1], reverse=True
         )[: top_k * 2]
     ]
+    dense_norm = _normalize_scores(dense_scores)
 
     if fusion_mode == "rrf":
         fused = _fuse_rrf(bm25_ranked, dense_ranked)
@@ -138,6 +163,12 @@ def hybrid_retrieve(
                 "kb_id": row.kb_id,
                 "content": row.content,
                 "source_location": row.source_location,
+                "bm25_raw": float(bm25_scores.get(chunk_id, 0.0)),
+                "bm25_norm": float(bm25_norm.get(chunk_id, 0.0)),
+                "dense_raw": float(dense_scores.get(chunk_id, 0.0)),
+                "dense_norm": float(dense_norm.get(chunk_id, 0.0)),
+                "fused_score": float(fused.get(chunk_id, 0.0)),
+                "score_before_rerank": float(fused.get(chunk_id, 0.0)),
                 "score": float(fused.get(chunk_id, 0.0)),
             }
         )
@@ -147,7 +178,23 @@ def hybrid_retrieve(
         candidates=results,
         model_name=settings.reranker_model,
     )
+    debug_rows = [
+        {
+            "chunk_id": item["chunk_id"],
+            "document_id": item["document_id"],
+            "source_location": item["source_location"],
+            "bm25_raw": round(float(item.get("bm25_raw", 0.0)), 6),
+            "bm25_norm": round(float(item.get("bm25_norm", 0.0)), 6),
+            "dense_raw": round(float(item.get("dense_raw", 0.0)), 6),
+            "dense_norm": round(float(item.get("dense_norm", 0.0)), 6),
+            "fused_score": round(float(item.get("fused_score", 0.0)), 6),
+            "rerank_score": round(float(item.get("rerank_score", 0.0)), 6),
+            "final_score": round(float(item.get("score", 0.0)), 6),
+            "content": item.get("content", ""),
+        }
+        for item in reranked
+    ]
     filtered = [
         item for item in reranked if float(item.get("score", 0.0)) >= score_threshold
     ]
-    return filtered[:top_k]
+    return filtered[:top_k], debug_rows

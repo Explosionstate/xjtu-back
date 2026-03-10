@@ -14,6 +14,7 @@ from app.schemas.chat import ChatCompletionRequest, SourceItem
 from app.services.llm_service import answer_with_llm
 from app.services.retrieval_config_service import get_effective_retrieval_config
 from app.services.retrieval_service import hybrid_retrieve
+from app.services.sensitive_service import get_sensitive_words, mask_sensitive_text
 from app.services.system_config_service import (
     DEFAULT_CONTEXT_MAX_ROUNDS,
     DEFAULT_CONTEXT_MAX_TOKENS,
@@ -86,6 +87,8 @@ def chat_completion(
     current_user: User | None,
 ) -> tuple[str, str, list[SourceItem]]:
     question = _get_latest_user_question([m.model_dump() for m in payload.messages])
+    sensitive_words = get_sensitive_words(db)
+    question = mask_sensitive_text(question, sensitive_words)
     conversation_id = payload.conversation_id or str(uuid.uuid4())
     kb_ids = payload.kb_ids or [
         item.id
@@ -163,6 +166,7 @@ def chat_completion(
                 )
                 for item in retrieved
             ]
+    answer = mask_sensitive_text(answer, sensitive_words)
 
     if len(answer) > settings.max_answer_chars:
         answer = answer[: settings.max_answer_chars] + "..."
@@ -204,3 +208,36 @@ def chat_completion(
         db.commit()
 
     return conversation_id, answer, sources
+
+
+def clear_conversation_context(db: Session, conversation_id: str) -> int:
+    deleted = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return int(deleted or 0)
+
+
+def rollback_conversation_context(
+    db: Session, conversation_id: str, keep_rounds: int
+) -> int:
+    history = list(
+        db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+        ).all()
+    )
+    if not history:
+        return 0
+
+    keep_messages = max(0, keep_rounds * 2)
+    keep_ids = {item.id for item in history[:keep_messages]}
+    query = db.query(Message).filter(Message.conversation_id == conversation_id)
+    if keep_ids:
+        query = query.filter(~Message.id.in_(keep_ids))
+    deleted = query.delete(synchronize_session=False)
+    db.commit()
+    return int(deleted or 0)

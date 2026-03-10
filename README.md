@@ -76,7 +76,11 @@ python scripts/ops.py stop --port 8000
 - `GET /knowledge-bases/{kb_id}/documents/{document_id}/preview`
 - `POST /knowledge-bases/{kb_id}/documents/{document_id}/reindex`
 - `DELETE /knowledge-bases/{kb_id}/documents/{document_id}`
+- `POST /knowledge-bases/{kb_id}/documents/batch-delete`
 - `POST /chat/completions`
+- `POST /chat/retrieval-debug`（返回融合前后分、重排分）
+- `DELETE /chat/conversations/{conversation_id}/context`
+- `POST /chat/conversations/{conversation_id}/rollback?keep_rounds=2`
 - `WS /ws/chat/completions?token=<access_token>`（WebSocket流式输出）
 - `GET /chat/logs`（按用户/时间/关键词/知识库筛选）
 - `GET /chat/logs/export`（CSV导出）
@@ -157,6 +161,31 @@ python scripts/ops.py stop --port 8000
 - `python scripts/ops.py start --reload`：安全启动
 - `python scripts/ops.py start --reload --force-stop`：自动清理冲突进程后启动
 - `python scripts/ops.py stop --port 8000`：停止占用 8000 的服务
+
+### 敏感词过滤
+
+- 通过系统参数 `sensitive_words` 管理敏感词（逗号分隔）
+- 设置示例：`PUT /system-config/sensitive_words`，值如 `违规词,测试词`
+- 生效范围：用户提问和机器人回答都会做掩码替换
+
+### 自动日志清理
+
+- 服务启动后自动启动后台清理任务（默认每 60 分钟执行一次）
+- 保留天数来自 `log_retention_days`（可通过系统参数调整）
+
+### 检索调试
+
+- 调试接口：`POST /chat/retrieval-debug`
+- 输入：`query`、可选 `kb_ids/top_k/score_threshold/fusion_mode/alpha`
+- 输出：
+  - `top_k_results`：最终入选结果
+  - `all_candidates`：候选全量评分（`bm25_raw/bm25_norm/dense_raw/dense_norm/fused_score/rerank_score/final_score`）
+
+### 自动化测试
+
+- 最小回归测试文件：`tests/test_api_smoke.py`
+- 覆盖链路：登录、建库、上传、检索调试、问答、日志查询、批量删文档、删知识库
+- 运行：`pytest -q`
 
 ## 快速示例
 

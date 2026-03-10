@@ -4,6 +4,7 @@ import uuid
 import asyncio
 
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -18,8 +19,20 @@ from app.schemas.chat import (
     ChatCompletionResponse,
     ChatCompletionResponseMessage,
 )
+from app.schemas.retrieval_debug import (
+    RetrievalDebugRequest,
+    RetrievalDebugResponse,
+    RetrievalDebugScoreItem,
+)
+from app.models.knowledge_base import KnowledgeBase
 from app.services.chat_service import chat_completion
 from app.services.auth_service import get_active_user
+from app.services.chat_service import (
+    clear_conversation_context,
+    rollback_conversation_context,
+)
+from app.services.retrieval_config_service import get_effective_retrieval_config
+from app.services.retrieval_service import hybrid_retrieve_with_debug
 
 router = APIRouter(tags=["chat"])
 
@@ -32,6 +45,86 @@ def chat_completions(
 ) -> ChatCompletionResponse:
     conversation_id, answer, sources = chat_completion(
         db=db, payload=payload, current_user=current_user
+    )
+    return ChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex[:20]}",
+        model=payload.model or "xjtu-hybrid-rag",
+        conversation_id=conversation_id,
+        choices=[
+            ChatCompletionChoice(
+                message=ChatCompletionResponseMessage(content=answer),
+            )
+        ],
+        sources=sources,
+    )
+
+
+@router.delete("/chat/conversations/{conversation_id}/context")
+def clear_context(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+) -> dict[str, int]:
+    _ = current_user
+    deleted = clear_conversation_context(db=db, conversation_id=conversation_id)
+    return {"deleted_messages": deleted}
+
+
+@router.post("/chat/conversations/{conversation_id}/rollback")
+def rollback_context(
+    conversation_id: str,
+    keep_rounds: int = Query(ge=0, default=0),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+) -> dict[str, int]:
+    _ = current_user
+    deleted = rollback_conversation_context(
+        db=db,
+        conversation_id=conversation_id,
+        keep_rounds=keep_rounds,
+    )
+    return {"deleted_messages": deleted, "keep_rounds": keep_rounds}
+
+
+@router.post("/chat/retrieval-debug", response_model=RetrievalDebugResponse)
+def retrieval_debug(
+    payload: RetrievalDebugRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+) -> RetrievalDebugResponse:
+    _ = current_user
+    kb_ids = payload.kb_ids or [
+        item.id
+        for item in db.scalars(
+            select(KnowledgeBase).where(KnowledgeBase.status == "active")
+        ).all()
+    ]
+    cfg = get_effective_retrieval_config(
+        db=db,
+        conversation_id=None,
+        payload_top_k=payload.top_k,
+        payload_score_threshold=payload.score_threshold,
+        payload_fusion_mode=payload.fusion_mode,
+        payload_alpha=payload.alpha,
+    )
+    results, debug_rows = hybrid_retrieve_with_debug(
+        db=db,
+        query=payload.query,
+        kb_ids=kb_ids,
+        top_k=int(cfg["retrieval_top_k"]),
+        score_threshold=float(cfg["score_threshold"]),
+        fusion_mode=str(cfg["fusion_mode"]),
+        alpha=float(cfg["alpha"]),
+    )
+    top_ids = {item["chunk_id"] for item in results}
+    top_rows = [item for item in debug_rows if item["chunk_id"] in top_ids]
+    return RetrievalDebugResponse(
+        top_k_results=[
+            RetrievalDebugScoreItem.model_validate(item) for item in top_rows
+        ],
+        all_candidates=[
+            RetrievalDebugScoreItem.model_validate(item) for item in debug_rows
+        ],
     )
 
 
@@ -79,14 +172,3 @@ async def ws_chat_completions(
         return
     finally:
         db.close()
-    return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex[:20]}",
-        model=payload.model or "xjtu-hybrid-rag",
-        conversation_id=conversation_id,
-        choices=[
-            ChatCompletionChoice(
-                message=ChatCompletionResponseMessage(content=answer),
-            )
-        ],
-        sources=sources,
-    )
