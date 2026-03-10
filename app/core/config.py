@@ -5,6 +5,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Project-level fixed defaults for local deployment.
+FIXED_LOCAL_MODELS_ROOT = Path("D:/xjtu/local_models")
+FIXED_DEFAULT_EMBEDDING_MODEL = "BAAI/bge-base-zh-v1.5"
+FIXED_RERANKER_ENABLED = True
+FIXED_RERANKER_MODEL = "BAAI/bge-reranker-base"
+FIXED_RERANKER_TOP_N = 20
+FIXED_RERANKER_WEIGHT = 0.7
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str
@@ -30,8 +39,13 @@ class Settings:
     llm_enabled: bool
     embedding_model_root: Path | None
     local_modules_root: Path | None
+    local_models_root: Path | None
     chat_stream_delay_ms: int
     default_log_retention_days: int
+    reranker_enabled: bool
+    reranker_model: str
+    reranker_top_n: int
+    reranker_weight: float
 
 
 def get_settings() -> Settings:
@@ -42,6 +56,20 @@ def get_settings() -> Settings:
 
     embedding_root_raw = os.getenv("EMBEDDING_MODEL_ROOT")
     local_modules_raw = os.getenv("LOCAL_MODULES_ROOT")
+    default_local_models = workspace_root / "local_models"
+    default_local_modules = workspace_root / "local_modules"
+
+    if FIXED_LOCAL_MODELS_ROOT.exists():
+        local_models_root: Path | None = FIXED_LOCAL_MODELS_ROOT
+    else:
+        local_models_root = (
+            default_local_models if default_local_models.exists() else None
+        )
+    local_modules_root = (
+        Path(local_modules_raw)
+        if local_modules_raw
+        else (default_local_modules if default_local_modules.exists() else None)
+    )
 
     return Settings(
         app_name=os.getenv("APP_NAME", "xjtu-back"),
@@ -50,9 +78,7 @@ def get_settings() -> Settings:
             "DB_URL", f"sqlite:///{(data_root / 'app.db').as_posix()}"
         ),
         chroma_root=Path(os.getenv("CHROMA_ROOT", (data_root / "chroma").as_posix())),
-        default_embedding_model=os.getenv(
-            "DEFAULT_EMBEDDING_MODEL", "bge-small-zh-v1.5"
-        ),
+        default_embedding_model=FIXED_DEFAULT_EMBEDDING_MODEL,
         api_key=os.getenv("API_KEY"),
         docs_root=Path(os.getenv("DOCS_ROOT", (data_root / "docs").as_posix())),
         jwt_secret=os.getenv("JWT_SECRET", "xjtu-back-dev-secret"),
@@ -75,12 +101,15 @@ def get_settings() -> Settings:
         llm_enabled=os.getenv("LLM_ENABLED", "true").lower() in {"1", "true", "yes"},
         embedding_model_root=Path(embedding_root_raw)
         if embedding_root_raw
-        else (workspace_root / "local_modules" / "models"),
-        local_modules_root=Path(local_modules_raw)
-        if local_modules_raw
-        else (workspace_root / "local_modules"),
+        else local_models_root,
+        local_modules_root=local_modules_root,
+        local_models_root=local_models_root,
         chat_stream_delay_ms=int(os.getenv("CHAT_STREAM_DELAY_MS", "10")),
         default_log_retention_days=int(os.getenv("DEFAULT_LOG_RETENTION_DAYS", "30")),
+        reranker_enabled=FIXED_RERANKER_ENABLED,
+        reranker_model=FIXED_RERANKER_MODEL,
+        reranker_top_n=FIXED_RERANKER_TOP_N,
+        reranker_weight=FIXED_RERANKER_WEIGHT,
     )
 
 

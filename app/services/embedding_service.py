@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from app.core.config import settings
 from app.core.errors import BusinessError
@@ -30,22 +31,47 @@ def _candidate_paths(model_name: str) -> list[Path]:
         candidates.append(settings.embedding_model_root / model_name)
         normalized = model_name.replace("/", "--")
         candidates.append(settings.embedding_model_root / normalized)
+        candidates.append(settings.embedding_model_root / f"models--{normalized}")
 
     if settings.local_modules_root:
         candidates.append(settings.local_modules_root / model_name)
         candidates.append(settings.local_modules_root / "models" / model_name)
+    if settings.local_models_root:
+        normalized = model_name.replace("/", "--")
+        candidates.append(settings.local_models_root / f"models--{normalized}")
     return candidates
+
+
+def _resolve_hf_cache_snapshot(root: Path) -> Path | None:
+    refs_main = root / "refs" / "main"
+    if refs_main.exists():
+        snapshot_id = refs_main.read_text(encoding="utf-8", errors="ignore").strip()
+        if snapshot_id:
+            snap_dir = root / "snapshots" / snapshot_id
+            if snap_dir.exists():
+                return snap_dir
+    snapshots_dir = root / "snapshots"
+    if snapshots_dir.exists():
+        dirs = [item for item in snapshots_dir.iterdir() if item.is_dir()]
+        if dirs:
+            dirs.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+            return dirs[0]
+    return None
 
 
 def resolve_model_reference(model_name: str) -> str:
     for item in _candidate_paths(model_name):
         if item.exists():
+            if item.is_dir() and item.name.startswith("models--"):
+                snapshot = _resolve_hf_cache_snapshot(item)
+                if snapshot is not None:
+                    return str(snapshot)
             return str(item)
     return model_name
 
 
 @lru_cache(maxsize=8)
-def _get_embedder(model_reference: str) -> SentenceTransformer:
+def _get_embedder(model_reference: str) -> Any:
     _register_local_modules()
     if SentenceTransformer is None:
         raise BusinessError(

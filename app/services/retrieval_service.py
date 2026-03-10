@@ -9,7 +9,9 @@ from sqlalchemy.orm import Session
 
 from app.models.document import DocumentChunk
 from app.models.knowledge_base import KnowledgeBase
+from app.core.config import settings
 from app.services.embedding_service import embed_query
+from app.services.reranker_service import rerank_candidates
 from app.vectorstore.chroma_manager import search_similar_chunks
 
 
@@ -124,8 +126,7 @@ def hybrid_retrieve(
         for chunk_id, score in sorted(
             fused.items(), key=lambda item: item[1], reverse=True
         )
-        if score >= score_threshold
-    ][:top_k]
+    ][: max(top_k * 3, top_k)]
 
     results: list[dict] = []
     for chunk_id in sorted_ids:
@@ -140,4 +141,13 @@ def hybrid_retrieve(
                 "score": float(fused.get(chunk_id, 0.0)),
             }
         )
-    return results
+
+    reranked = rerank_candidates(
+        query=query,
+        candidates=results,
+        model_name=settings.reranker_model,
+    )
+    filtered = [
+        item for item in reranked if float(item.get("score", 0.0)) >= score_threshold
+    ]
+    return filtered[:top_k]
