@@ -79,6 +79,7 @@ python scripts/ops.py stop --port 8000
 - `POST /knowledge-bases/{kb_id}/documents/batch-delete`
 - `POST /chat/completions`
 - `POST /chat/retrieval-debug`（返回融合前后分、重排分）
+- `GET /debug/runtime`（运行时配置诊断）
 - `DELETE /chat/conversations/{conversation_id}/context`
 - `POST /chat/conversations/{conversation_id}/rollback?keep_rounds=2`
 - `WS /ws/chat/completions?token=<access_token>`（WebSocket流式输出）

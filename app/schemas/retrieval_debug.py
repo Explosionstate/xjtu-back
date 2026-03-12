@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class RetrievalDebugRequest(BaseModel):
     query: str = Field(min_length=1)
     kb_ids: list[str] | None = None
+    document_ids: list[str] | None = None
     top_k: int | None = Field(default=None, ge=1, le=50)
     score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     fusion_mode: str | None = None

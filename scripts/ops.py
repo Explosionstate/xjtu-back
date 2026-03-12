@@ -2,20 +2,53 @@ from __future__ import annotations
 
 import argparse
 import json
+import locale
 import socket
 import subprocess
 import sys
 import urllib.request
+from pathlib import Path
+
+
+def _decode_output(raw: bytes | str | None) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    preferred = locale.getpreferredencoding(False) or "utf-8"
+    return raw.decode(preferred, errors="replace")
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    proc = subprocess.run(cmd, capture_output=True, text=False)
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=proc.returncode,
+        stdout=_decode_output(proc.stdout),
+        stderr=_decode_output(proc.stderr),
+    )
+
+
+def _ensure_repo_root() -> bool:
+    cwd = Path.cwd()
+    expected = cwd / "app" / "main.py"
+    scripts_file = cwd / "scripts" / "ops.py"
+    if expected.exists() and scripts_file.exists():
+        return True
+
+    print("[ABORT] Please run this command from xjtu-back root directory.")
+    print(f"[INFO] Current directory: {cwd}")
+    print("[INFO] Correct usage example: python scripts/ops.py start --reload")
+    return False
 
 
 def _listener_pids(port: int) -> list[int]:
     proc = _run(["netstat", "-ano"])
+    if proc.returncode != 0:
+        return []
+    stdout = proc.stdout or ""
     pids: set[int] = set()
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         text = line.strip()
         if not text or "LISTENING" not in text:
             continue
@@ -154,7 +187,10 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="xjtu-back operations")
+    parser = argparse.ArgumentParser(
+        description="xjtu-back operations",
+        epilog="Run from repository root, e.g.: python scripts/ops.py start --reload",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     start = sub.add_parser("start", help="start backend service")
@@ -181,6 +217,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if not _ensure_repo_root():
+        return 2
     return int(args.func(args))
 
 

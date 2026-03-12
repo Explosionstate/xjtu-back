@@ -12,7 +12,7 @@ os.environ["ANONYMIZED_TELEMETRY"] = "False"
 # Project-level fixed defaults for local deployment.
 FIXED_LOCAL_MODELS_ROOT = Path("D:/xjtu/local_models")
 FIXED_DEFAULT_EMBEDDING_MODEL = "BAAI/bge-base-zh-v1.5"
-FIXED_RERANKER_ENABLED = True
+FIXED_RERANKER_ENABLED = False
 FIXED_RERANKER_MODEL = "BAAI/bge-reranker-base"
 FIXED_RERANKER_TOP_N = 20
 FIXED_RERANKER_WEIGHT = 0.7

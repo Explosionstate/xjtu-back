@@ -111,6 +111,7 @@ def retrieval_debug(
         db=db,
         query=payload.query,
         kb_ids=kb_ids,
+        document_ids=payload.document_ids,
         top_k=int(cfg["retrieval_top_k"]),
         score_threshold=float(cfg["score_threshold"]),
         fusion_mode=str(cfg["fusion_mode"]),

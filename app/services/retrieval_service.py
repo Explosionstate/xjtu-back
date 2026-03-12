@@ -57,6 +57,7 @@ def hybrid_retrieve(
     db: Session,
     query: str,
     kb_ids: list[str],
+    document_ids: list[str] | None,
     top_k: int,
     score_threshold: float,
     fusion_mode: str,
@@ -66,6 +67,7 @@ def hybrid_retrieve(
         db=db,
         query=query,
         kb_ids=kb_ids,
+        document_ids=document_ids,
         top_k=top_k,
         score_threshold=score_threshold,
         fusion_mode=fusion_mode,
@@ -78,14 +80,16 @@ def hybrid_retrieve_with_debug(
     db: Session,
     query: str,
     kb_ids: list[str],
+    document_ids: list[str] | None,
     top_k: int,
     score_threshold: float,
     fusion_mode: str,
     alpha: float,
 ) -> tuple[list[dict], list[dict]]:
-    chunk_rows = list(
-        db.scalars(select(DocumentChunk).where(DocumentChunk.kb_id.in_(kb_ids))).all()
-    )
+    stmt = select(DocumentChunk).where(DocumentChunk.kb_id.in_(kb_ids))
+    if document_ids:
+        stmt = stmt.where(DocumentChunk.document_id.in_(document_ids))
+    chunk_rows = list(db.scalars(stmt).all())
     if not chunk_rows:
         return [], []
 

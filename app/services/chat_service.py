@@ -145,6 +145,7 @@ def chat_completion(
             db=db,
             query=retrieval_query,
             kb_ids=kb_ids,
+            document_ids=payload.document_ids,
             top_k=top_k,
             score_threshold=score_threshold,
             fusion_mode=fusion_mode,
@@ -155,7 +156,11 @@ def chat_completion(
             sources = []
         else:
             contexts = [item["content"] for item in retrieved]
-            answer = answer_with_llm(question=question, contexts=contexts)
+            answer = answer_with_llm(
+                question=question,
+                contexts=contexts,
+                llm_enabled=payload.llm_enabled,
+            )
             if not answer:
                 answer = "\n\n".join(contexts)
             sources = [
