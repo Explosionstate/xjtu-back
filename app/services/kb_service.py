@@ -21,6 +21,7 @@ from app.vectorstore.chroma_manager import (
     ensure_kb_vectorstore,
 )
 from app.services.vectorstore_cleanup_service import enqueue_vectorstore_cleanup
+from app.services.embedding_service import normalize_embedding_model_name
 
 
 def create_knowledge_base(
@@ -37,7 +38,7 @@ def create_knowledge_base(
         description=payload.description,
         department=payload.department,
         owner=payload.owner,
-        embedding_model=payload.embedding_model or settings.default_embedding_model,
+        embedding_model=normalize_embedding_model_name(payload.embedding_model),
     )
     db.add(kb)
     db.commit()
@@ -108,7 +109,7 @@ def update_knowledge_base(
     if payload.owner is not None:
         kb.owner = payload.owner
     if payload.embedding_model is not None:
-        kb.embedding_model = payload.embedding_model
+        kb.embedding_model = normalize_embedding_model_name(payload.embedding_model)
 
     db.commit()
     db.refresh(kb)
@@ -164,9 +165,11 @@ def clone_knowledge_base(
         if payload.department is not None
         else source.department,
         owner=payload.owner if payload.owner is not None else source.owner,
-        embedding_model=payload.embedding_model
-        if payload.embedding_model is not None
-        else source.embedding_model,
+        embedding_model=normalize_embedding_model_name(
+            payload.embedding_model
+            if payload.embedding_model is not None
+            else source.embedding_model
+        ),
     )
     db.add(cloned)
     db.commit()

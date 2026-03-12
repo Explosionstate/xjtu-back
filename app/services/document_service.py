@@ -15,6 +15,7 @@ from app.core.errors import BusinessError
 from app.models.document import Document, DocumentChunk
 from app.models.knowledge_base import KnowledgeBase
 from app.services.embedding_service import embed_texts
+from app.services.embedding_service import normalize_embedding_model_name
 from app.vectorstore.chroma_manager import delete_chunks_by_document, upsert_chunks
 
 ALLOWED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
@@ -134,7 +135,7 @@ def upload_documents(
             ],
             embeddings=embed_texts(
                 [item.content for item in chunk_rows],
-                model_name=kb.embedding_model,
+                model_name=normalize_embedding_model_name(kb.embedding_model),
             ),
         )
 
@@ -276,7 +277,7 @@ def reindex_document(
         ],
         embeddings=embed_texts(
             [item.content for item in rows],
-            model_name=kb.embedding_model,
+            model_name=normalize_embedding_model_name(kb.embedding_model),
         ),
     )
     doc.chunk_count = len(rows)

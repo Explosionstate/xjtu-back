@@ -10,10 +10,28 @@ from typing import Any, cast
 
 from app.core.config import settings
 
+# Reduce noisy telemetry errors in local/offline environments.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 try:
     import chromadb
+    from chromadb.config import Settings as ChromaClientSettings
 except ImportError:
     chromadb = None
+    ChromaClientSettings = None
+
+
+def _create_client(path: Path):
+    if chromadb is None:
+        return None
+    if ChromaClientSettings is not None:
+        return chromadb.PersistentClient(
+            path=str(path),
+            settings=ChromaClientSettings(
+                anonymized_telemetry=False,
+            ),
+        )
+    return chromadb.PersistentClient(path=str(path))
 
 
 def kb_vectorstore_path(kb_id: str) -> Path:
@@ -25,14 +43,16 @@ def ensure_kb_vectorstore(kb_id: str) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
 
     if chromadb is not None:
-        client = chromadb.PersistentClient(path=str(target_dir))
+        client = _create_client(target_dir)
+        if client is None:
+            return
         client.get_or_create_collection(name="documents")
 
 
 def _get_collection(kb_id: str):
-    if chromadb is None:
+    client = _create_client(kb_vectorstore_path(kb_id))
+    if client is None:
         return None
-    client = chromadb.PersistentClient(path=str(kb_vectorstore_path(kb_id)))
     return client.get_or_create_collection(name="documents")
 
 
@@ -72,7 +92,14 @@ def search_similar_chunks(
     collection = _get_collection(kb_id)
     if collection is None:
         return []
-    query_payload: dict[str, Any] = {"n_results": top_k}
+    max_results = top_k
+    try:
+        current_count = int(collection.count())
+        max_results = max(1, min(top_k, current_count))
+    except Exception:
+        pass
+
+    query_payload: dict[str, Any] = {"n_results": max_results}
     if query_embedding is not None:
         query_payload["query_embeddings"] = [query_embedding]
     else:

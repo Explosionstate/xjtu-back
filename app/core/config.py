@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Disable Chroma telemetry in local deployments before chromadb import.
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
+
 # Project-level fixed defaults for local deployment.
 FIXED_LOCAL_MODELS_ROOT = Path("D:/xjtu/local_models")
 FIXED_DEFAULT_EMBEDDING_MODEL = "BAAI/bge-base-zh-v1.5"
@@ -12,6 +16,8 @@ FIXED_RERANKER_ENABLED = True
 FIXED_RERANKER_MODEL = "BAAI/bge-reranker-base"
 FIXED_RERANKER_TOP_N = 20
 FIXED_RERANKER_WEIGHT = 0.7
+FIXED_LLM_ENABLED = False
+FIXED_LLM_TIMEOUT_SECONDS = 8
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,7 @@ class Settings:
     llm_model: str
     llm_temperature: float
     llm_enabled: bool
+    llm_timeout_seconds: int
     embedding_model_root: Path | None
     local_modules_root: Path | None
     local_models_root: Path | None
@@ -98,7 +105,8 @@ def get_settings() -> Settings:
         ),
         llm_model=os.getenv("LLM_MODEL", "qwen3.5-plus"),
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
-        llm_enabled=os.getenv("LLM_ENABLED", "true").lower() in {"1", "true", "yes"},
+        llm_enabled=FIXED_LLM_ENABLED,
+        llm_timeout_seconds=FIXED_LLM_TIMEOUT_SECONDS,
         embedding_model_root=Path(embedding_root_raw)
         if embedding_root_raw
         else local_models_root,

@@ -4,6 +4,7 @@ from threading import Event, Thread
 
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 try:
@@ -32,6 +33,18 @@ def create_app() -> FastAPI:
     vector_cleanup_thread: Thread | None = None
 
     register_exception_handlers(app)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://127.0.0.1:5174",
+            "http://localhost:5174",
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(api_router)
     if swagger_ui_bundle is not None:
         app.mount(

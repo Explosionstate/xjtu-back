@@ -14,6 +14,7 @@ def get_chat_llm() -> ChatOpenAI:
         base_url=settings.llm_base_url,
         model=settings.llm_model,
         temperature=settings.llm_temperature,
+        timeout=settings.llm_timeout_seconds,
     )
 
 
@@ -27,5 +28,9 @@ def answer_with_llm(question: str, contexts: list[str]) -> str:
         f"问题：{question}\n\n"
         f"资料：\n{chr(10).join(contexts)}"
     )
-    response = get_chat_llm().invoke(prompt)
-    return (response.content or "").strip()
+    try:
+        response = get_chat_llm().invoke(prompt)
+        return (response.content or "").strip()
+    except Exception:
+        # Keep chat endpoint responsive when upstream model is slow/unavailable.
+        return "\n\n".join(contexts)

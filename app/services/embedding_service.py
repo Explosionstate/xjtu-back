@@ -70,6 +70,33 @@ def resolve_model_reference(model_name: str) -> str:
     return model_name
 
 
+def normalize_embedding_model_name(model_name: str | None) -> str:
+    value = (model_name or "").strip()
+    if not value or value.lower() in {"string", "none", "null", "default"}:
+        return settings.default_embedding_model
+    return value
+
+
+def resolve_local_model_reference(model_name: str | None) -> str:
+    normalized = normalize_embedding_model_name(model_name)
+    reference = resolve_model_reference(normalized)
+    if Path(reference).exists():
+        return reference
+
+    # Keep deployment offline/local-first: do not auto-download from HuggingFace.
+    fallback_reference = resolve_model_reference(settings.default_embedding_model)
+    if Path(fallback_reference).exists():
+        return fallback_reference
+
+    raise BusinessError(
+        (
+            f"未找到本地Embedding模型: {normalized}。"
+            "请确认模型位于 D:/xjtu/local_models 或更新 app/core/config.py 固定模型配置。"
+        ),
+        status_code=500,
+    )
+
+
 @lru_cache(maxsize=8)
 def _get_embedder(model_reference: str) -> Any:
     _register_local_modules()
@@ -83,7 +110,7 @@ def _get_embedder(model_reference: str) -> Any:
 def embed_texts(texts: list[str], model_name: str) -> list[list[float]]:
     if not texts:
         return []
-    reference = resolve_model_reference(model_name)
+    reference = resolve_local_model_reference(model_name)
     embedder = _get_embedder(reference)
     vectors = embedder.encode(texts, normalize_embeddings=True)
     return [vec.tolist() for vec in vectors]

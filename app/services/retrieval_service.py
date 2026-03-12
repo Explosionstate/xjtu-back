@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.models.document import DocumentChunk
 from app.models.knowledge_base import KnowledgeBase
 from app.core.config import settings
-from app.services.embedding_service import embed_query
+from app.services.embedding_service import embed_query, normalize_embedding_model_name
 from app.services.reranker_service import rerank_candidates
 from app.vectorstore.chroma_manager import search_similar_chunks
 
@@ -120,7 +120,9 @@ def hybrid_retrieve_with_debug(
         ).all()
     }
     for kb_id in kb_ids:
-        model_name = kb_model_map.get(kb_id, "bge-small-zh-v1.5")
+        model_name = normalize_embedding_model_name(
+            kb_model_map.get(kb_id, settings.default_embedding_model)
+        )
         query_embedding = embed_query(query=query, model_name=model_name)
         for item in search_similar_chunks(
             kb_id=kb_id,
