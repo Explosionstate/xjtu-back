@@ -13,6 +13,18 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class SSOExchangeRequest(BaseModel):
+    ticket: str = Field(min_length=1, max_length=256)
+
+
+class SSOExchangeResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    login_name: str
+    role: str
+    source_table: str
+
+
 class UserItem(BaseModel):
     id: int
     login_name: str

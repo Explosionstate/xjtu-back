@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.errors import BusinessError
 from app.core.security import create_access_token, hash_password, verify_password
 from app.models.rbac import AuthLoginAttempt, SysRole, SysUserRole, User
@@ -65,9 +70,7 @@ def login(db: Session, login_name: str, password: str) -> str:
             raise BusinessError("登录失败次数过多，请稍后重试", status_code=429)
         attempt.failed_count = 0
 
-    user = db.scalar(
-        select(User).where(User.login_name == login_name, User.is_deleted == 0)
-    )
+    user = db.scalar(select(User).where(User.login_name == login_name))
     if user is None or not verify_password(password, user.password):
         if attempt is None:
             attempt = AuthLoginAttempt(
@@ -108,3 +111,116 @@ def get_user_role_codes(db: Session, user_id: int) -> set[str]:
         if user:
             role_codes.add(user.role)
     return role_codes
+
+
+def sso_exchange(db: Session, ticket: str) -> tuple[str, User, str]:
+    payload = _consume_xjtuexer_ticket(ticket)
+    login_name = payload.get("loginName")
+    source_role = payload.get("role")
+    source_table = payload.get("sourceTable") or "user"
+    display_name = payload.get("displayName")
+
+    if not login_name or not source_role:
+        raise BusinessError("SSO票据缺少用户信息", status_code=401)
+
+    mapped_role = _map_sso_role(source_role)
+    user = db.scalar(
+        select(User).where(User.login_name == login_name, User.is_deleted == 0)
+    )
+
+    if user is None:
+        user = User(
+            login_name=login_name,
+            password=hash_password(f"sso:{uuid4()}"),
+            role=mapped_role,
+            name=display_name or login_name,
+            email=None,
+            department_name=source_table,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        updated = False
+        if user.is_deleted != 0:
+            user.is_deleted = 0
+            updated = True
+        if user.role != mapped_role:
+            user.role = mapped_role
+            updated = True
+        if display_name and user.name != display_name:
+            user.name = display_name
+            updated = True
+        if source_table and user.department_name != source_table:
+            user.department_name = source_table
+            updated = True
+        if updated:
+            db.commit()
+
+    _ensure_role_link(db, user.id, mapped_role)
+    user.last_login_time = datetime.utcnow()
+    db.commit()
+
+    token = create_access_token(str(user.id))
+    return token, user, source_table
+
+
+def _consume_xjtuexer_ticket(ticket: str) -> dict:
+    url = settings.xjtuexer_sso_consume_url
+    req = urllib_request.Request(
+        url=url,
+        data=json.dumps({"ticket": ticket}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(
+            req, timeout=settings.xjtuexer_sso_timeout_seconds
+        ) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise BusinessError(
+            f"SSO校验失败: {detail or exc.reason}", status_code=401
+        ) from exc
+    except Exception as exc:  # pragma: no cover
+        raise BusinessError("无法连接 xjtuexer SSO 服务", status_code=503) from exc
+
+    try:
+        body = json.loads(raw)
+    except Exception as exc:
+        raise BusinessError("SSO响应解析失败", status_code=502) from exc
+
+    if not body.get("status"):
+        raise BusinessError(body.get("message") or "SSO票据无效", status_code=401)
+    data = body.get("data") or {}
+    if not isinstance(data, dict):
+        raise BusinessError("SSO响应格式错误", status_code=502)
+    return data
+
+
+def _map_sso_role(source_role: str) -> str:
+    role = source_role.strip().lower()
+    if role == "admin":
+        return "super_admin"
+    if role in {"teacher", "student"}:
+        return "user"
+    return "user"
+
+
+def _ensure_role_link(db: Session, user_id: int, role_code: str) -> None:
+    role = db.scalar(
+        select(SysRole).where(SysRole.role_code == role_code, SysRole.is_deleted == 0)
+    )
+    if role is None:
+        return
+
+    linked = db.scalar(
+        select(SysUserRole).where(
+            SysUserRole.users_id == user_id,
+            SysUserRole.role_id == role.role_id,
+        )
+    )
+    if linked is None:
+        db.add(SysUserRole(users_id=user_id, role_id=role.role_id))
+        db.commit()

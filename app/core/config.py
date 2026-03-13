@@ -18,6 +18,8 @@ FIXED_RERANKER_TOP_N = 20
 FIXED_RERANKER_WEIGHT = 0.7
 FIXED_LLM_ENABLED = False
 FIXED_LLM_TIMEOUT_SECONDS = 8
+FIXED_XJTUEXER_SSO_CONSUME_URL = "http://127.0.0.1:8080/api/sso/consume"
+FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,8 @@ class Settings:
     reranker_model: str
     reranker_top_n: int
     reranker_weight: float
+    xjtuexer_sso_consume_url: str
+    xjtuexer_sso_timeout_seconds: int
 
 
 def get_settings() -> Settings:
@@ -118,6 +122,8 @@ def get_settings() -> Settings:
         reranker_model=FIXED_RERANKER_MODEL,
         reranker_top_n=FIXED_RERANKER_TOP_N,
         reranker_weight=FIXED_RERANKER_WEIGHT,
+        xjtuexer_sso_consume_url=FIXED_XJTUEXER_SSO_CONSUME_URL,
+        xjtuexer_sso_timeout_seconds=FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS,
     )
 
 
