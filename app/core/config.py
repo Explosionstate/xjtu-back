@@ -7,6 +7,12 @@ from pathlib import Path
 
 # Disable Chroma telemetry in local deployments before chromadb import.
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["CHROMA_TELEMETRY_IMPL"] = (
+    "app.vectorstore.chroma_noop_telemetry.NoopProductTelemetryClient"
+)
+os.environ["CHROMA_PRODUCT_TELEMETRY_IMPL"] = (
+    "app.vectorstore.chroma_noop_telemetry.NoopProductTelemetryClient"
+)
 
 
 # Project-level fixed defaults for local deployment.
@@ -20,6 +26,13 @@ FIXED_LLM_ENABLED = False
 FIXED_LLM_TIMEOUT_SECONDS = 8
 FIXED_XJTUEXER_SSO_CONSUME_URL = "http://127.0.0.1:8080/api/sso/consume"
 FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS = 5
+FIXED_LOCAL_TRANSFORMER_ENABLED = True
+FIXED_LOCAL_TRANSFORMER_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+FIXED_LOCAL_TRANSFORMER_MAX_NEW_TOKENS = 256
+FIXED_LOCAL_TRANSFORMER_TEMPERATURE = 0.2
+FIXED_TRANSFORMER_DEVICE = "cuda"
+FIXED_LOCAL_TRANSFORMER_MAX_CONCURRENCY = 1
+FIXED_LOCAL_TRANSFORMER_QUEUE_TIMEOUT_SECONDS = 8
 
 
 @dataclass(frozen=True)
@@ -57,6 +70,13 @@ class Settings:
     reranker_weight: float
     xjtuexer_sso_consume_url: str
     xjtuexer_sso_timeout_seconds: int
+    local_transformer_enabled: bool
+    local_transformer_model: str
+    local_transformer_max_new_tokens: int
+    local_transformer_temperature: float
+    transformer_device: str
+    local_transformer_max_concurrency: int
+    local_transformer_queue_timeout_seconds: int
 
 
 def get_settings() -> Settings:
@@ -124,6 +144,13 @@ def get_settings() -> Settings:
         reranker_weight=FIXED_RERANKER_WEIGHT,
         xjtuexer_sso_consume_url=FIXED_XJTUEXER_SSO_CONSUME_URL,
         xjtuexer_sso_timeout_seconds=FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS,
+        local_transformer_enabled=FIXED_LOCAL_TRANSFORMER_ENABLED,
+        local_transformer_model=FIXED_LOCAL_TRANSFORMER_MODEL,
+        local_transformer_max_new_tokens=FIXED_LOCAL_TRANSFORMER_MAX_NEW_TOKENS,
+        local_transformer_temperature=FIXED_LOCAL_TRANSFORMER_TEMPERATURE,
+        transformer_device=FIXED_TRANSFORMER_DEVICE,
+        local_transformer_max_concurrency=FIXED_LOCAL_TRANSFORMER_MAX_CONCURRENCY,
+        local_transformer_queue_timeout_seconds=FIXED_LOCAL_TRANSFORMER_QUEUE_TIMEOUT_SECONDS,
     )
 
 

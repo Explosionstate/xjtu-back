@@ -29,6 +29,34 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _has_uvicorn(python_exe: str) -> bool:
+    proc = _run([python_exe, "-c", "import uvicorn"])
+    return proc.returncode == 0
+
+
+def _pick_python_with_uvicorn() -> str:
+    candidates = [sys.executable]
+    cwd = Path.cwd()
+    candidates.extend(
+        [
+            str(cwd / ".venv1" / "Scripts" / "python.exe"),
+            str(cwd / ".venv" / "Scripts" / "python.exe"),
+            str(cwd / ".venv" / "bin" / "python"),
+            str(cwd / ".venv1" / "bin" / "python"),
+        ]
+    )
+    seen: set[str] = set()
+    for item in candidates:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        if not Path(item).exists() and item != sys.executable:
+            continue
+        if _has_uvicorn(item):
+            return item
+    return sys.executable
+
+
 def _ensure_repo_root() -> bool:
     cwd = Path.cwd()
     expected = cwd / "app" / "main.py"
@@ -123,8 +151,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             print("[ABORT] Use --force-stop to kill conflicting listeners first.")
             return 1
 
+    python_exe = _pick_python_with_uvicorn()
     cmd = [
-        sys.executable,
+        python_exe,
         "-m",
         "uvicorn",
         "app.main:app",
@@ -135,8 +164,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if args.reload:
         cmd.append("--reload")
+    if python_exe != sys.executable:
+        print(f"[INFO] Using interpreter with uvicorn: {python_exe}")
     print("[INFO] Starting:", " ".join(cmd))
-    return subprocess.call(cmd)
+    try:
+        return subprocess.call(cmd)
+    except KeyboardInterrupt:
+        print("\n[INFO] Caught Ctrl+C, stopping listeners...")
+        stop_args = argparse.Namespace(port=args.port, all_python=False)
+        cmd_stop(stop_args)
+        return 130
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -158,6 +195,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
         message = proc.stdout.strip() or proc.stderr.strip()
         if message:
             print(f"    {message}")
+
+        # Fallback: sometimes taskkill reports "not found" while the listener
+        # is still shown by Get-NetTCPConnection on Windows.
+        if _port_in_use("127.0.0.1", args.port):
+            ps_cmd = (
+                "$pids = (Get-NetTCPConnection -LocalPort "
+                f"{args.port}"
+                " -State Listen -ErrorAction SilentlyContinue | "
+                "Select-Object -ExpandProperty OwningProcess -Unique); "
+                "foreach ($procId in $pids) { "
+                "Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }"
+            )
+            _ = _run(["powershell", "-NoProfile", "-Command", ps_cmd])
+
+    if _port_in_use("127.0.0.1", args.port):
+        print(
+            f"[WARN] Port {args.port} still appears occupied; "
+            "the listener may belong to a protected process or another session."
+        )
     return 0
 
 
@@ -186,6 +242,21 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_restart(args: argparse.Namespace) -> int:
+    stop_args = argparse.Namespace(port=args.port, all_python=False)
+    stop_code = cmd_stop(stop_args)
+    if stop_code != 0:
+        return stop_code
+
+    start_args = argparse.Namespace(
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        force_stop=True,
+    )
+    return cmd_start(start_args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="xjtu-back operations",
@@ -211,6 +282,12 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--base", default="http://127.0.0.1:8000")
     check.add_argument("--timeout", type=int, default=8)
     check.set_defaults(func=cmd_check)
+
+    restart = sub.add_parser("restart", help="restart backend service")
+    restart.add_argument("--host", default="127.0.0.1")
+    restart.add_argument("--port", type=int, default=8000)
+    restart.add_argument("--reload", action="store_true")
+    restart.set_defaults(func=cmd_restart)
     return parser
 
 
