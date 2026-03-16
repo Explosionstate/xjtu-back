@@ -1,24 +1,34 @@
 from __future__ import annotations
 
+import json
 import math
+from datetime import datetime
 from time import perf_counter
+from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.errors import BusinessError
 from app.models.knowledge_base import KnowledgeBase
+from app.models.transformer_eval import TransformerEvalSnapshot
 from app.schemas.chat import SourceItem
 from app.schemas.transformer import (
+    TransformerBatchRunRequest,
+    TransformerCompareResponse,
     TransformerChatRequest,
     TransformerClassifyItem,
     TransformerClassifyRequest,
+    TransformerCompareRequest,
     TransformerClusterGroup,
     TransformerClusterRequest,
     TransformerEvalRequest,
     TransformerQuickTestItem,
     TransformerQuickTestRequest,
     TransformerRagAnalyzeRequest,
+    TransformerSnapshotItem,
+    TransformerTopicDeltaItem,
     TransformerTopicTemplate,
 )
 from app.services.embedding_service import (
@@ -507,3 +517,130 @@ def build_quick_test_markdown_report(
     lines.append("- 若需真实性能评估，可开启 run_generation=true 进行生成模式测试。")
     lines.append("")
     return "\n".join(lines)
+
+
+def _snapshot_to_item(row: TransformerEvalSnapshot) -> TransformerSnapshotItem:
+    return TransformerSnapshotItem(
+        snapshot_id=row.snapshot_id,
+        batch_id=row.batch_id,
+        run_index=row.run_index,
+        provider=row.provider,
+        model=row.model,
+        total_topics=row.total_topics,
+        pass_count=row.pass_count,
+        average_score=round(float(row.average_score), 2),
+        created_at=row.created_at,
+    )
+
+
+def run_quick_test_batch(
+    db: Session, payload: TransformerBatchRunRequest
+) -> tuple[str, list[TransformerSnapshotItem]]:
+    batch_id = str(uuid4())
+    snapshots: list[TransformerSnapshotItem] = []
+
+    for run_index in range(1, payload.run_count + 1):
+        model, total_topics, pass_count, average_score, items = quick_test_topics(
+            db=db,
+            payload=payload.quick_test,
+        )
+        snapshot_id = str(uuid4())
+        result_payload = {
+            "items": [item.model_dump() for item in items],
+            "batch_label": payload.batch_label,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        row = TransformerEvalSnapshot(
+            snapshot_id=snapshot_id,
+            batch_id=batch_id,
+            run_index=run_index,
+            provider=payload.quick_test.provider,
+            model=model,
+            total_topics=total_topics,
+            pass_count=pass_count,
+            average_score=float(average_score),
+            payload_json=json.dumps(
+                payload.quick_test.model_dump(), ensure_ascii=False
+            ),
+            result_json=json.dumps(result_payload, ensure_ascii=False),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        snapshots.append(_snapshot_to_item(row))
+    return batch_id, snapshots
+
+
+def list_eval_snapshots(db: Session, limit: int = 30) -> list[TransformerSnapshotItem]:
+    rows = db.scalars(
+        select(TransformerEvalSnapshot)
+        .order_by(desc(TransformerEvalSnapshot.created_at))
+        .limit(max(1, min(limit, 200)))
+    ).all()
+    return [_snapshot_to_item(item) for item in rows]
+
+
+def compare_eval_snapshots(
+    db: Session, payload: TransformerCompareRequest
+) -> TransformerCompareResponse:
+    current_row = db.scalar(
+        select(TransformerEvalSnapshot).where(
+            TransformerEvalSnapshot.snapshot_id == payload.current_snapshot_id
+        )
+    )
+    if current_row is None:
+        raise BusinessError("当前快照不存在", status_code=404)
+
+    baseline_row = None
+    if payload.baseline_snapshot_id:
+        baseline_row = db.scalar(
+            select(TransformerEvalSnapshot).where(
+                TransformerEvalSnapshot.snapshot_id == payload.baseline_snapshot_id
+            )
+        )
+    else:
+        baseline_row = db.scalar(
+            select(TransformerEvalSnapshot)
+            .where(TransformerEvalSnapshot.created_at < current_row.created_at)
+            .order_by(desc(TransformerEvalSnapshot.created_at))
+            .limit(1)
+        )
+    if baseline_row is None:
+        raise BusinessError("基线快照不存在", status_code=404)
+
+    current_result = json.loads(current_row.result_json or "{}")
+    baseline_result = json.loads(baseline_row.result_json or "{}")
+    current_items = {
+        str(item.get("code")): item for item in (current_result.get("items") or [])
+    }
+    baseline_items = {
+        str(item.get("code")): item for item in (baseline_result.get("items") or [])
+    }
+    topic_codes = sorted(set(current_items.keys()) | set(baseline_items.keys()))
+
+    topic_deltas: list[TransformerTopicDeltaItem] = []
+    for code in topic_codes:
+        current_item = current_items.get(code, {})
+        baseline_item = baseline_items.get(code, {})
+        current_score = float(current_item.get("score") or 0.0)
+        baseline_score = float(baseline_item.get("score") or 0.0)
+        title = str(current_item.get("title") or baseline_item.get("title") or code)
+        topic_deltas.append(
+            TransformerTopicDeltaItem(
+                code=code,
+                title=title,
+                current_score=round(current_score, 2),
+                baseline_score=round(baseline_score, 2),
+                delta_score=round(current_score - baseline_score, 2),
+            )
+        )
+
+    return TransformerCompareResponse(
+        current=_snapshot_to_item(current_row),
+        baseline=_snapshot_to_item(baseline_row),
+        avg_score_delta=round(
+            float(current_row.average_score) - float(baseline_row.average_score), 2
+        ),
+        pass_count_delta=int(current_row.pass_count - baseline_row.pass_count),
+        topic_deltas=topic_deltas,
+    )

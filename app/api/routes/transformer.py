@@ -10,10 +10,14 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.schemas.transformer import (
+    TransformerBatchRunRequest,
+    TransformerBatchRunResponse,
     TransformerChatRequest,
     TransformerChatResponse,
     TransformerClassifyRequest,
     TransformerClassifyResponse,
+    TransformerCompareRequest,
+    TransformerCompareResponse,
     TransformerClusterRequest,
     TransformerClusterResponse,
     TransformerEvalRequest,
@@ -22,13 +26,17 @@ from app.schemas.transformer import (
     TransformerQuickTestResponse,
     TransformerRagAnalyzeRequest,
     TransformerRagAnalyzeResponse,
+    TransformerSnapshotListResponse,
     TransformerTopicTemplateResponse,
     TransformerRuntimeResponse,
 )
 from app.services.transformer_task_service import (
     build_quick_test_markdown_report,
+    compare_eval_snapshots,
     list_topic_templates,
+    list_eval_snapshots,
     quick_test_topics,
+    run_quick_test_batch,
     transformer_chat,
     transformer_classify,
     transformer_cluster,
@@ -236,3 +244,37 @@ def topics_quick_test_report_markdown(
             "Content-Disposition": "attachment; filename=transformer_quick_test_report.md"
         },
     )
+
+
+@router.post("/topics/batch-run", response_model=TransformerBatchRunResponse)
+def topics_batch_run(
+    payload: TransformerBatchRunRequest,
+    db: Session = Depends(get_db),
+    _: object = Depends(get_current_user),
+) -> TransformerBatchRunResponse:
+    batch_id, snapshots = run_quick_test_batch(db=db, payload=payload)
+    return TransformerBatchRunResponse(
+        batch_id=batch_id,
+        run_count=len(snapshots),
+        snapshots=snapshots,
+    )
+
+
+@router.get("/topics/snapshots", response_model=TransformerSnapshotListResponse)
+def topics_snapshots(
+    limit: int = 30,
+    _: object = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TransformerSnapshotListResponse:
+    return TransformerSnapshotListResponse(
+        items=list_eval_snapshots(db=db, limit=limit)
+    )
+
+
+@router.post("/topics/compare", response_model=TransformerCompareResponse)
+def topics_compare(
+    payload: TransformerCompareRequest,
+    db: Session = Depends(get_db),
+    _: object = Depends(get_current_user),
+) -> TransformerCompareResponse:
+    return compare_eval_snapshots(db=db, payload=payload)

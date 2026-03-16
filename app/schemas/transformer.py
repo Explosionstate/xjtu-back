@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 from app.schemas.chat import ChatMessage, SourceItem
@@ -163,3 +165,52 @@ class TransformerQuickTestResponse(BaseModel):
     pass_count: int
     average_score: float
     items: list[TransformerQuickTestItem]
+
+
+class TransformerBatchRunRequest(BaseModel):
+    quick_test: TransformerQuickTestRequest
+    run_count: int = Field(default=3, ge=1, le=20)
+    batch_label: str = Field(default="", max_length=128)
+
+
+class TransformerSnapshotItem(BaseModel):
+    snapshot_id: str
+    batch_id: str
+    run_index: int
+    provider: str
+    model: str
+    total_topics: int
+    pass_count: int
+    average_score: float
+    created_at: datetime
+
+
+class TransformerBatchRunResponse(BaseModel):
+    batch_id: str
+    run_count: int
+    snapshots: list[TransformerSnapshotItem]
+
+
+class TransformerSnapshotListResponse(BaseModel):
+    items: list[TransformerSnapshotItem]
+
+
+class TransformerCompareRequest(BaseModel):
+    current_snapshot_id: str = Field(min_length=1, max_length=64)
+    baseline_snapshot_id: str | None = Field(default=None, max_length=64)
+
+
+class TransformerTopicDeltaItem(BaseModel):
+    code: str
+    title: str
+    current_score: float
+    baseline_score: float
+    delta_score: float
+
+
+class TransformerCompareResponse(BaseModel):
+    current: TransformerSnapshotItem
+    baseline: TransformerSnapshotItem
+    avg_score_delta: float
+    pass_count_delta: int
+    topic_deltas: list[TransformerTopicDeltaItem]

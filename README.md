@@ -100,6 +100,19 @@ python scripts/ops.py stop --port 8000
 - `POST /transformer/cluster`
 - `POST /transformer/rag/analyze`
 - `POST /transformer/eval/run`
+- `GET /transformer/topics/templates`
+- `POST /transformer/topics/quick-test`
+- `POST /transformer/topics/quick-test/export`
+- `POST /transformer/topics/quick-test/report-markdown`
+- `POST /transformer/topics/batch-run`
+- `GET /transformer/topics/snapshots`
+- `POST /transformer/topics/compare`
+
+## Day7 交付文档
+
+- 验收清单：`docs/DAY7_ACCEPTANCE.md`
+- 部署与回滚：`docs/DEPLOY_ROLLBACK.md`
+- 最终评测结论：`docs/FINAL_EVAL_CONCLUSION.md`
 
 ## 环境变量
 
