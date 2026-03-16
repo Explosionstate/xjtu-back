@@ -11,6 +11,7 @@ from app.models.rbac import (
 )
 from app.models.sys_config import SysConfig
 from app.models.cleanup_task import VectorstoreCleanupTask
+from app.models.transformer_eval import TransformerEvalSnapshot
 
 __all__ = [
     "KnowledgeBase",
@@ -28,4 +29,5 @@ __all__ = [
     "AuthLoginAttempt",
     "SysConfig",
     "VectorstoreCleanupTask",
+    "TransformerEvalSnapshot",
 ]
