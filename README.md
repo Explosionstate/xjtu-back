@@ -94,6 +94,12 @@ python scripts/ops.py stop --port 8000
 - `GET /retrieval-config/sessions/{conversation_id}`
 - `PUT /retrieval-config/sessions/{conversation_id}`
 - `GET/POST/PUT /rbac/*`
+- `GET /transformer/runtime`
+- `POST /transformer/chat/completions`
+- `POST /transformer/classify`
+- `POST /transformer/cluster`
+- `POST /transformer/rag/analyze`
+- `POST /transformer/eval/run`
 
 ## 环境变量
 
@@ -122,6 +128,11 @@ python scripts/ops.py stop --port 8000
 - `FIXED_RERANKER_MODEL`
 - `FIXED_RERANKER_TOP_N`
 - `FIXED_RERANKER_WEIGHT`
+- `FIXED_LOCAL_TRANSFORMER_ENABLED`
+- `FIXED_LOCAL_TRANSFORMER_MODEL`
+- `FIXED_LOCAL_TRANSFORMER_MAX_NEW_TOKENS`
+- `FIXED_LOCAL_TRANSFORMER_TEMPERATURE`
+- `FIXED_TRANSFORMER_DEVICE`
 
 ### 本地 Embedding 模型配置
 

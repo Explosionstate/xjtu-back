@@ -27,6 +27,9 @@ def _candidate_paths(model_name: str) -> list[Path]:
     if value.exists():
         candidates.append(value)
 
+    parts = [item for item in model_name.split("/") if item]
+    modelscope_parts = [part.replace(".", "___").replace("-", "-") for part in parts]
+
     if settings.embedding_model_root:
         candidates.append(settings.embedding_model_root / model_name)
         normalized = model_name.replace("/", "--")
@@ -37,6 +40,13 @@ def _candidate_paths(model_name: str) -> list[Path]:
         candidates.append(settings.local_modules_root / model_name)
         candidates.append(settings.local_modules_root / "models" / model_name)
     if settings.local_models_root:
+        # Plain nested path, e.g. D:/xjtu/local_models/Qwen/Qwen2.5-1.5B-Instruct
+        candidates.append(settings.local_models_root / model_name)
+        if parts:
+            candidates.append(settings.local_models_root.joinpath(*parts))
+        # ModelScope fallback path on Windows, e.g. Qwen2___5-1___5B-Instruct
+        if modelscope_parts:
+            candidates.append(settings.local_models_root.joinpath(*modelscope_parts))
         normalized = model_name.replace("/", "--")
         candidates.append(settings.local_models_root / f"models--{normalized}")
     return candidates

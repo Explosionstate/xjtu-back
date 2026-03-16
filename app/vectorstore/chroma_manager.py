@@ -12,6 +12,14 @@ from app.core.config import settings
 
 # Reduce noisy telemetry errors in local/offline environments.
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault(
+    "CHROMA_TELEMETRY_IMPL",
+    "app.vectorstore.chroma_noop_telemetry.NoopProductTelemetryClient",
+)
+os.environ.setdefault(
+    "CHROMA_PRODUCT_TELEMETRY_IMPL",
+    "app.vectorstore.chroma_noop_telemetry.NoopProductTelemetryClient",
+)
 
 try:
     import chromadb

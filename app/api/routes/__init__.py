@@ -9,6 +9,7 @@ from app.api.routes.knowledge_bases import router as kb_router
 from app.api.routes.rbac import router as rbac_router
 from app.api.routes.retrieval_config import router as retrieval_config_router
 from app.api.routes.system_config import router as system_config_router
+from app.api.routes.transformer import router as transformer_router
 
 
 api_router = APIRouter()
@@ -21,3 +22,4 @@ api_router.include_router(debug_router)
 api_router.include_router(rbac_router)
 api_router.include_router(system_config_router)
 api_router.include_router(retrieval_config_router)
+api_router.include_router(transformer_router)
