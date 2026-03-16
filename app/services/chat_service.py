@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import uuid
+from dataclasses import dataclass
 from time import perf_counter
+import uuid
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -10,8 +11,8 @@ from app.core.config import settings
 from app.models.chat import ChatLog, Conversation, Message
 from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
-from app.schemas.chat import ChatCompletionRequest, SourceItem
-from app.services.llm_service import answer_with_llm
+from app.schemas.chat import ChatCompletionRequest, ChatThinking, SourceItem
+from app.services.llm_service import LLMAnswerResult, answer_with_llm
 from app.services.retrieval_config_service import get_effective_retrieval_config
 from app.services.retrieval_service import hybrid_retrieve
 from app.services.sensitive_service import get_sensitive_words, mask_sensitive_text
@@ -20,6 +21,14 @@ from app.services.system_config_service import (
     DEFAULT_CONTEXT_MAX_TOKENS,
     get_int_config,
 )
+
+
+@dataclass(frozen=True)
+class ChatCompletionResult:
+    conversation_id: str
+    answer: str
+    sources: list[SourceItem]
+    thinking: ChatThinking
 
 
 def _get_latest_user_question(messages: list[dict]) -> str:
@@ -44,14 +53,14 @@ def _ensure_conversation(
 def _format_rule_answer(question: str) -> str | None:
     lowered = question.lower()
     if "帮助" in question or "help" in lowered:
-        return "你可以提问知识库内容，或指定 kb_ids 进行范围检索。"
+        return "你可以提问知识库中的内容，也可以通过 kb_ids 或文档范围限定检索来源。"
     if "版本" in question or "version" in lowered:
         return "xjtu-back 对话服务版本：0.1.0"
     return None
 
 
 def _estimate_tokens(text: str) -> int:
-    # Lightweight token estimation for mixed Chinese/English text.
+    # Lightweight token estimation for mixed Chinese and English text.
     return max(1, len(text) // 2)
 
 
@@ -81,11 +90,98 @@ def _build_retrieval_query(history: list[Message], question: str) -> str:
     return "\n".join(snippets + [question])
 
 
+def _build_scope_text(kb_ids: list[str], document_ids: list[str] | None) -> str:
+    if document_ids:
+        return f"当前勾选的 {len(document_ids)} 份文档"
+    if kb_ids:
+        return f"{len(kb_ids)} 个知识库"
+    return "默认检索范围"
+
+
+def _build_summary_thinking(
+    trimmed_history: list[Message],
+    kb_ids: list[str],
+    document_ids: list[str] | None,
+    retrieved_count: int,
+    top_k: int,
+    score_threshold: float,
+    rule_answer: bool,
+    llm_result: LLMAnswerResult | None,
+) -> ChatThinking:
+    steps: list[str] = []
+    if trimmed_history:
+        rounds = max(1, (len(trimmed_history) + 1) // 2)
+        steps.append(f"已结合最近 {rounds} 轮对话上下文整理当前问题。")
+    else:
+        steps.append("已读取当前问题并准备检索。")
+
+    if rule_answer:
+        steps.append("命中系统内置规则回答，未进入知识库检索和模型生成。")
+    else:
+        scope_text = _build_scope_text(kb_ids, document_ids)
+        if retrieved_count > 0:
+            steps.append(
+                f"已在{scope_text}中筛到 {retrieved_count} 条相关片段（Top-K={top_k}，阈值={score_threshold:.2f}）。"
+            )
+        else:
+            steps.append(
+                f"已在{scope_text}中完成检索，但当前阈值 {score_threshold:.2f} 下没有足够相关的参考资料。"
+            )
+
+        if llm_result is None:
+            steps.append("本次回答直接基于检索结果整理。")
+        elif llm_result.mode == "llm":
+            steps.append("已基于检索结果组织最终回答。")
+        elif llm_result.mode == "disabled":
+            steps.append("当前未启用可返回 reasoning 的模型，本次回答由检索结果整理生成。")
+        else:
+            steps.append("模型未返回可公开展示的 reasoning，本次展示的是系统处理摘要。")
+
+    steps.append("这里展示的是处理摘要，不是模型私有思维链。")
+    return ChatThinking(
+        title="处理摘要",
+        content="\n".join(f"{index}. {step}" for index, step in enumerate(steps, start=1)),
+        kind="summary",
+        is_real=False,
+        collapsed=True,
+    )
+
+
+def _build_thinking_payload(
+    trimmed_history: list[Message],
+    kb_ids: list[str],
+    document_ids: list[str] | None,
+    retrieved_count: int,
+    top_k: int,
+    score_threshold: float,
+    rule_answer: bool,
+    llm_result: LLMAnswerResult | None,
+) -> ChatThinking:
+    if llm_result and llm_result.reasoning:
+        return ChatThinking(
+            title="思考过程",
+            content=llm_result.reasoning,
+            kind="reasoning",
+            is_real=True,
+            collapsed=True,
+        )
+    return _build_summary_thinking(
+        trimmed_history=trimmed_history,
+        kb_ids=kb_ids,
+        document_ids=document_ids,
+        retrieved_count=retrieved_count,
+        top_k=top_k,
+        score_threshold=score_threshold,
+        rule_answer=rule_answer,
+        llm_result=llm_result,
+    )
+
+
 def chat_completion(
     db: Session,
     payload: ChatCompletionRequest,
     current_user: User | None,
-) -> tuple[str, str, list[SourceItem]]:
+) -> ChatCompletionResult:
     question = _get_latest_user_question([m.model_dump() for m in payload.messages])
     sensitive_words = get_sensitive_words(db)
     question = mask_sensitive_text(question, sensitive_words)
@@ -136,9 +232,11 @@ def chat_completion(
     retrieval_query = _build_retrieval_query(trimmed_history, question)
 
     start = perf_counter()
-    rule_answer = _format_rule_answer(question)
-    if rule_answer:
-        answer = rule_answer
+    llm_result: LLMAnswerResult | None = None
+    retrieved: list[dict] = []
+    rule_answer_text = _format_rule_answer(question)
+    if rule_answer_text:
+        answer = rule_answer_text
         sources: list[SourceItem] = []
     else:
         retrieved = hybrid_retrieve(
@@ -156,13 +254,12 @@ def chat_completion(
             sources = []
         else:
             contexts = [item["content"] for item in retrieved]
-            answer = answer_with_llm(
+            llm_result = answer_with_llm(
                 question=question,
                 contexts=contexts,
                 llm_enabled=payload.llm_enabled,
             )
-            if not answer:
-                answer = "\n\n".join(contexts)
+            answer = llm_result.answer or "\n\n".join(contexts)
             sources = [
                 SourceItem(
                     source_location=item["source_location"],
@@ -171,10 +268,29 @@ def chat_completion(
                 )
                 for item in retrieved
             ]
-    answer = mask_sensitive_text(answer, sensitive_words)
 
+    answer = mask_sensitive_text(answer, sensitive_words)
     if len(answer) > settings.max_answer_chars:
         answer = answer[: settings.max_answer_chars] + "..."
+
+    thinking = _build_thinking_payload(
+        trimmed_history=trimmed_history,
+        kb_ids=kb_ids,
+        document_ids=payload.document_ids,
+        retrieved_count=len(retrieved),
+        top_k=top_k,
+        score_threshold=score_threshold,
+        rule_answer=bool(rule_answer_text),
+        llm_result=llm_result,
+    )
+    thinking_content = mask_sensitive_text(thinking.content, sensitive_words).strip()
+    thinking = ChatThinking(
+        title=thinking.title,
+        content=thinking_content or "1. 已完成当前问题处理。\n2. 这里展示的是系统处理摘要，不是模型私有思维链。",
+        kind=thinking.kind,
+        is_real=thinking.is_real,
+        collapsed=thinking.collapsed,
+    )
 
     elapsed_ms = int((perf_counter() - start) * 1000)
 
@@ -212,7 +328,12 @@ def chat_completion(
         ).delete(synchronize_session=False)
         db.commit()
 
-    return conversation_id, answer, sources
+    return ChatCompletionResult(
+        conversation_id=conversation_id,
+        answer=answer,
+        sources=sources,
+        thinking=thinking,
+    )
 
 
 def clear_conversation_context(db: Session, conversation_id: str) -> int:

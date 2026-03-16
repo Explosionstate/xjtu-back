@@ -4,10 +4,10 @@ import uuid
 
 from fastapi.testclient import TestClient
 
-from app.core.config import settings
-from app.main import app
 import app.services.document_service as document_service
 import app.services.retrieval_service as retrieval_service
+from app.core.config import settings
+from app.main import app
 
 
 def _auth_headers(client: TestClient) -> dict[str, str]:
@@ -21,7 +21,7 @@ def _auth_headers(client: TestClient) -> dict[str, str]:
 
 
 def _patch_embeddings() -> None:
-    # Use deterministic fake vectors to avoid model dependency in CI/local smoke tests.
+    # Use deterministic fake vectors to avoid local model dependencies in smoke tests.
     document_service.embed_texts = lambda texts, model_name: [
         [0.1, 0.2, 0.3] for _ in texts
     ]
@@ -89,6 +89,8 @@ def test_login_upload_chat_logs_flow() -> None:
         assert chat_resp.status_code == 200, chat_resp.text
         chat_json = chat_resp.json()
         assert chat_json["choices"][0]["message"]["content"]
+        assert chat_json["thinking"]["content"]
+        assert chat_json["thinking"]["kind"] in {"summary", "reasoning"}
 
         logs_resp = client.get("/chat/logs", headers=headers)
         assert logs_resp.status_code == 200, logs_resp.text

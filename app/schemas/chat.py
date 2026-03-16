@@ -30,6 +30,14 @@ class SourceItem(BaseModel):
     score: float
 
 
+class ChatThinking(BaseModel):
+    title: str
+    content: str
+    kind: str = "summary"
+    is_real: bool = False
+    collapsed: bool = True
+
+
 class ChatCompletionResponseMessage(BaseModel):
     role: str = "assistant"
     content: str
@@ -48,3 +56,4 @@ class ChatCompletionResponse(BaseModel):
     conversation_id: str
     choices: list[ChatCompletionChoice]
     sources: list[SourceItem]
+    thinking: ChatThinking | None = None
