@@ -41,6 +41,13 @@ def _iter_thinking_chunks(text: str) -> list[str]:
     return chunks or [text]
 
 
+def _iter_answer_chunks(text: str, chunk_size: int = 24) -> list[str]:
+    if not text:
+        return []
+    safe_size = max(1, chunk_size)
+    return [text[index : index + safe_size] for index in range(0, len(text), safe_size)]
+
+
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 def chat_completions(
     payload: ChatCompletionRequest,
@@ -139,7 +146,6 @@ async def ws_chat_completions(
 ) -> None:
     await websocket.accept()
     db = SessionLocal()
-    thinking_delay_ms = max(settings.chat_stream_delay_ms * 4, 30)
     try:
         user: User | None = None
         subject = decode_access_token(token)
@@ -188,7 +194,6 @@ async def ws_chat_completions(
                         "done": False,
                     }
                 )
-                await asyncio.sleep(thinking_delay_ms / 1000)
 
             await websocket.send_json(
                 {
@@ -202,8 +207,8 @@ async def ws_chat_completions(
                 }
             )
 
-            for ch in result.answer:
-                await websocket.send_json({"type": "delta", "content": ch})
+            for chunk in _iter_answer_chunks(result.answer):
+                await websocket.send_json({"type": "delta", "content": chunk})
                 if settings.chat_stream_delay_ms > 0:
                     await asyncio.sleep(settings.chat_stream_delay_ms / 1000)
 

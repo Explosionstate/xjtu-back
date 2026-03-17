@@ -33,6 +33,13 @@ def get_my_academic_analysis(
     try:
         with academic_session_scope() as db:
             _apply_query_timeout(db)
+            actor_role = _query_academic_user_role(db, normalized_login_name)
+            if actor_role and actor_role != "student":
+                raise BusinessError(
+                    "Only students can access academic analysis",
+                    status_code=403,
+                )
+
             student_row = _query_student_profile(db, normalized_login_name)
             if student_row is None:
                 raise BusinessError(
@@ -176,6 +183,25 @@ def _query_student_profile(db: Session, login_name: str) -> dict | None:
     )
     row = db.execute(sql, {"login_name": login_name}).mappings().first()
     return dict(row) if row else None
+
+
+def _query_academic_user_role(db: Session, login_name: str) -> str | None:
+    row = db.execute(
+        text(
+            """
+            SELECT role
+            FROM `user`
+            WHERE login_name = :login_name
+              AND is_deleted = 0
+            LIMIT 1
+            """
+        ),
+        {"login_name": login_name},
+    ).mappings().first()
+    if row is None:
+        return None
+    role = str(row.get("role") or "").strip().lower()
+    return role or None
 
 
 def _resolve_term(db: Session, term_code: str | None) -> dict | None:
