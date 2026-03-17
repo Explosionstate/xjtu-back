@@ -6,12 +6,13 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.errors import BusinessError
 from app.core.security import create_access_token, hash_password, verify_password
+from app.db.academic_session import academic_session_scope
 from app.models.rbac import AuthLoginAttempt, SysRole, SysUserRole, User
 
 MAX_LOGIN_RETRY = 5
@@ -71,7 +72,20 @@ def login(db: Session, login_name: str, password: str) -> str:
         attempt.failed_count = 0
 
     user = db.scalar(select(User).where(User.login_name == login_name))
-    if user is None or not verify_password(password, user.password):
+    local_verified = _verify_local_password(password, user.password) if user else False
+
+    if user is None or not local_verified:
+        external = _authenticate_external_user(login_name=login_name, password=password)
+        if external is not None:
+            user = _upsert_external_user(
+                db=db,
+                existing_user=user,
+                external=external,
+                plain_password=password,
+            )
+            local_verified = True
+
+    if user is None or not local_verified:
         if attempt is None:
             attempt = AuthLoginAttempt(
                 login_name=login_name, failed_count=1, last_failed_at=datetime.utcnow()
@@ -83,6 +97,10 @@ def login(db: Session, login_name: str, password: str) -> str:
         db.commit()
         raise BusinessError("用户名或密码错误", status_code=401)
 
+    if user and user.password == password:
+        # Auto-upgrade legacy plain text password records.
+        user.password = hash_password(password)
+
     if attempt is not None and attempt.failed_count > 0:
         attempt.failed_count = 0
         attempt.last_failed_at = None
@@ -90,6 +108,96 @@ def login(db: Session, login_name: str, password: str) -> str:
     user.last_login_time = datetime.utcnow()
     db.commit()
     return create_access_token(str(user.id))
+
+
+def _verify_local_password(plain_password: str, stored_password: str) -> bool:
+    if not stored_password:
+        return False
+    if verify_password(plain_password, stored_password):
+        return True
+    # Compatible with legacy plaintext records.
+    return plain_password == stored_password
+
+
+def _authenticate_external_user(login_name: str, password: str) -> dict | None:
+    try:
+        with academic_session_scope() as adb:
+            row = (
+                adb.execute(
+                    text(
+                        """
+                    SELECT id, login_name, role, name, email, department_name
+                    FROM `user`
+                    WHERE login_name = :login_name
+                      AND password = :password
+                      AND is_deleted = 0
+                    LIMIT 1
+                    """
+                    ),
+                    {"login_name": login_name, "password": password},
+                )
+                .mappings()
+                .first()
+            )
+            if not row:
+                return None
+            return dict(row)
+    except Exception:
+        return None
+
+
+def _upsert_external_user(
+    db: Session,
+    existing_user: User | None,
+    external: dict,
+    plain_password: str,
+) -> User:
+    source_role = str(external.get("role") or "student").strip().lower()
+    mapped_role = "super_admin" if source_role == "admin" else "user"
+    login_name = str(external.get("login_name") or "").strip()
+
+    user = existing_user
+    if user is None:
+        user = User(
+            login_name=login_name,
+            password=hash_password(plain_password),
+            role=mapped_role,
+            name=str(external.get("name") or login_name),
+            email=str(external.get("email") or "") or None,
+            department_name=str(external.get("department_name") or "") or None,
+            is_deleted=0,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        updated = False
+        if user.is_deleted != 0:
+            user.is_deleted = 0
+            updated = True
+        if user.role != mapped_role:
+            user.role = mapped_role
+            updated = True
+        if not verify_password(plain_password, user.password):
+            user.password = hash_password(plain_password)
+            updated = True
+        ext_name = str(external.get("name") or "").strip()
+        if ext_name and user.name != ext_name:
+            user.name = ext_name
+            updated = True
+        ext_email = str(external.get("email") or "").strip()
+        if ext_email and user.email != ext_email:
+            user.email = ext_email
+            updated = True
+        ext_dept = str(external.get("department_name") or "").strip()
+        if ext_dept and user.department_name != ext_dept:
+            user.department_name = ext_dept
+            updated = True
+        if updated:
+            db.commit()
+
+    _ensure_role_link(db, user.id, mapped_role)
+    return user
 
 
 def get_active_user(db: Session, user_id: int) -> User:

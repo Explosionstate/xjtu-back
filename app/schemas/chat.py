@@ -10,6 +10,7 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
+    agent_key: str | None = None
     messages: list[ChatMessage]
     stream: bool = False
     conversation_id: str | None = None

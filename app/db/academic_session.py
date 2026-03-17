@@ -25,7 +25,11 @@ def get_academic_engine() -> Engine:
             connect_args = (
                 {"check_same_thread": False}
                 if settings.academic_db_url.startswith("sqlite")
-                else {}
+                else {
+                    "connect_timeout": 3,
+                    "read_timeout": 6,
+                    "write_timeout": 6,
+                }
             )
             _academic_engine = create_engine(
                 settings.academic_db_url,

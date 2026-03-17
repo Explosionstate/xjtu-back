@@ -22,12 +22,12 @@ FIXED_RERANKER_ENABLED = False
 FIXED_RERANKER_MODEL = "BAAI/bge-reranker-base"
 FIXED_RERANKER_TOP_N = 20
 FIXED_RERANKER_WEIGHT = 0.7
-FIXED_LLM_ENABLED = False
+FIXED_LLM_ENABLED = True
 FIXED_LLM_TIMEOUT_SECONDS = 8
 FIXED_XJTUEXER_SSO_CONSUME_URL = "http://127.0.0.1:8080/api/sso/consume"
 FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS = 5
 FIXED_ACADEMIC_DB_URL = (
-    "mysql+pymysql://root:zzyhhz19708@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
+    "mysql+pymysql://root:admin@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
 )
 FIXED_ACADEMIC_QUERY_TIMEOUT_SECONDS = 8
 FIXED_LOCAL_TRANSFORMER_ENABLED = True
@@ -126,10 +126,10 @@ def get_settings() -> Settings:
         default_chunk_size=int(os.getenv("DEFAULT_CHUNK_SIZE", "500")),
         default_chunk_overlap=int(os.getenv("DEFAULT_CHUNK_OVERLAP", "80")),
         max_answer_chars=int(os.getenv("MAX_ANSWER_CHARS", "800")),
-        retrieval_top_k=int(os.getenv("RETRIEVAL_TOP_K", "8")),
-        retrieval_score_threshold=float(os.getenv("RETRIEVAL_SCORE_THRESHOLD", "0.15")),
+        retrieval_top_k=int(os.getenv("RETRIEVAL_TOP_K", "4")),
+        retrieval_score_threshold=float(os.getenv("RETRIEVAL_SCORE_THRESHOLD", "0.25")),
         retrieval_fusion_mode=os.getenv("RETRIEVAL_FUSION_MODE", "weighted"),
-        retrieval_alpha=float(os.getenv("RETRIEVAL_ALPHA", "0.6")),
+        retrieval_alpha=float(os.getenv("RETRIEVAL_ALPHA", "0.55")),
         llm_base_url=os.getenv(
             "LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         ),

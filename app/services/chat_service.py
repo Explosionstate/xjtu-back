@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from time import perf_counter
 import uuid
@@ -8,19 +9,32 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.errors import BusinessError
 from app.models.chat import ChatLog, Conversation, Message
 from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
 from app.schemas.chat import ChatCompletionRequest, ChatThinking, SourceItem
 from app.services.llm_service import LLMAnswerResult, answer_with_llm
+from app.services.external_profile_service import load_user_profile_context
+from app.services.langgraph_service import run_chat_workflow_graph
 from app.services.retrieval_config_service import get_effective_retrieval_config
 from app.services.retrieval_service import hybrid_retrieve
-from app.services.sensitive_service import get_sensitive_words, mask_sensitive_text
+from app.services.sensitive_service import (
+    detect_sensitive_text,
+    get_sensitive_words,
+    log_sensitive_block,
+    mask_sensitive_text,
+)
 from app.services.system_config_service import (
     DEFAULT_CONTEXT_MAX_ROUNDS,
     DEFAULT_CONTEXT_MAX_TOKENS,
     get_int_config,
 )
+
+
+CHAT_TOTAL_TIMEOUT_SECONDS = 30
+RETRIEVAL_TIMEOUT_SECONDS = 8
+PROFILE_TIMEOUT_SECONDS = 2
 
 
 @dataclass(frozen=True)
@@ -52,10 +66,24 @@ def _ensure_conversation(
 
 def _format_rule_answer(question: str) -> str | None:
     lowered = question.lower()
+    if any(item in lowered for item in ["你好", "hello", "hi", "嗨", "在吗"]):
+        return (
+            "结论：你好，我是西交 AI 智能体。\n"
+            "依据：当前消息属于问候场景，不需要知识库检索。\n"
+            "建议：你可以继续提问，例如“请分析我的学情风险并给建议”。"
+        )
     if "帮助" in question or "help" in lowered:
-        return "你可以提问知识库中的内容，也可以通过 kb_ids 或文档范围限定检索来源。"
+        return (
+            "结论：你可以直接发起知识问答。\n"
+            "依据：系统支持知识库检索、文档范围限定与模型增强。\n"
+            "建议：可指定问题场景并选择助手类型以提升回答质量。"
+        )
     if "版本" in question or "version" in lowered:
-        return "xjtu-back 对话服务版本：0.1.0"
+        return (
+            "结论：当前对话服务版本为 0.1.0。\n"
+            "依据：系统内置版本信息。\n"
+            "建议：如需新特性，请关注后续版本发布说明。"
+        )
     return None
 
 
@@ -133,14 +161,18 @@ def _build_summary_thinking(
         elif llm_result.mode == "llm":
             steps.append("已基于检索结果组织最终回答。")
         elif llm_result.mode == "disabled":
-            steps.append("当前未启用可返回 reasoning 的模型，本次回答由检索结果整理生成。")
+            steps.append(
+                "当前未启用可返回 reasoning 的模型，本次回答由检索结果整理生成。"
+            )
         else:
             steps.append("模型未返回可公开展示的 reasoning，本次展示的是系统处理摘要。")
 
     steps.append("这里展示的是处理摘要，不是模型私有思维链。")
     return ChatThinking(
         title="处理摘要",
-        content="\n".join(f"{index}. {step}" for index, step in enumerate(steps, start=1)),
+        content="\n".join(
+            f"{index}. {step}" for index, step in enumerate(steps, start=1)
+        ),
         kind="summary",
         is_real=False,
         collapsed=True,
@@ -182,10 +214,26 @@ def chat_completion(
     payload: ChatCompletionRequest,
     current_user: User | None,
 ) -> ChatCompletionResult:
-    question = _get_latest_user_question([m.model_dump() for m in payload.messages])
+    raw_question = _get_latest_user_question([m.model_dump() for m in payload.messages])
     sensitive_words = get_sensitive_words(db)
-    question = mask_sensitive_text(question, sensitive_words)
     conversation_id = payload.conversation_id or str(uuid.uuid4())
+    blocked_word = detect_sensitive_text(raw_question, sensitive_words)
+    if blocked_word:
+        log_sensitive_block(
+            db=db,
+            user_id=current_user.id if current_user else None,
+            conversation_id=conversation_id,
+            agent_key=payload.agent_key,
+            direction="input",
+            blocked_word=blocked_word,
+            content=raw_question,
+        )
+        raise BusinessError(
+            f"输入内容命中敏感词，已拦截（{blocked_word}）。",
+            status_code=400,
+        )
+
+    question = raw_question.strip()
     kb_ids = payload.kb_ids or [
         item.id
         for item in db.scalars(
@@ -238,28 +286,105 @@ def chat_completion(
     if rule_answer_text:
         answer = rule_answer_text
         sources: list[SourceItem] = []
+        system_instruction = ""
     else:
-        retrieved = hybrid_retrieve(
-            db=db,
-            query=retrieval_query,
-            kb_ids=kb_ids,
-            document_ids=payload.document_ids,
-            top_k=top_k,
-            score_threshold=score_threshold,
-            fusion_mode=fusion_mode,
-            alpha=alpha,
-        )
-        if not retrieved:
-            answer = "未在知识库中找到相关答案，请换个问题试试。"
-            sources = []
-        else:
-            contexts = [item["content"] for item in retrieved]
+
+        def _load_profile(_: str) -> str:
+            if current_user is None:
+                return ""
+            try:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        load_user_profile_context, current_user.login_name
+                    )
+                    return future.result(timeout=PROFILE_TIMEOUT_SECONDS)
+            except Exception:
+                return ""
+
+        def _retrieve(runtime_question: str) -> tuple[list[str], list[dict]]:
+            nonlocal retrieved
+            query = _build_retrieval_query(trimmed_history, runtime_question)
+            try:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        hybrid_retrieve,
+                        db,
+                        query,
+                        kb_ids,
+                        payload.document_ids,
+                        top_k,
+                        score_threshold,
+                        fusion_mode,
+                        alpha,
+                    )
+                    retrieved = future.result(timeout=RETRIEVAL_TIMEOUT_SECONDS)
+            except FuturesTimeoutError:
+                retrieved = []
+            except Exception:
+                retrieved = []
+            return [item["content"] for item in retrieved], retrieved
+
+        def _generate(
+            runtime_question: str,
+            contexts: list[str],
+            system_instruction: str,
+        ) -> str:
+            nonlocal llm_result
             llm_result = answer_with_llm(
-                question=question,
+                question=runtime_question,
                 contexts=contexts,
                 llm_enabled=payload.llm_enabled,
+                system_instruction=system_instruction,
             )
-            answer = llm_result.answer or "\n\n".join(contexts)
+            return llm_result.answer
+
+        graph_result = run_chat_workflow_graph(
+            question=question,
+            agent_key=payload.agent_key,
+            sensitive_words=sensitive_words,
+            detect_fn=detect_sensitive_text,
+            load_profile_fn=_load_profile,
+            retrieve_fn=_retrieve,
+            generate_fn=_generate,
+        )
+
+        blocked_stage = str(graph_result.get("blocked_stage") or "")
+        blocked_word = str(graph_result.get("blocked_word") or "")
+        if blocked_stage and blocked_word:
+            direction = "output" if blocked_stage == "output" else "input"
+            log_sensitive_block(
+                db=db,
+                user_id=current_user.id if current_user else None,
+                conversation_id=conversation_id,
+                agent_key=payload.agent_key,
+                direction=direction,
+                blocked_word=blocked_word,
+                content=(
+                    str(graph_result.get("answer") or "")
+                    if direction == "output"
+                    else question
+                ),
+            )
+            raise BusinessError(
+                f"{('回答' if direction == 'output' else '输入')}命中敏感词，已拦截（{blocked_word}）。",
+                status_code=400,
+            )
+
+        system_instruction = str(graph_result.get("system_instruction") or "")
+        answer = str(graph_result.get("answer") or "").strip()
+        if not answer:
+            answer = "结论：未检索到可用答案。\n依据：当前知识库上下文不足。\n建议：请补充更具体问题或导入相关文档。"
+
+        if perf_counter() - start > CHAT_TOTAL_TIMEOUT_SECONDS:
+            answer = (
+                "结论：当前请求处理超出实时窗口。\n"
+                "依据：检索或生成耗时超过 30 秒。\n"
+                "建议：请缩小检索范围（文档/知识库）或降低召回数量后重试。"
+            )
+            sources = []
+            retrieved = []
+
+        if retrieved:
             sources = [
                 SourceItem(
                     source_location=item["source_location"],
@@ -268,6 +393,24 @@ def chat_completion(
                 )
                 for item in retrieved
             ]
+        else:
+            sources = []
+
+    blocked_output_word = detect_sensitive_text(answer, sensitive_words)
+    if blocked_output_word:
+        log_sensitive_block(
+            db=db,
+            user_id=current_user.id if current_user else None,
+            conversation_id=conversation_id,
+            agent_key=payload.agent_key,
+            direction="output",
+            blocked_word=blocked_output_word,
+            content=answer,
+        )
+        raise BusinessError(
+            f"回答命中敏感词，已拦截（{blocked_output_word}）。",
+            status_code=400,
+        )
 
     answer = mask_sensitive_text(answer, sensitive_words)
     if len(answer) > settings.max_answer_chars:
@@ -286,7 +429,8 @@ def chat_completion(
     thinking_content = mask_sensitive_text(thinking.content, sensitive_words).strip()
     thinking = ChatThinking(
         title=thinking.title,
-        content=thinking_content or "1. 已完成当前问题处理。\n2. 这里展示的是系统处理摘要，不是模型私有思维链。",
+        content=thinking_content
+        or "1. 已完成当前问题处理。\n2. 这里展示的是系统处理摘要，不是模型私有思维链。",
         kind=thinking.kind,
         is_real=thinking.is_real,
         collapsed=thinking.collapsed,

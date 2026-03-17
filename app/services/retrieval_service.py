@@ -4,7 +4,7 @@ import re
 from collections import defaultdict
 
 from rank_bm25 import BM25Okapi
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.models.document import DocumentChunk
@@ -18,6 +18,27 @@ from app.vectorstore.chroma_manager import search_similar_chunks
 def _tokenize(text: str) -> list[str]:
     cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", text.lower())
     return [tok for tok in cleaned.split() if tok]
+
+
+def _is_small_talk(query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    small_talk_keywords = ["你好", "在吗", "hello", "hi", "嗨", "你是谁"]
+    return any(keyword in q for keyword in small_talk_keywords) and len(q) <= 12
+
+
+def _looks_like_schema_chunk(content: str) -> bool:
+    lowered = (content or "").lower()
+    markers = [
+        "create table",
+        "primary key",
+        "foreign key",
+        "comment '",
+        "engine = innodb",
+        "drop table",
+    ]
+    return any(marker in lowered for marker in markers)
 
 
 def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
@@ -86,10 +107,18 @@ def hybrid_retrieve_with_debug(
     fusion_mode: str,
     alpha: float,
 ) -> tuple[list[dict], list[dict]]:
+    if _is_small_talk(query):
+        return [], []
+
+    max_candidates = max(400, int(top_k) * 120)
     stmt = select(DocumentChunk).where(DocumentChunk.kb_id.in_(kb_ids))
     if document_ids:
         stmt = stmt.where(DocumentChunk.document_id.in_(document_ids))
+    stmt = stmt.order_by(desc(DocumentChunk.created_at)).limit(max_candidates)
     chunk_rows = list(db.scalars(stmt).all())
+    chunk_rows = [
+        row for row in chunk_rows if not _looks_like_schema_chunk(row.content)
+    ]
     if not chunk_rows:
         return [], []
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import shutil
 import stat
@@ -27,6 +28,9 @@ try:
 except ImportError:
     chromadb = None
     ChromaClientSettings = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def _create_client(path: Path):
@@ -103,6 +107,8 @@ def search_similar_chunks(
     max_results = top_k
     try:
         current_count = int(collection.count())
+        if current_count <= 0:
+            return []
         max_results = max(1, min(top_k, current_count))
     except Exception:
         pass
@@ -112,7 +118,13 @@ def search_similar_chunks(
         query_payload["query_embeddings"] = [query_embedding]
     else:
         query_payload["query_texts"] = [query]
-    result = collection.query(**query_payload)
+    try:
+        result = collection.query(**query_payload)
+    except Exception as exc:
+        # Chroma metadata can be temporarily inconsistent on Windows/local dev.
+        # Keep chat path available by degrading to BM25-only retrieval.
+        logger.warning("chroma query failed for kb %s: %s", kb_id, exc)
+        return []
     ids_all = result.get("ids") or [[]]
     docs_all = result.get("documents") or [[]]
     distances_all = result.get("distances") or [[]]

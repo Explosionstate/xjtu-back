@@ -34,6 +34,7 @@ def answer_with_llm(
     question: str,
     contexts: list[str],
     llm_enabled: bool | None = None,
+    system_instruction: str | None = None,
 ) -> LLMAnswerResult:
     enabled = settings.llm_enabled if llm_enabled is None else llm_enabled
     if not enabled or not settings.api_key:
@@ -42,7 +43,12 @@ def answer_with_llm(
     compact_contexts = [ctx.strip()[:1200] for ctx in contexts[:3] if ctx.strip()]
 
     prompt = (
+        f"{(system_instruction or '').strip()}\n"
         "你是知识库问答助手。请严格依据给定资料作答，不编造事实。"
+        "回答必须严格按以下结构输出：\n"
+        "结论：...\n"
+        "依据：...\n"
+        "建议：...\n"
         "请优先使用自然语言总结，先给结论再给简洁步骤。"
         "除非用户明确要求，不要原样大段复制文档或连续命令列表。"
         "如果资料不足，请明确说明资料不足。\n\n"
@@ -59,6 +65,7 @@ def answer_with_llm(
                 answer=_fallback_natural_answer(question, compact_contexts),
                 mode="empty_fallback",
             )
+        answer = _ensure_three_section(answer)
         return LLMAnswerResult(
             answer=answer,
             mode="llm",
@@ -80,7 +87,7 @@ def answer_with_llm(
 def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
     del question
     if not contexts:
-        return "未在知识库中检索到可用于回答的资料。"
+        return "结论：未在知识库中检索到可用于回答的资料。\n依据：当前检索结果为空。\n建议：请补充更具体问题或增加知识库资料后重试。"
 
     merged = "\n".join(contexts)
     sentences = re.split(r"[\n。！？!?]", merged)
@@ -94,7 +101,26 @@ def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
             break
 
     summary = "；".join(cleaned)
-    return f"根据知识库检索结果，{summary}。"
+    return (
+        f"结论：根据当前检索结果，问题可从资料中部分回答。\n"
+        f"依据：{summary}。\n"
+        "建议：如需更精准结论，请补充上下文或限定具体场景。"
+    )
+
+
+def _ensure_three_section(answer: str) -> str:
+    text = (answer or "").strip()
+    if not text:
+        return "结论：暂无有效回答。\n依据：模型未返回内容。\n建议：请调整问题后重试。"
+
+    if all(tag in text for tag in ("结论", "依据", "建议")):
+        return text
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    head = lines[0] if lines else text
+    rest = "；".join(lines[1:3]) if len(lines) > 1 else text[:160]
+    tail = lines[-1] if len(lines) > 2 else "建议结合更多上下文继续追问。"
+    return f"结论：{head}\n依据：{rest}\n建议：{tail}"
 
 
 def _extract_text_content(content: Any) -> str:
