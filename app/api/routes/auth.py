@@ -32,10 +32,12 @@ def me(current_user=Depends(get_current_user)) -> UserItem:
 def sso_exchange_api(
     payload: SSOExchangeRequest, db: Session = Depends(get_db)
 ) -> SSOExchangeResponse:
-    token, user, source_table = sso_exchange(db=db, ticket=payload.ticket)
+    token, user, source_table, frontend_role = sso_exchange(
+        db=db, ticket=payload.ticket
+    )
     return SSOExchangeResponse(
         access_token=token,
         login_name=user.login_name,
-        role=user.role,
+        role=frontend_role,
         source_table=source_table,
     )

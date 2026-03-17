@@ -113,7 +113,7 @@ def get_user_role_codes(db: Session, user_id: int) -> set[str]:
     return role_codes
 
 
-def sso_exchange(db: Session, ticket: str) -> tuple[str, User, str]:
+def sso_exchange(db: Session, ticket: str) -> tuple[str, User, str, str]:
     payload = _consume_xjtuexer_ticket(ticket)
     login_name = payload.get("loginName")
     source_role = payload.get("role")
@@ -123,7 +123,8 @@ def sso_exchange(db: Session, ticket: str) -> tuple[str, User, str]:
     if not login_name or not source_role:
         raise BusinessError("SSO票据缺少用户信息", status_code=401)
 
-    mapped_role = _map_sso_role(source_role)
+    normalized_source_role = str(source_role).strip().lower()
+    mapped_role = _map_sso_role(normalized_source_role)
     user = db.scalar(
         select(User).where(User.login_name == login_name, User.is_deleted == 0)
     )
@@ -162,7 +163,8 @@ def sso_exchange(db: Session, ticket: str) -> tuple[str, User, str]:
     db.commit()
 
     token = create_access_token(str(user.id))
-    return token, user, source_table
+    frontend_role = _map_frontend_role(normalized_source_role, mapped_role)
+    return token, user, source_table, frontend_role
 
 
 def _consume_xjtuexer_ticket(ticket: str) -> dict:
@@ -206,6 +208,14 @@ def _map_sso_role(source_role: str) -> str:
     if role in {"teacher", "student"}:
         return "user"
     return "user"
+
+
+def _map_frontend_role(source_role: str, mapped_role: str) -> str:
+    if source_role in {"admin", "teacher", "student"}:
+        return source_role
+    if mapped_role == "super_admin":
+        return "admin"
+    return "student"
 
 
 def _ensure_role_link(db: Session, user_id: int, role_code: str) -> None:

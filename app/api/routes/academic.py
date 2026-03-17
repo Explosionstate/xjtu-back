@@ -1,0 +1,21 @@
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Query
+
+from app.api.deps import get_current_user
+from app.models.rbac import User
+from app.schemas.academic import AcademicAnalysisResponse
+from app.services.academic_service import get_my_academic_analysis
+
+router = APIRouter(prefix="/academic", tags=["academic"])
+
+
+@router.get("/analysis/me", response_model=AcademicAnalysisResponse)
+def get_academic_analysis_me(
+    term_code: str | None = Query(default=None, max_length=32),
+    current_user: User = Depends(get_current_user),
+) -> AcademicAnalysisResponse:
+    return get_my_academic_analysis(
+        login_name=current_user.login_name,
+        term_code=term_code,
+    )

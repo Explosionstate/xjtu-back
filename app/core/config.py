@@ -26,6 +26,10 @@ FIXED_LLM_ENABLED = False
 FIXED_LLM_TIMEOUT_SECONDS = 8
 FIXED_XJTUEXER_SSO_CONSUME_URL = "http://127.0.0.1:8080/api/sso/consume"
 FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS = 5
+FIXED_ACADEMIC_DB_URL = (
+    "mysql+pymysql://root:zzyhhz19708@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
+)
+FIXED_ACADEMIC_QUERY_TIMEOUT_SECONDS = 8
 FIXED_LOCAL_TRANSFORMER_ENABLED = True
 FIXED_LOCAL_TRANSFORMER_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 FIXED_LOCAL_TRANSFORMER_MAX_NEW_TOKENS = 256
@@ -70,6 +74,8 @@ class Settings:
     reranker_weight: float
     xjtuexer_sso_consume_url: str
     xjtuexer_sso_timeout_seconds: int
+    academic_db_url: str
+    academic_query_timeout_seconds: int
     local_transformer_enabled: bool
     local_transformer_model: str
     local_transformer_max_new_tokens: int
@@ -144,6 +150,13 @@ def get_settings() -> Settings:
         reranker_weight=FIXED_RERANKER_WEIGHT,
         xjtuexer_sso_consume_url=FIXED_XJTUEXER_SSO_CONSUME_URL,
         xjtuexer_sso_timeout_seconds=FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS,
+        academic_db_url=os.getenv("ACADEMIC_DB_URL", FIXED_ACADEMIC_DB_URL),
+        academic_query_timeout_seconds=int(
+            os.getenv(
+                "ACADEMIC_QUERY_TIMEOUT_SECONDS",
+                str(FIXED_ACADEMIC_QUERY_TIMEOUT_SECONDS),
+            )
+        ),
         local_transformer_enabled=FIXED_LOCAL_TRANSFORMER_ENABLED,
         local_transformer_model=FIXED_LOCAL_TRANSFORMER_MODEL,
         local_transformer_max_new_tokens=FIXED_LOCAL_TRANSFORMER_MAX_NEW_TOKENS,
