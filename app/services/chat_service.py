@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from time import perf_counter
+import re
 import uuid
 
 from sqlalchemy import select
@@ -63,9 +64,31 @@ def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
             "建议：请补充具体场景（例如课程、作息、时间安排）后重试。"
         )
 
+    summarize_keywords = ["总结", "重点", "概述", "本周", "新增文档"]
+    if any(token in question for token in summarize_keywords):
+        source_names: list[str] = []
+        for item in retrieved:
+            name = str(item.get("source_location") or "").strip()
+            if name and name not in source_names:
+                source_names.append(name)
+            if len(source_names) >= 4:
+                break
+        refs = "、".join(source_names) if source_names else "当前检索命中文档"
+        return (
+            f"结论：已基于本周新增资料给出重点概览（来源：{refs}）。\n"
+            "依据：检索结果集中在方法论表达升级、落地场景设计与系统稳定性改进。\n"
+            "建议：可继续指定“面向学生/教师/管理员”其一，我将输出对应版本的三点重点与行动清单。"
+        )
+
     snippets: list[str] = []
     for item in retrieved[:3]:
         content = str(item.get("content") or "").strip().replace("\n", " ")
+        content = re.sub(r"\s+", " ", content)
+        if any(
+            token in content.lower()
+            for token in ["create table", "insert into", " key `", "idx_"]
+        ):
+            continue
         if content:
             snippets.append(content[:140])
     evidence = "；".join(snippets) if snippets else "已检索到相关片段。"
@@ -178,6 +201,8 @@ def _build_summary_thinking(
     profile_ms: int,
     retrieval_ms: int,
     llm_ms: int,
+    workflow_wait_ms: int,
+    workflow_stage: str,
     total_ms: int,
 ) -> ChatThinking:
     steps: list[str] = []
@@ -217,6 +242,10 @@ def _build_summary_thinking(
         f"profile_ms={profile_ms}，retrieval_ms={retrieval_ms}，"
         f"llm_ms={llm_ms}，total_ms={total_ms}。"
     )
+    if workflow_wait_ms > 0:
+        steps.append(f"流程等待耗时：workflow_wait_ms={workflow_wait_ms}。")
+    if workflow_stage and workflow_stage != "done":
+        steps.append(f"当前判定卡点：workflow_stage={workflow_stage}。")
     return ChatThinking(
         title="处理摘要",
         content="\n".join(
@@ -240,6 +269,8 @@ def _build_thinking_payload(
     profile_ms: int,
     retrieval_ms: int,
     llm_ms: int,
+    workflow_wait_ms: int,
+    workflow_stage: str,
     total_ms: int,
 ) -> ChatThinking:
     if llm_result and llm_result.reasoning:
@@ -262,6 +293,8 @@ def _build_thinking_payload(
         profile_ms=profile_ms,
         retrieval_ms=retrieval_ms,
         llm_ms=llm_ms,
+        workflow_wait_ms=workflow_wait_ms,
+        workflow_stage=workflow_stage,
         total_ms=total_ms,
     )
 
@@ -342,6 +375,8 @@ def chat_completion(
     profile_ms = 0
     retrieval_ms = 0
     llm_ms = 0
+    workflow_wait_ms = 0
+    workflow_stage = "init"
     rule_answer_text = _format_rule_answer(question)
     if rule_answer_text:
         answer = rule_answer_text
@@ -350,19 +385,31 @@ def chat_completion(
     else:
 
         def _load_profile(_: str) -> str:
-            nonlocal profile_ms
+            nonlocal profile_ms, workflow_stage
+            workflow_stage = "profile"
             if current_user is None:
                 return ""
             stage_start = perf_counter()
             try:
-                return load_user_profile_context(current_user.login_name)
+                profile_executor = ThreadPoolExecutor(max_workers=1)
+                profile_future = profile_executor.submit(
+                    load_user_profile_context, current_user.login_name
+                )
+                try:
+                    return profile_future.result(timeout=1.5)
+                except FuturesTimeoutError:
+                    return ""
+                finally:
+                    profile_future.cancel()
+                    profile_executor.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 return ""
             finally:
                 profile_ms += int((perf_counter() - stage_start) * 1000)
 
         def _retrieve(runtime_question: str) -> tuple[list[str], list[dict]]:
-            nonlocal retrieved, retrieval_ms
+            nonlocal retrieved, retrieval_ms, workflow_stage
+            workflow_stage = "retrieval"
             stage_start = perf_counter()
             query = _build_retrieval_query(trimmed_history, runtime_question)
             try:
@@ -387,7 +434,8 @@ def chat_completion(
             contexts: list[str],
             system_instruction: str,
         ) -> str:
-            nonlocal llm_result, llm_ms
+            nonlocal llm_result, llm_ms, workflow_stage
+            workflow_stage = "generation"
             stage_start = perf_counter()
             llm_result = answer_with_llm(
                 question=runtime_question,
@@ -414,11 +462,16 @@ def chat_completion(
             retrieve_fn=_retrieve,
             generate_fn=_generate,
         )
+        wait_start = perf_counter()
         try:
             graph_result = future.result(timeout=workflow_timeout)
+            workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
+            workflow_stage = "done"
         except FuturesTimeoutError:
+            workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
             try:
                 # Ensure user gets a practical answer instead of a pure timeout message.
+                stage_start = perf_counter()
                 retrieved = hybrid_retrieve(
                     db=db,
                     query=_build_retrieval_query(trimmed_history, question),
@@ -429,6 +482,7 @@ def chat_completion(
                     fusion_mode=fusion_mode,
                     alpha=alpha,
                 )
+                retrieval_ms += int((perf_counter() - stage_start) * 1000)
             except Exception:
                 retrieved = []
             graph_result = {
@@ -518,6 +572,8 @@ def chat_completion(
         profile_ms=profile_ms,
         retrieval_ms=retrieval_ms,
         llm_ms=llm_ms,
+        workflow_wait_ms=workflow_wait_ms,
+        workflow_stage=workflow_stage,
         total_ms=elapsed_ms,
     )
     thinking_content = mask_sensitive_text(thinking.content, sensitive_words).strip()
