@@ -33,8 +33,7 @@ from app.services.system_config_service import (
 
 
 CHAT_TOTAL_TIMEOUT_SECONDS = 30
-RETRIEVAL_TIMEOUT_SECONDS = 8
-PROFILE_TIMEOUT_SECONDS = 2
+WORKFLOW_TIMEOUT_SECONDS = 24
 
 
 @dataclass(frozen=True)
@@ -43,6 +42,38 @@ class ChatCompletionResult:
     answer: str
     sources: list[SourceItem]
     thinking: ChatThinking
+
+
+def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
+    lowered = (question or "").lower()
+    if "xjtu-back" in lowered and any(
+        token in question for token in ["启动", "运行", "start"]
+    ):
+        return (
+            "结论：建议在 xjtu-back 根目录使用脚本启动，最稳妥。\n"
+            "依据：仓库已提供 scripts/ops.py，可自动处理端口占用、重启与健康检查。\n"
+            "建议：先执行 `python scripts/ops.py start --reload --force-stop`，"
+            "再执行 `python scripts/ops.py check --probe` 验证 /health。"
+        )
+
+    if not retrieved:
+        return (
+            "结论：当前未检索到足够的直接依据。\n"
+            "依据：系统已在限定时间内完成快速检索，但有效片段不足。\n"
+            "建议：请补充具体场景（例如课程、作息、时间安排）后重试。"
+        )
+
+    snippets: list[str] = []
+    for item in retrieved[:3]:
+        content = str(item.get("content") or "").strip().replace("\n", " ")
+        if content:
+            snippets.append(content[:140])
+    evidence = "；".join(snippets) if snippets else "已检索到相关片段。"
+    return (
+        f"结论：已基于当前检索结果回答“{question[:32]}”。\n"
+        f"依据：{evidence}\n"
+        "建议：若你希望更精确，请补充目标对象、时间范围和约束条件（例如平台、端口、环境）。"
+    )
 
 
 def _get_latest_user_question(messages: list[dict]) -> str:
@@ -83,6 +114,15 @@ def _format_rule_answer(question: str) -> str | None:
             "结论：当前对话服务版本为 0.1.0。\n"
             "依据：系统内置版本信息。\n"
             "建议：如需新特性，请关注后续版本发布说明。"
+        )
+    if "xjtu-back" in lowered and any(
+        token in question for token in ["启动", "运行", "start"]
+    ):
+        return (
+            "结论：请在 xjtu-back 根目录用运维脚本启动后端。\n"
+            "依据：`scripts/ops.py` 已封装 start/stop/restart/check，并处理端口冲突。\n"
+            "建议：依次执行 `python scripts/ops.py start --reload --force-stop`、"
+            "`python scripts/ops.py check --probe`；如需重启用 `python scripts/ops.py restart --reload`。"
         )
     return None
 
@@ -135,6 +175,10 @@ def _build_summary_thinking(
     score_threshold: float,
     rule_answer: bool,
     llm_result: LLMAnswerResult | None,
+    profile_ms: int,
+    retrieval_ms: int,
+    llm_ms: int,
+    total_ms: int,
 ) -> ChatThinking:
     steps: list[str] = []
     if trimmed_history:
@@ -168,6 +212,11 @@ def _build_summary_thinking(
             steps.append("模型未返回可公开展示的 reasoning，本次展示的是系统处理摘要。")
 
     steps.append("这里展示的是处理摘要，不是模型私有思维链。")
+    steps.append(
+        "性能耗时："
+        f"profile_ms={profile_ms}，retrieval_ms={retrieval_ms}，"
+        f"llm_ms={llm_ms}，total_ms={total_ms}。"
+    )
     return ChatThinking(
         title="处理摘要",
         content="\n".join(
@@ -188,6 +237,10 @@ def _build_thinking_payload(
     score_threshold: float,
     rule_answer: bool,
     llm_result: LLMAnswerResult | None,
+    profile_ms: int,
+    retrieval_ms: int,
+    llm_ms: int,
+    total_ms: int,
 ) -> ChatThinking:
     if llm_result and llm_result.reasoning:
         return ChatThinking(
@@ -206,6 +259,10 @@ def _build_thinking_payload(
         score_threshold=score_threshold,
         rule_answer=rule_answer,
         llm_result=llm_result,
+        profile_ms=profile_ms,
+        retrieval_ms=retrieval_ms,
+        llm_ms=llm_ms,
+        total_ms=total_ms,
     )
 
 
@@ -282,6 +339,9 @@ def chat_completion(
     start = perf_counter()
     llm_result: LLMAnswerResult | None = None
     retrieved: list[dict] = []
+    profile_ms = 0
+    retrieval_ms = 0
+    llm_ms = 0
     rule_answer_text = _format_rule_answer(question)
     if rule_answer_text:
         answer = rule_answer_text
@@ -290,38 +350,36 @@ def chat_completion(
     else:
 
         def _load_profile(_: str) -> str:
+            nonlocal profile_ms
             if current_user is None:
                 return ""
+            stage_start = perf_counter()
             try:
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(
-                        load_user_profile_context, current_user.login_name
-                    )
-                    return future.result(timeout=PROFILE_TIMEOUT_SECONDS)
+                return load_user_profile_context(current_user.login_name)
             except Exception:
                 return ""
+            finally:
+                profile_ms += int((perf_counter() - stage_start) * 1000)
 
         def _retrieve(runtime_question: str) -> tuple[list[str], list[dict]]:
-            nonlocal retrieved
+            nonlocal retrieved, retrieval_ms
+            stage_start = perf_counter()
             query = _build_retrieval_query(trimmed_history, runtime_question)
             try:
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(
-                        hybrid_retrieve,
-                        db,
-                        query,
-                        kb_ids,
-                        payload.document_ids,
-                        top_k,
-                        score_threshold,
-                        fusion_mode,
-                        alpha,
-                    )
-                    retrieved = future.result(timeout=RETRIEVAL_TIMEOUT_SECONDS)
-            except FuturesTimeoutError:
-                retrieved = []
+                retrieved = hybrid_retrieve(
+                    db=db,
+                    query=query,
+                    kb_ids=kb_ids,
+                    document_ids=payload.document_ids,
+                    top_k=top_k,
+                    score_threshold=score_threshold,
+                    fusion_mode=fusion_mode,
+                    alpha=alpha,
+                )
             except Exception:
                 retrieved = []
+            finally:
+                retrieval_ms += int((perf_counter() - stage_start) * 1000)
             return [item["content"] for item in retrieved], retrieved
 
         def _generate(
@@ -329,16 +387,25 @@ def chat_completion(
             contexts: list[str],
             system_instruction: str,
         ) -> str:
-            nonlocal llm_result
+            nonlocal llm_result, llm_ms
+            stage_start = perf_counter()
             llm_result = answer_with_llm(
                 question=runtime_question,
                 contexts=contexts,
                 llm_enabled=payload.llm_enabled,
                 system_instruction=system_instruction,
             )
+            llm_ms += int((perf_counter() - stage_start) * 1000)
             return llm_result.answer
 
-        graph_result = run_chat_workflow_graph(
+        workflow_timeout = max(
+            8,
+            min(WORKFLOW_TIMEOUT_SECONDS, CHAT_TOTAL_TIMEOUT_SECONDS - 6),
+        )
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            run_chat_workflow_graph,
             question=question,
             agent_key=payload.agent_key,
             sensitive_words=sensitive_words,
@@ -347,6 +414,33 @@ def chat_completion(
             retrieve_fn=_retrieve,
             generate_fn=_generate,
         )
+        try:
+            graph_result = future.result(timeout=workflow_timeout)
+        except FuturesTimeoutError:
+            try:
+                # Ensure user gets a practical answer instead of a pure timeout message.
+                retrieved = hybrid_retrieve(
+                    db=db,
+                    query=_build_retrieval_query(trimmed_history, question),
+                    kb_ids=kb_ids,
+                    document_ids=payload.document_ids,
+                    top_k=min(2, top_k),
+                    score_threshold=max(score_threshold, 0.35),
+                    fusion_mode=fusion_mode,
+                    alpha=alpha,
+                )
+            except Exception:
+                retrieved = []
+            graph_result = {
+                "error": "WORKFLOW_TIMEOUT",
+                "system_instruction": "",
+                "answer": _fast_retrieval_answer(question, retrieved),
+                "blocked_stage": "",
+                "blocked_word": "",
+            }
+        finally:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
 
         blocked_stage = str(graph_result.get("blocked_stage") or "")
         blocked_word = str(graph_result.get("blocked_word") or "")
@@ -375,14 +469,8 @@ def chat_completion(
         if not answer:
             answer = "结论：未检索到可用答案。\n依据：当前知识库上下文不足。\n建议：请补充更具体问题或导入相关文档。"
 
-        if perf_counter() - start > CHAT_TOTAL_TIMEOUT_SECONDS:
-            answer = (
-                "结论：当前请求处理超出实时窗口。\n"
-                "依据：检索或生成耗时超过 30 秒。\n"
-                "建议：请缩小检索范围（文档/知识库）或降低召回数量后重试。"
-            )
-            sources = []
-            retrieved = []
+        if perf_counter() - start > CHAT_TOTAL_TIMEOUT_SECONDS and not answer:
+            answer = _fast_retrieval_answer(question, retrieved)
 
         if retrieved:
             sources = [
@@ -416,6 +504,8 @@ def chat_completion(
     if len(answer) > settings.max_answer_chars:
         answer = answer[: settings.max_answer_chars] + "..."
 
+    elapsed_ms = int((perf_counter() - start) * 1000)
+
     thinking = _build_thinking_payload(
         trimmed_history=trimmed_history,
         kb_ids=kb_ids,
@@ -425,6 +515,10 @@ def chat_completion(
         score_threshold=score_threshold,
         rule_answer=bool(rule_answer_text),
         llm_result=llm_result,
+        profile_ms=profile_ms,
+        retrieval_ms=retrieval_ms,
+        llm_ms=llm_ms,
+        total_ms=elapsed_ms,
     )
     thinking_content = mask_sensitive_text(thinking.content, sensitive_words).strip()
     thinking = ChatThinking(
@@ -435,8 +529,6 @@ def chat_completion(
         is_real=thinking.is_real,
         collapsed=thinking.collapsed,
     )
-
-    elapsed_ms = int((perf_counter() - start) * 1000)
 
     db.add(Message(conversation_id=conversation_id, role="user", content=question))
     db.add(Message(conversation_id=conversation_id, role="assistant", content=answer))

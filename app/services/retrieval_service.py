@@ -32,8 +32,18 @@ def _looks_like_schema_chunk(content: str) -> bool:
     lowered = (content or "").lower()
     markers = [
         "create table",
+        "alter table",
+        "insert into",
+        "update ",
+        "delete from",
+        "values (",
         "primary key",
         "foreign key",
+        " unique key",
+        " key `",
+        " idx_",
+        " index ",
+        "constraint ",
         "comment '",
         "engine = innodb",
         "drop table",

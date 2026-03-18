@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.errors import BusinessError
 from app.models.knowledge_base import KnowledgeBase
-from app.models.document import Document
+from app.models.document import Document, DocumentChunk
 from app.schemas.knowledge_base import (
     KnowledgeBaseCloneRequest,
     KnowledgeBaseCreateRequest,
@@ -19,9 +19,11 @@ from app.vectorstore.chroma_manager import (
     clone_kb_vectorstore,
     delete_kb_vectorstore,
     ensure_kb_vectorstore,
+    upsert_chunks,
 )
 from app.services.vectorstore_cleanup_service import enqueue_vectorstore_cleanup
 from app.services.embedding_service import normalize_embedding_model_name
+from app.services.embedding_service import embed_texts
 
 
 def create_knowledge_base(
@@ -178,3 +180,90 @@ def clone_knowledge_base(
     clone_kb_vectorstore(source_kb_id=source.id, target_kb_id=cloned.id)
     cloned.document_count = 0
     return cloned
+
+
+def rebuild_kb_vectorstore(db: Session, kb_id: str) -> dict[str, int | bool]:
+    kb = db.get(KnowledgeBase, kb_id)
+    if kb is None or kb.status == "deleted":
+        raise BusinessError("知识库不存在", status_code=404)
+
+    chunk_count_rows = db.execute(
+        select(DocumentChunk.document_id, func.count())
+        .where(DocumentChunk.kb_id == kb_id)
+        .group_by(DocumentChunk.document_id)
+    ).all()
+    chunk_count_map = {str(doc_id): int(cnt) for doc_id, cnt in chunk_count_rows}
+
+    docs = list(db.scalars(select(Document).where(Document.kb_id == kb_id)).all())
+    for doc in docs:
+        chunk_count = int(chunk_count_map.get(doc.id, 0))
+        doc.chunk_count = chunk_count
+        if chunk_count > 0:
+            doc.status = "ready"
+        elif doc.status == "processing":
+            doc.status = "failed"
+    db.commit()
+
+    docs_total = int(
+        db.scalar(
+            select(func.count()).select_from(Document).where(Document.kb_id == kb_id)
+        )
+        or 0
+    )
+    ready_docs = int(
+        db.scalar(
+            select(func.count())
+            .select_from(Document)
+            .where(Document.kb_id == kb_id, Document.status == "ready")
+        )
+        or 0
+    )
+
+    chunks = list(
+        db.scalars(
+            select(DocumentChunk)
+            .where(DocumentChunk.kb_id == kb_id)
+            .order_by(DocumentChunk.created_at.asc())
+        ).all()
+    )
+
+    reset_ok = delete_kb_vectorstore(kb_id, raise_on_failure=False)
+    ensure_kb_vectorstore(kb_id)
+
+    if not chunks:
+        return {
+            "docs_total": docs_total,
+            "ready_docs": ready_docs,
+            "indexed_chunks": 0,
+            "vectorstore_reset": bool(reset_ok),
+        }
+
+    model_name = normalize_embedding_model_name(kb.embedding_model)
+    batch_size = 128
+    indexed_chunks = 0
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start : start + batch_size]
+        texts = [item.content for item in batch]
+        upsert_chunks(
+            kb_id=kb_id,
+            chunk_ids=[item.id for item in batch],
+            texts=texts,
+            metadatas=[
+                {
+                    "kb_id": kb_id,
+                    "document_id": item.document_id,
+                    "source_location": item.source_location,
+                    "chunk_index": item.chunk_index,
+                }
+                for item in batch
+            ],
+            embeddings=embed_texts(texts, model_name=model_name),
+        )
+        indexed_chunks += len(batch)
+
+    return {
+        "docs_total": docs_total,
+        "ready_docs": ready_docs,
+        "indexed_chunks": indexed_chunks,
+        "vectorstore_reset": bool(reset_ok),
+    }

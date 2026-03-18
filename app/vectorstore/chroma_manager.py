@@ -62,10 +62,14 @@ def ensure_kb_vectorstore(kb_id: str) -> None:
 
 
 def _get_collection(kb_id: str):
-    client = _create_client(kb_vectorstore_path(kb_id))
-    if client is None:
+    try:
+        client = _create_client(kb_vectorstore_path(kb_id))
+        if client is None:
+            return None
+        return client.get_or_create_collection(name="documents")
+    except Exception as exc:
+        logger.warning("chroma open collection failed for kb %s: %s", kb_id, exc)
         return None
-    return client.get_or_create_collection(name="documents")
 
 
 def upsert_chunks(
@@ -92,7 +96,17 @@ def delete_chunks_by_document(kb_id: str, document_id: str) -> None:
     collection = _get_collection(kb_id)
     if collection is None:
         return
-    collection.delete(where={"document_id": document_id})
+    try:
+        collection.delete(where={"document_id": document_id})
+    except Exception as exc:
+        # Keep document deletion path available even if local Chroma metadata
+        # is temporarily inconsistent (common in Windows dev envs).
+        logger.warning(
+            "chroma delete failed for kb %s doc %s: %s",
+            kb_id,
+            document_id,
+            exc,
+        )
 
 
 def search_similar_chunks(

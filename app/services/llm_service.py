@@ -56,9 +56,13 @@ def answer_with_llm(
         f"资料：\n{chr(10).join(compact_contexts)}"
     )
     try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(get_chat_llm().invoke, prompt)
-            response = future.result(timeout=settings.llm_timeout_seconds + 1)
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(get_chat_llm().invoke, prompt)
+        try:
+            response = future.result(timeout=max(1, settings.llm_timeout_seconds))
+        finally:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
         answer = _extract_text_content(getattr(response, "content", ""))
         if not answer:
             return LLMAnswerResult(

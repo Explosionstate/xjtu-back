@@ -88,62 +88,70 @@ def upload_documents(
 
         store_path = _doc_storage_path(kb_id, doc.id, upload.filename or "file")
         store_path.parent.mkdir(parents=True, exist_ok=True)
-        with store_path.open("wb") as out:
-            shutil.copyfileobj(upload.file, out)
+        try:
+            with store_path.open("wb") as out:
+                shutil.copyfileobj(upload.file, out)
 
-        doc.file_path = store_path.as_posix()
-        doc.file_size = store_path.stat().st_size
+            doc.file_path = store_path.as_posix()
+            doc.file_size = store_path.stat().st_size
 
-        text = _extract_text_from_path(store_path, suffix).strip()
-        if not text:
+            text = _extract_text_from_path(store_path, suffix).strip()
+            if not text:
+                doc.status = "failed"
+                db.commit()
+                db.refresh(doc)
+                saved_docs.append(doc)
+                continue
+
+            chunks = _split_text(text, target_chunk_size, target_chunk_overlap)
+            for idx, chunk in enumerate(chunks):
+                db.add(
+                    DocumentChunk(
+                        kb_id=kb_id,
+                        document_id=doc.id,
+                        chunk_index=idx,
+                        content=chunk,
+                        source_location=doc.file_name,
+                    )
+                )
+            db.commit()
+
+            chunk_rows = list(
+                db.scalars(
+                    select(DocumentChunk)
+                    .where(DocumentChunk.document_id == doc.id)
+                    .order_by(DocumentChunk.chunk_index.asc())
+                ).all()
+            )
+            upsert_chunks(
+                kb_id=kb_id,
+                chunk_ids=[item.id for item in chunk_rows],
+                texts=[item.content for item in chunk_rows],
+                metadatas=[
+                    {
+                        "kb_id": kb_id,
+                        "document_id": doc.id,
+                        "source_location": doc.file_name,
+                        "chunk_index": item.chunk_index,
+                    }
+                    for item in chunk_rows
+                ],
+                embeddings=embed_texts(
+                    [item.content for item in chunk_rows],
+                    model_name=normalize_embedding_model_name(kb.embedding_model),
+                ),
+            )
+
+            doc.chunk_count = len(chunk_rows)
+            doc.status = "ready"
+            db.commit()
+            db.refresh(doc)
+            saved_docs.append(doc)
+        except Exception:
             doc.status = "failed"
             db.commit()
-            continue
-
-        chunks = _split_text(text, target_chunk_size, target_chunk_overlap)
-        for idx, chunk in enumerate(chunks):
-            db.add(
-                DocumentChunk(
-                    kb_id=kb_id,
-                    document_id=doc.id,
-                    chunk_index=idx,
-                    content=chunk,
-                    source_location=doc.file_name,
-                )
-            )
-        db.commit()
-
-        chunk_rows = list(
-            db.scalars(
-                select(DocumentChunk)
-                .where(DocumentChunk.document_id == doc.id)
-                .order_by(DocumentChunk.chunk_index.asc())
-            ).all()
-        )
-        upsert_chunks(
-            kb_id=kb_id,
-            chunk_ids=[item.id for item in chunk_rows],
-            texts=[item.content for item in chunk_rows],
-            metadatas=[
-                {
-                    "kb_id": kb_id,
-                    "document_id": doc.id,
-                    "source_location": doc.file_name,
-                    "chunk_index": item.chunk_index,
-                }
-                for item in chunk_rows
-            ],
-            embeddings=embed_texts(
-                [item.content for item in chunk_rows],
-                model_name=normalize_embedding_model_name(kb.embedding_model),
-            ),
-        )
-
-        doc.chunk_count = len(chunk_rows)
-        doc.status = "ready"
-        db.commit()
-        db.refresh(doc)
-        saved_docs.append(doc)
+            db.refresh(doc)
+            saved_docs.append(doc)
 
     return saved_docs
 

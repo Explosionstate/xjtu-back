@@ -20,6 +20,7 @@ from app.services.kb_service import (
     create_knowledge_base,
     delete_knowledge_base,
     list_knowledge_bases,
+    rebuild_kb_vectorstore,
     update_knowledge_base,
 )
 
@@ -98,3 +99,13 @@ def delete_kb(
         db=db, kb_id=kb_id, payload=KnowledgeBaseDeleteRequest(physical=physical)
     )
     return {"status": "ok", "cleanup_queued": cleanup_queued}
+
+
+@router.post("/{kb_id}/rebuild-vectorstore")
+def rebuild_vectorstore(
+    kb_id: str,
+    _: object = Depends(require_roles("super_admin", "kb_admin")),
+    db: Session = Depends(get_db),
+) -> dict[str, int | bool | str]:
+    result = rebuild_kb_vectorstore(db=db, kb_id=kb_id)
+    return {"status": "ok", **result}
