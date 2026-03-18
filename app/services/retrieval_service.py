@@ -51,6 +51,67 @@ def _looks_like_schema_chunk(content: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _looks_like_command_chunk(content: str) -> bool:
+    lowered = (content or "").lower()
+    markers = [
+        "pip install",
+        "npm install",
+        "python -m",
+        "requirements.txt",
+        "localhost:",
+        "127.0.0.1",
+        "uvicorn",
+        "taskkill",
+        "--reload",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def _is_summary_style_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    flags = ["总结", "概述", "重点", "新增文档", "指南", "手册"]
+    return any(flag in q for flag in flags)
+
+
+def _is_guidance_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    flags = ["学生", "建议", "指南", "学习", "生活", "成长"]
+    return any(flag in q for flag in flags)
+
+
+def _looks_like_noise_chunk(content: str) -> bool:
+    text = (content or "").strip()
+    lowered = text.lower()
+    if not text:
+        return True
+    if _looks_like_schema_chunk(text) or _looks_like_command_chunk(text):
+        return True
+    noisy_tokens = ["`", "{", "}", "=>", "::", "localhost", "http://", "https://"]
+    return sum(token in lowered for token in noisy_tokens) >= 4
+
+
+def _keyword_bonus(query: str, source_location: str, content: str) -> float:
+    q = (query or "").strip()
+    if not q:
+        return 0.0
+    src = (source_location or "").lower()
+    body = (content or "").lower()
+    bonus = 0.0
+    keyword_weights = [
+        ("学生", 0.12),
+        ("指南", 0.12),
+        ("手册", 0.10),
+        ("学业", 0.08),
+        ("成长", 0.08),
+        ("建议", 0.08),
+        ("生活", 0.06),
+    ]
+    for keyword, weight in keyword_weights:
+        if keyword in q and (keyword in src or keyword in body[:260]):
+            bonus += weight
+    return min(0.35, bonus)
+
+
 def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
     if not scores:
         return {}
@@ -129,6 +190,14 @@ def hybrid_retrieve_with_debug(
     chunk_rows = [
         row for row in chunk_rows if not _looks_like_schema_chunk(row.content)
     ]
+    if _is_summary_style_query(query):
+        chunk_rows = [
+            row for row in chunk_rows if not _looks_like_command_chunk(row.content)
+        ]
+    if _is_summary_style_query(query) or _is_guidance_query(query):
+        chunk_rows = [
+            row for row in chunk_rows if not _looks_like_noise_chunk(row.content)
+        ]
     if not chunk_rows:
         return [], []
 
@@ -222,6 +291,17 @@ def hybrid_retrieve_with_debug(
         query=query,
         candidates=results,
         model_name=settings.reranker_model,
+    )
+
+    for item in reranked:
+        item["score"] = float(item.get("score", 0.0)) + _keyword_bonus(
+            query=query,
+            source_location=str(item.get("source_location") or ""),
+            content=str(item.get("content") or ""),
+        )
+
+    reranked = sorted(
+        reranked, key=lambda it: float(it.get("score", 0.0)), reverse=True
     )
     debug_rows = [
         {

@@ -241,29 +241,37 @@ def rebuild_kb_vectorstore(db: Session, kb_id: str) -> dict[str, int | bool]:
     model_name = normalize_embedding_model_name(kb.embedding_model)
     batch_size = 128
     indexed_chunks = 0
+    failed_chunks = 0
     for start in range(0, len(chunks), batch_size):
         batch = chunks[start : start + batch_size]
-        texts = [item.content for item in batch]
-        upsert_chunks(
-            kb_id=kb_id,
-            chunk_ids=[item.id for item in batch],
-            texts=texts,
-            metadatas=[
-                {
-                    "kb_id": kb_id,
-                    "document_id": item.document_id,
-                    "source_location": item.source_location,
-                    "chunk_index": item.chunk_index,
-                }
-                for item in batch
-            ],
-            embeddings=embed_texts(texts, model_name=model_name),
-        )
-        indexed_chunks += len(batch)
+        try:
+            texts = [item.content for item in batch]
+            ok = upsert_chunks(
+                kb_id=kb_id,
+                chunk_ids=[item.id for item in batch],
+                texts=texts,
+                metadatas=[
+                    {
+                        "kb_id": kb_id,
+                        "document_id": item.document_id,
+                        "source_location": item.source_location,
+                        "chunk_index": item.chunk_index,
+                    }
+                    for item in batch
+                ],
+                embeddings=embed_texts(texts, model_name=model_name),
+            )
+            if ok:
+                indexed_chunks += len(batch)
+            else:
+                failed_chunks += len(batch)
+        except Exception:
+            failed_chunks += len(batch)
 
     return {
         "docs_total": docs_total,
         "ready_docs": ready_docs,
         "indexed_chunks": indexed_chunks,
+        "failed_chunks": failed_chunks,
         "vectorstore_reset": bool(reset_ok),
     }

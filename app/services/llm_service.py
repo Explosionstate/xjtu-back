@@ -89,22 +89,56 @@ def answer_with_llm(
 
 
 def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
-    del question
+    q = (question or "").strip().lower()
     if not contexts:
         return "结论：未在知识库中检索到可用于回答的资料。\n依据：当前检索结果为空。\n建议：请补充更具体问题或增加知识库资料后重试。"
 
     merged = "\n".join(contexts)
+
+    def _is_noise_line(text: str) -> bool:
+        t = text.lower()
+        if len(text) <= 2:
+            return True
+        noise_markers = [
+            "pip install",
+            "npm install",
+            "python -m",
+            "requirements.txt",
+            "localhost:",
+            "127.0.0.1",
+            "create table",
+            "insert into",
+            " key `",
+            "idx_",
+        ]
+        return any(marker in t for marker in noise_markers)
+
     sentences = re.split(r"[\n。！？!?]", merged)
     cleaned: list[str] = []
     for item in sentences:
         text = " ".join(item.strip().split())
-        if not text or text in cleaned:
+        if not text or text in cleaned or _is_noise_line(text):
             continue
         cleaned.append(text)
-        if len(cleaned) >= 4:
+        if len(cleaned) >= 5:
             break
 
-    summary = "；".join(cleaned)
+    if not cleaned:
+        return (
+            "结论：已完成检索，但可直接引用的高质量片段不足。\n"
+            "依据：命中内容以命令/配置片段为主，不适合作为自然语言回答依据。\n"
+            "建议：请补充更贴近业务的文档内容，或降低该类技术脚本文档在当前问答场景中的优先级。"
+        )
+
+    summary = "；".join(cleaned[:3])
+
+    if any(token in q for token in ["总结", "概述", "重点", "新增文档", "指南"]):
+        return (
+            "结论：根据当前检索内容，可提炼出本次资料的主要关注点。\n"
+            f"依据：{summary}。\n"
+            "建议：如需更可执行的版本，请指定对象（学生/教师/管理员）和输出格式（三点清单/一周行动表）。"
+        )
+
     return (
         f"结论：根据当前检索结果，问题可从资料中部分回答。\n"
         f"依据：{summary}。\n"

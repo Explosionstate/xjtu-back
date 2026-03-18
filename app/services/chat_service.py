@@ -33,8 +33,8 @@ from app.services.system_config_service import (
 )
 
 
-CHAT_TOTAL_TIMEOUT_SECONDS = 30
-WORKFLOW_TIMEOUT_SECONDS = 24
+CHAT_TOTAL_TIMEOUT_SECONDS = 60
+WORKFLOW_TIMEOUT_SECONDS = 52
 
 
 @dataclass(frozen=True)
@@ -173,12 +173,23 @@ def _truncate_history(
 
 
 def _build_retrieval_query(history: list[Message], question: str) -> str:
+    summary_keywords = ["总结", "概述", "重点", "本周新增文档", "学生指南"]
+    if any(keyword in question for keyword in summary_keywords):
+        # For summary-style requests, avoid dragging unrelated chat history.
+        return question
+
     if not history:
         return question
     snippets = [item.content for item in history[-4:] if item.content.strip()]
     if not snippets:
         return question
     return "\n".join(snippets + [question])
+
+
+def _is_guidance_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    flags = ["学生", "建议", "指南", "总结", "重点", "规划", "学习", "生活"]
+    return any(flag in q for flag in flags)
 
 
 def _build_scope_text(kb_ids: list[str], document_ids: list[str] | None) -> str:
@@ -342,6 +353,10 @@ def chat_completion(
     score_threshold = float(retrieval_config["score_threshold"])
     fusion_mode = str(retrieval_config["fusion_mode"])
     alpha = float(retrieval_config["alpha"])
+
+    if _is_guidance_query(question):
+        top_k = min(top_k, 5)
+        score_threshold = max(score_threshold, 0.25)
 
     configured_max_rounds = get_int_config(
         db, "context_max_rounds", DEFAULT_CONTEXT_MAX_ROUNDS

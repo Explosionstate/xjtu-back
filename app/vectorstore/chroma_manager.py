@@ -78,10 +78,10 @@ def upsert_chunks(
     texts: list[str],
     metadatas: list[dict[str, Any]],
     embeddings: list[list[float]] | None = None,
-) -> None:
+) -> bool:
     collection = _get_collection(kb_id)
     if collection is None or not chunk_ids:
-        return
+        return False
     payload: dict[str, Any] = {
         "ids": chunk_ids,
         "documents": texts,
@@ -89,7 +89,12 @@ def upsert_chunks(
     }
     if embeddings is not None:
         payload["embeddings"] = embeddings
-    collection.upsert(**payload)
+    try:
+        collection.upsert(**payload)
+        return True
+    except Exception as exc:
+        logger.warning("chroma upsert failed for kb %s: %s", kb_id, exc)
+        return False
 
 
 def delete_chunks_by_document(kb_id: str, document_id: str) -> None:
