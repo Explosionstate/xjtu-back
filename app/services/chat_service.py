@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from time import perf_counter
+import logging
 import re
 import uuid
 
@@ -11,12 +12,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.errors import BusinessError
-from app.models.chat import ChatLog, Conversation, Message
+from app.models.chat import ChatLog, ChatPerfLog, Conversation, Message
 from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
 from app.schemas.chat import ChatCompletionRequest, ChatThinking, SourceItem
 from app.services.llm_service import LLMAnswerResult, answer_with_llm
 from app.services.external_profile_service import load_user_profile_context
+from app.services.academic_service import get_my_academic_analysis
 from app.services.langgraph_service import run_chat_workflow_graph
 from app.services.retrieval_config_service import get_effective_retrieval_config
 from app.services.retrieval_service import hybrid_retrieve
@@ -34,7 +36,14 @@ from app.services.system_config_service import (
 
 
 CHAT_TOTAL_TIMEOUT_SECONDS = 60
-WORKFLOW_TIMEOUT_SECONDS = 52
+WORKFLOW_TIMEOUT_SECONDS = 44
+GENERATION_STAGE_TIMEOUT_SECONDS = 28
+ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 120
+ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 112
+ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
+ACADEMIC_PROFILE_TIMEOUT_SECONDS = 8.0
+DEFAULT_PROFILE_TIMEOUT_SECONDS = 1.5
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -184,6 +193,59 @@ def _build_retrieval_query(history: list[Message], question: str) -> str:
     if not snippets:
         return question
     return "\n".join(snippets + [question])
+
+
+def _expand_academic_query(agent_key: str | None, question: str) -> str:
+    if not _is_student_growth_agent(agent_key):
+        return question
+    q = (question or "").strip()
+    if not q:
+        return q
+    if any(token in q for token in ["学业分析", "学习分析", "成绩分析", "学情分析"]):
+        return (
+            f"{q}\n"
+            "请重点检索：学习成绩、课堂互动、学习时长、课程完成度、薄弱课程、改进建议。"
+        )
+    return q
+
+
+def _is_student_growth_agent(agent_key: str | None) -> bool:
+    key = (agent_key or "").strip().lower()
+    return key in {"student-growth", "student_growth", "student"}
+
+
+def _is_academic_analysis_query(agent_key: str | None, question: str) -> bool:
+    if not _is_student_growth_agent(agent_key):
+        return False
+    q = (question or "").strip().lower()
+    return any(token in q for token in ["学业分析", "学习分析", "成绩分析", "学情分析"])
+
+
+def _format_academic_analysis_context(login_name: str) -> str:
+    data = get_my_academic_analysis(login_name=login_name)
+    metrics = data.metrics
+    course_lines = []
+    for item in data.course_scores[:4]:
+        course_lines.append(f"- {item.course_name}: {item.final_score:.1f}")
+    warning_open = [w for w in data.warnings if (w.status or "").lower() == "open"]
+
+    return "\n".join(
+        [
+            "学业分析结构化数据：",
+            f"- 学生: {data.student.student_name} ({data.student.login_name})",
+            f"- 学期: {data.term.term_name}",
+            f"- 平均分: {metrics.avg_score if metrics.avg_score is not None else 'N/A'}",
+            f"- GPA: {metrics.gpa if metrics.gpa is not None else 'N/A'}",
+            f"- 风险等级: {data.risk_level}",
+            f"- 未处理预警数: {len(warning_open)}",
+            "- 课程成绩(前4):",
+            *(course_lines or ["- 无课程成绩数据"]),
+            "- 关键发现:",
+            *([f"- {x}" for x in data.key_findings[:4]] or ["- 无"]),
+            "- 建议:",
+            *([f"- {x}" for x in data.recommendations[:4]] or ["- 无"]),
+        ]
+    )
 
 
 def _is_guidance_query(question: str) -> bool:
@@ -382,7 +444,31 @@ def chat_completion(
     trimmed_history = _truncate_history(
         history=history, max_rounds=max_rounds, max_tokens=max_tokens
     )
-    retrieval_query = _build_retrieval_query(trimmed_history, question)
+    retrieval_query = _expand_academic_query(
+        payload.agent_key,
+        _build_retrieval_query(trimmed_history, question),
+    )
+    is_academic_analysis = _is_academic_analysis_query(payload.agent_key, question)
+    chat_total_timeout = (
+        ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS
+        if is_academic_analysis
+        else CHAT_TOTAL_TIMEOUT_SECONDS
+    )
+    workflow_timeout_cap = (
+        ACADEMIC_WORKFLOW_TIMEOUT_SECONDS
+        if is_academic_analysis
+        else WORKFLOW_TIMEOUT_SECONDS
+    )
+    generation_timeout = (
+        ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS
+        if is_academic_analysis
+        else GENERATION_STAGE_TIMEOUT_SECONDS
+    )
+    profile_timeout_seconds = (
+        ACADEMIC_PROFILE_TIMEOUT_SECONDS
+        if is_academic_analysis
+        else DEFAULT_PROFILE_TIMEOUT_SECONDS
+    )
 
     start = perf_counter()
     llm_result: LLMAnswerResult | None = None
@@ -407,12 +493,26 @@ def chat_completion(
             stage_start = perf_counter()
             try:
                 profile_executor = ThreadPoolExecutor(max_workers=1)
-                profile_future = profile_executor.submit(
-                    load_user_profile_context, current_user.login_name
+                profile_future = (
+                    profile_executor.submit(
+                        _format_academic_analysis_context,
+                        current_user.login_name,
+                    )
+                    if is_academic_analysis
+                    else profile_executor.submit(
+                        load_user_profile_context,
+                        current_user.login_name,
+                    )
                 )
                 try:
-                    return profile_future.result(timeout=1.5)
+                    return profile_future.result(timeout=profile_timeout_seconds)
                 except FuturesTimeoutError:
+                    logger.warning(
+                        "profile timeout: conversation=%s agent=%s academic=%s",
+                        conversation_id,
+                        payload.agent_key,
+                        is_academic_analysis,
+                    )
                     return ""
                 finally:
                     profile_future.cancel()
@@ -426,7 +526,10 @@ def chat_completion(
             nonlocal retrieved, retrieval_ms, workflow_stage
             workflow_stage = "retrieval"
             stage_start = perf_counter()
-            query = _build_retrieval_query(trimmed_history, runtime_question)
+            query = _expand_academic_query(
+                payload.agent_key,
+                _build_retrieval_query(trimmed_history, runtime_question),
+            )
             try:
                 retrieved = hybrid_retrieve(
                     db=db,
@@ -437,8 +540,14 @@ def chat_completion(
                     score_threshold=score_threshold,
                     fusion_mode=fusion_mode,
                     alpha=alpha,
+                    agent_key=payload.agent_key,
                 )
             except Exception:
+                logger.exception(
+                    "retrieval failed: conversation=%s agent=%s",
+                    conversation_id,
+                    payload.agent_key,
+                )
                 retrieved = []
             finally:
                 retrieval_ms += int((perf_counter() - stage_start) * 1000)
@@ -452,18 +561,30 @@ def chat_completion(
             nonlocal llm_result, llm_ms, workflow_stage
             workflow_stage = "generation"
             stage_start = perf_counter()
-            llm_result = answer_with_llm(
-                question=runtime_question,
-                contexts=contexts,
-                llm_enabled=payload.llm_enabled,
-                system_instruction=system_instruction,
-            )
+            try:
+                llm_result = answer_with_llm(
+                    question=runtime_question,
+                    contexts=contexts,
+                    llm_enabled=payload.llm_enabled,
+                    system_instruction=system_instruction,
+                    timeout_seconds=generation_timeout,
+                )
+            except Exception:
+                logger.exception(
+                    "generation failed: conversation=%s agent=%s",
+                    conversation_id,
+                    payload.agent_key,
+                )
+                llm_result = LLMAnswerResult(
+                    answer="结论：当前生成失败，已切换到简化回答。\n依据：模型推理阶段发生异常。\n建议：请稍后重试，或缩小问题范围后再提问。",
+                    mode="error_fallback",
+                )
             llm_ms += int((perf_counter() - stage_start) * 1000)
             return llm_result.answer
 
         workflow_timeout = max(
             8,
-            min(WORKFLOW_TIMEOUT_SECONDS, CHAT_TOTAL_TIMEOUT_SECONDS - 6),
+            min(workflow_timeout_cap, chat_total_timeout - 6),
         )
 
         executor = ThreadPoolExecutor(max_workers=1)
@@ -484,18 +605,29 @@ def chat_completion(
             workflow_stage = "done"
         except FuturesTimeoutError:
             workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
+            logger.warning(
+                "workflow timeout: conversation=%s agent=%s stage=%s elapsed_ms=%s",
+                conversation_id,
+                payload.agent_key,
+                workflow_stage,
+                workflow_wait_ms,
+            )
             try:
                 # Ensure user gets a practical answer instead of a pure timeout message.
                 stage_start = perf_counter()
                 retrieved = hybrid_retrieve(
                     db=db,
-                    query=_build_retrieval_query(trimmed_history, question),
+                    query=_expand_academic_query(
+                        payload.agent_key,
+                        _build_retrieval_query(trimmed_history, question),
+                    ),
                     kb_ids=kb_ids,
                     document_ids=payload.document_ids,
                     top_k=min(2, top_k),
                     score_threshold=max(score_threshold, 0.35),
                     fusion_mode=fusion_mode,
                     alpha=alpha,
+                    agent_key=payload.agent_key,
                 )
                 retrieval_ms += int((perf_counter() - stage_start) * 1000)
             except Exception:
@@ -538,7 +670,7 @@ def chat_completion(
         if not answer:
             answer = "结论：未检索到可用答案。\n依据：当前知识库上下文不足。\n建议：请补充更具体问题或导入相关文档。"
 
-        if perf_counter() - start > CHAT_TOTAL_TIMEOUT_SECONDS and not answer:
+        if perf_counter() - start > chat_total_timeout and not answer:
             answer = _fast_retrieval_answer(question, retrieved)
 
         if retrieved:
@@ -613,6 +745,24 @@ def chat_completion(
             retrieval_top_k=top_k,
             score_threshold=score_threshold,
             elapsed_ms=elapsed_ms,
+        )
+    )
+    db.add(
+        ChatPerfLog(
+            conversation_id=conversation_id,
+            user_id=current_user.id if current_user else None,
+            agent_key=(payload.agent_key or "").strip().lower() or None,
+            question=question,
+            retrieved_count=len(retrieved),
+            llm_mode=llm_result.mode
+            if llm_result
+            else ("rule" if rule_answer_text else "none"),
+            profile_ms=profile_ms,
+            retrieval_ms=retrieval_ms,
+            llm_ms=llm_ms,
+            workflow_wait_ms=workflow_wait_ms,
+            total_ms=elapsed_ms,
+            workflow_stage=workflow_stage,
         )
     )
     db.commit()

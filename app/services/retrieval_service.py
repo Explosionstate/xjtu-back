@@ -79,6 +79,67 @@ def _is_guidance_query(query: str) -> bool:
     return any(flag in q for flag in flags)
 
 
+def _is_student_growth_agent(agent_key: str | None) -> bool:
+    key = (agent_key or "").strip().lower()
+    return key in {"student-growth", "student_growth", "student"}
+
+
+def _is_mojibake_text(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return True
+    replacement_ratio = text.count("�") / max(1, len(text))
+    if replacement_ratio >= 0.03:
+        return True
+    mojibake_markers = ["Ã", "Â", "ä¸", "ç", "å", "æ", "ï¼", "é"]
+    marker_hits = sum(text.count(marker) for marker in mojibake_markers)
+    return marker_hits >= 12 and marker_hits / max(1, len(text)) > 0.05
+
+
+def _source_weight(agent_key: str | None, source_location: str, query: str) -> float:
+    if not _is_student_growth_agent(agent_key):
+        return 1.0
+
+    src = (source_location or "").lower()
+    q = (query or "").lower()
+    positive = ["学生", "学业", "成长", "指南", "手册", "学习", "预警", "辅导"]
+    negative = [
+        "xjtu-back",
+        "xjtu-front",
+        "readme",
+        "ops.py",
+        "接口",
+        "部署",
+        "开发",
+        "脚本",
+        "api",
+    ]
+
+    weight = 1.0
+    if any(key in q for key in ["学业", "学生", "学习", "成长", "指南", "建议"]):
+        if any(token in src for token in positive):
+            weight *= 1.22
+        if any(token in src for token in negative):
+            weight *= 0.35
+    return max(0.2, min(1.4, weight))
+
+
+def _is_academic_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    flags = ["学业", "成绩", "课堂", "学习", "课程", "预警"]
+    return any(flag in q for flag in flags)
+
+
+def _token_overlap_score(query_tokens: set[str], content: str) -> float:
+    if not query_tokens:
+        return 0.0
+    content_tokens = set(_tokenize(content))
+    if not content_tokens:
+        return 0.0
+    overlap = len(query_tokens & content_tokens)
+    return overlap / max(1, len(query_tokens))
+
+
 def _looks_like_noise_chunk(content: str) -> bool:
     text = (content or "").strip()
     lowered = text.lower()
@@ -154,6 +215,7 @@ def hybrid_retrieve(
     score_threshold: float,
     fusion_mode: str,
     alpha: float,
+    agent_key: str | None = None,
 ) -> list[dict]:
     results, _ = hybrid_retrieve_with_debug(
         db=db,
@@ -164,6 +226,7 @@ def hybrid_retrieve(
         score_threshold=score_threshold,
         fusion_mode=fusion_mode,
         alpha=alpha,
+        agent_key=agent_key,
     )
     return results
 
@@ -177,11 +240,17 @@ def hybrid_retrieve_with_debug(
     score_threshold: float,
     fusion_mode: str,
     alpha: float,
+    agent_key: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     if _is_small_talk(query):
         return [], []
 
-    max_candidates = max(400, int(top_k) * 120)
+    local_top_k = int(top_k)
+    local_threshold = float(score_threshold)
+    if _is_student_growth_agent(agent_key):
+        local_top_k = min(local_top_k, 5)
+        local_threshold = max(local_threshold, 0.28)
+    max_candidates = max(120, int(local_top_k) * 60)
     stmt = select(DocumentChunk).where(DocumentChunk.kb_id.in_(kb_ids))
     if document_ids:
         stmt = stmt.where(DocumentChunk.document_id.in_(document_ids))
@@ -198,6 +267,16 @@ def hybrid_retrieve_with_debug(
         chunk_rows = [
             row for row in chunk_rows if not _looks_like_noise_chunk(row.content)
         ]
+    chunk_rows = [row for row in chunk_rows if not _is_mojibake_text(row.content)]
+
+    if _is_guidance_query(query) or _is_academic_query(query):
+        q_tokens = set(_tokenize(query))
+        if q_tokens:
+            chunk_rows = sorted(
+                chunk_rows,
+                key=lambda row: _token_overlap_score(q_tokens, row.content),
+                reverse=True,
+            )[: max(100, local_top_k * 20)]
     if not chunk_rows:
         return [], []
 
@@ -217,7 +296,7 @@ def hybrid_retrieve_with_debug(
         cid
         for cid, _ in sorted(
             bm25_scores.items(), key=lambda item: item[1], reverse=True
-        )[: top_k * 2]
+        )[: local_top_k * 2]
     ]
     bm25_norm = _normalize_scores(bm25_scores)
 
@@ -239,7 +318,7 @@ def hybrid_retrieve_with_debug(
         for item in search_similar_chunks(
             kb_id=kb_id,
             query=query,
-            top_k=top_k * 2,
+            top_k=local_top_k * 2,
             query_embedding=query_embedding,
         ):
             chunk_id = item["chunk_id"]
@@ -251,7 +330,7 @@ def hybrid_retrieve_with_debug(
         cid
         for cid, _ in sorted(
             dense_scores.items(), key=lambda item: item[1], reverse=True
-        )[: top_k * 2]
+        )[: local_top_k * 2]
     ]
     dense_norm = _normalize_scores(dense_scores)
 
@@ -265,7 +344,7 @@ def hybrid_retrieve_with_debug(
         for chunk_id, score in sorted(
             fused.items(), key=lambda item: item[1], reverse=True
         )
-    ][: max(top_k * 3, top_k)]
+    ][: max(local_top_k * 3, local_top_k)]
 
     results: list[dict] = []
     for chunk_id in sorted_ids:
@@ -284,6 +363,9 @@ def hybrid_retrieve_with_debug(
                 "fused_score": float(fused.get(chunk_id, 0.0)),
                 "score_before_rerank": float(fused.get(chunk_id, 0.0)),
                 "score": float(fused.get(chunk_id, 0.0)),
+                "source_weight": _source_weight(
+                    agent_key, row.source_location or "", query
+                ),
             }
         )
 
@@ -294,11 +376,12 @@ def hybrid_retrieve_with_debug(
     )
 
     for item in reranked:
-        item["score"] = float(item.get("score", 0.0)) + _keyword_bonus(
+        base_score = float(item.get("score", 0.0)) + _keyword_bonus(
             query=query,
             source_location=str(item.get("source_location") or ""),
             content=str(item.get("content") or ""),
         )
+        item["score"] = base_score * float(item.get("source_weight", 1.0))
 
     reranked = sorted(
         reranked, key=lambda it: float(it.get("score", 0.0)), reverse=True
@@ -315,11 +398,12 @@ def hybrid_retrieve_with_debug(
             "fused_score": round(float(item.get("fused_score", 0.0)), 6),
             "rerank_score": round(float(item.get("rerank_score", 0.0)), 6),
             "final_score": round(float(item.get("score", 0.0)), 6),
+            "source_weight": round(float(item.get("source_weight", 1.0)), 4),
             "content": item.get("content", ""),
         }
         for item in reranked
     ]
     filtered = [
-        item for item in reranked if float(item.get("score", 0.0)) >= score_threshold
+        item for item in reranked if float(item.get("score", 0.0)) >= local_threshold
     ]
-    return filtered[:top_k], debug_rows
+    return filtered[:local_top_k], debug_rows

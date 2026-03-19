@@ -65,3 +65,26 @@ class ConversationSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+
+
+class ChatPerfLog(Base):
+    __tablename__ = "chat_perf_logs"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    conversation_id: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    agent_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    question: Mapped[str] = mapped_column(Text)
+    retrieved_count: Mapped[int] = mapped_column(Integer, default=0)
+    llm_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    profile_ms: Mapped[int] = mapped_column(Integer, default=0)
+    retrieval_ms: Mapped[int] = mapped_column(Integer, default=0)
+    llm_ms: Mapped[int] = mapped_column(Integer, default=0)
+    workflow_wait_ms: Mapped[int] = mapped_column(Integer, default=0)
+    total_ms: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    workflow_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, index=True
+    )

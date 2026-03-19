@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -13,7 +16,7 @@ from app.services.system_config_service import (
 
 
 def _normalize_retrieval_config(
-    config: dict[str, float | int | str],
+    config: Mapping[str, float | int | str | None],
 ) -> dict[str, float | int | str]:
     top_k = int(config.get("retrieval_top_k") or settings.retrieval_top_k)
     threshold = float(
@@ -29,11 +32,13 @@ def _normalize_retrieval_config(
     if fusion_mode not in {"weighted", "rrf"}:
         fusion_mode = "weighted"
 
-    config["retrieval_top_k"] = top_k
-    config["score_threshold"] = threshold
-    config["alpha"] = alpha
-    config["fusion_mode"] = fusion_mode
-    return config
+    normalized: dict[str, float | int | str] = {
+        "retrieval_top_k": top_k,
+        "score_threshold": threshold,
+        "alpha": alpha,
+        "fusion_mode": fusion_mode,
+    }
+    return normalized
 
 
 def get_global_retrieval_config(db: Session) -> dict[str, float | int | str]:
@@ -98,27 +103,40 @@ def upsert_session_retrieval_config(
     fusion_mode: str | None,
     alpha: float | None,
 ) -> ConversationSetting:
+    def _apply(target: ConversationSetting) -> None:
+        target.retrieval_top_k = retrieval_top_k
+        target.score_threshold = score_threshold
+        target.fusion_mode = fusion_mode
+        target.alpha = alpha
+        normalized = _normalize_retrieval_config(
+            {
+                "retrieval_top_k": target.retrieval_top_k,
+                "score_threshold": target.score_threshold,
+                "fusion_mode": target.fusion_mode,
+                "alpha": target.alpha,
+            }
+        )
+        target.retrieval_top_k = int(normalized["retrieval_top_k"])
+        target.score_threshold = float(normalized["score_threshold"])
+        target.fusion_mode = str(normalized["fusion_mode"])
+        target.alpha = float(normalized["alpha"])
+
     item = db.get(ConversationSetting, conversation_id)
     if item is None:
         item = ConversationSetting(conversation_id=conversation_id)
         db.add(item)
+    _apply(item)
 
-    item.retrieval_top_k = retrieval_top_k
-    item.score_threshold = score_threshold
-    item.fusion_mode = fusion_mode
-    item.alpha = alpha
-    normalized = _normalize_retrieval_config(
-        {
-            "retrieval_top_k": item.retrieval_top_k,
-            "score_threshold": item.score_threshold,
-            "fusion_mode": item.fusion_mode,
-            "alpha": item.alpha,
-        }
-    )
-    item.retrieval_top_k = int(normalized["retrieval_top_k"])
-    item.score_threshold = float(normalized["score_threshold"])
-    item.fusion_mode = str(normalized["fusion_mode"])
-    item.alpha = float(normalized["alpha"])
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.get(ConversationSetting, conversation_id)
+        if existing is None:
+            raise
+        _apply(existing)
+        db.commit()
+        item = existing
+
     db.refresh(item)
     return item

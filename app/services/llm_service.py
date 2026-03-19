@@ -35,6 +35,7 @@ def answer_with_llm(
     contexts: list[str],
     llm_enabled: bool | None = None,
     system_instruction: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> LLMAnswerResult:
     enabled = settings.llm_enabled if llm_enabled is None else llm_enabled
     if not enabled or not settings.api_key:
@@ -42,8 +43,19 @@ def answer_with_llm(
 
     compact_contexts = [ctx.strip()[:1200] for ctx in contexts[:3] if ctx.strip()]
 
+    academic_prompt = ""
+    if _is_academic_analysis_query(question):
+        academic_prompt = (
+            "当前问题属于学业分析场景，请按以下维度输出：\n"
+            "1) 学业现状（成绩/课程完成）\n"
+            "2) 学习行为（课堂互动/学习时长）\n"
+            "3) 风险点（最多3条，给出证据）\n"
+            "4) 下周行动计划（3条，可执行）\n"
+        )
+
     prompt = (
         f"{(system_instruction or '').strip()}\n"
+        f"{academic_prompt}"
         "你是知识库问答助手。请严格依据给定资料作答，不编造事实。"
         "回答必须严格按以下结构输出：\n"
         "结论：...\n"
@@ -55,11 +67,20 @@ def answer_with_llm(
         f"问题：{question}\n\n"
         f"资料：\n{chr(10).join(compact_contexts)}"
     )
+    effective_timeout = max(
+        2,
+        int(
+            timeout_seconds
+            if timeout_seconds is not None
+            else settings.llm_timeout_seconds
+        ),
+    )
+
     try:
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(get_chat_llm().invoke, prompt)
         try:
-            response = future.result(timeout=max(1, settings.llm_timeout_seconds))
+            response = future.result(timeout=effective_timeout)
         finally:
             future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
@@ -144,6 +165,12 @@ def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
         f"依据：{summary}。\n"
         "建议：如需更精准结论，请补充上下文或限定具体场景。"
     )
+
+
+def _is_academic_analysis_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    flags = ["学业分析", "学习分析", "成绩分析", "学情分析", "学习情况"]
+    return any(flag in q for flag in flags)
 
 
 def _ensure_three_section(answer: str) -> str:

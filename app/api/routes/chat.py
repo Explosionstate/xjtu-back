@@ -11,6 +11,7 @@ from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.security import decode_access_token
 from app.db.session import SessionLocal, get_db
+from app.models.chat import ChatPerfLog
 from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
 from app.schemas.chat import (
@@ -137,6 +138,39 @@ def retrieval_debug(
             RetrievalDebugScoreItem.model_validate(item) for item in debug_rows
         ],
     )
+
+
+@router.get("/chat/perf/slow-top")
+def slow_requests_top(
+    limit: int = Query(default=20, ge=1, le=200),
+    agent_key: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+) -> list[dict[str, int | str | None]]:
+    _ = current_user
+    stmt = select(ChatPerfLog)
+    if agent_key:
+        stmt = stmt.where(ChatPerfLog.agent_key == agent_key.strip().lower())
+    rows = list(
+        db.scalars(stmt.order_by(ChatPerfLog.total_ms.desc()).limit(limit)).all()
+    )
+    return [
+        {
+            "conversation_id": item.conversation_id,
+            "agent_key": item.agent_key,
+            "question": item.question[:80],
+            "workflow_stage": item.workflow_stage,
+            "llm_mode": item.llm_mode,
+            "retrieved_count": int(item.retrieved_count),
+            "profile_ms": int(item.profile_ms),
+            "retrieval_ms": int(item.retrieval_ms),
+            "llm_ms": int(item.llm_ms),
+            "workflow_wait_ms": int(item.workflow_wait_ms),
+            "total_ms": int(item.total_ms),
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+        }
+        for item in rows
+    ]
 
 
 @router.websocket("/ws/chat/completions")

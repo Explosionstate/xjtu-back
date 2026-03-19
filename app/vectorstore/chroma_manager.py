@@ -31,6 +31,8 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+_CHROMA_FAIL_UNTIL: dict[str, float] = {}
+_CHROMA_FAILURE_COOLDOWN_SECONDS = 180.0
 
 
 def _create_client(path: Path):
@@ -120,6 +122,11 @@ def search_similar_chunks(
     top_k: int,
     query_embedding: list[float] | None = None,
 ) -> list[dict[str, Any]]:
+    now = time.time()
+    fail_until = _CHROMA_FAIL_UNTIL.get(kb_id, 0.0)
+    if fail_until > now:
+        return []
+
     collection = _get_collection(kb_id)
     if collection is None:
         return []
@@ -142,8 +149,10 @@ def search_similar_chunks(
     except Exception as exc:
         # Chroma metadata can be temporarily inconsistent on Windows/local dev.
         # Keep chat path available by degrading to BM25-only retrieval.
+        _CHROMA_FAIL_UNTIL[kb_id] = time.time() + _CHROMA_FAILURE_COOLDOWN_SECONDS
         logger.warning("chroma query failed for kb %s: %s", kb_id, exc)
         return []
+    _CHROMA_FAIL_UNTIL.pop(kb_id, None)
     ids_all = result.get("ids") or [[]]
     docs_all = result.get("documents") or [[]]
     distances_all = result.get("distances") or [[]]

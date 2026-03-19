@@ -49,6 +49,18 @@ def _split_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
     return chunks
 
 
+def _looks_like_mojibake(text: str) -> bool:
+    body = (text or "").strip()
+    if not body:
+        return True
+    replacement_ratio = body.count("�") / max(1, len(body))
+    if replacement_ratio >= 0.03:
+        return True
+    markers = ["Ã", "Â", "ä¸", "ç", "å", "æ", "ï¼", "é"]
+    marker_hits = sum(body.count(marker) for marker in markers)
+    return marker_hits >= 16 and marker_hits / max(1, len(body)) > 0.06
+
+
 def split_preview(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
     return _split_text(text=text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
@@ -96,7 +108,7 @@ def upload_documents(
             doc.file_size = store_path.stat().st_size
 
             text = _extract_text_from_path(store_path, suffix).strip()
-            if not text:
+            if not text or _looks_like_mojibake(text):
                 doc.status = "failed"
                 db.commit()
                 db.refresh(doc)
@@ -242,6 +254,12 @@ def reindex_document(
     if kb is None or kb.status == "deleted":
         raise BusinessError("知识库不存在", status_code=404)
     text = _extract_text_from_path(Path(doc.file_path), f".{doc.file_type}")
+    if _looks_like_mojibake(text):
+        doc.status = "failed"
+        doc.chunk_count = 0
+        db.commit()
+        db.refresh(doc)
+        return doc
     target_chunk_size = chunk_size or settings.default_chunk_size
     target_chunk_overlap = chunk_overlap or settings.default_chunk_overlap
 

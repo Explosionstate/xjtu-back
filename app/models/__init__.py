@@ -1,6 +1,12 @@
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentChunk
-from app.models.chat import ChatLog, Conversation, ConversationSetting, Message
+from app.models.chat import (
+    ChatLog,
+    ChatPerfLog,
+    Conversation,
+    ConversationSetting,
+    Message,
+)
 from app.models.rbac import (
     AuthLoginAttempt,
     SysPermission,
@@ -21,6 +27,7 @@ __all__ = [
     "Conversation",
     "Message",
     "ChatLog",
+    "ChatPerfLog",
     "ConversationSetting",
     "User",
     "SysRole",
