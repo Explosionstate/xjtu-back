@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from time import perf_counter
+import logging
+from threading import Lock
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -21,6 +24,21 @@ from app.schemas.academic import (
 )
 
 
+logger = logging.getLogger(__name__)
+_ANALYSIS_CACHE: dict[
+    tuple[str, str | None], tuple[float, AcademicAnalysisResponse]
+] = {}
+_ANALYSIS_CACHE_LOCK = Lock()
+_ANALYSIS_CACHE_TTL_SECONDS = 180.0
+_STAGE_TIMEOUT_SECONDS = {
+    "metrics": 8,
+    "trend": 6,
+    "course_scores": 8,
+    "cohort": 10,
+    "warnings": 6,
+}
+
+
 def get_my_academic_analysis(
     login_name: str, term_code: str | None = None
 ) -> AcademicAnalysisResponse:
@@ -29,25 +47,52 @@ def get_my_academic_analysis(
 
     normalized_login_name = login_name.strip()
     normalized_term_code = term_code.strip() if term_code else None
+    cache_key = (normalized_login_name, normalized_term_code)
 
+    with _ANALYSIS_CACHE_LOCK:
+        cached = _ANALYSIS_CACHE.get(cache_key)
+        if cached and (perf_counter() - cached[0]) <= _ANALYSIS_CACHE_TTL_SECONDS:
+            logger.warning(
+                "academic analysis cache hit: login=%s term=%s",
+                normalized_login_name,
+                normalized_term_code,
+            )
+            return cached[1]
+
+    started = perf_counter()
     try:
         with academic_session_scope() as db:
             _apply_query_timeout(db)
-            actor_role = _query_academic_user_role(db, normalized_login_name)
+            actor_role = _run_stage(
+                db=db,
+                stage="profile",
+                supplier=lambda: _query_academic_user_role(db, normalized_login_name),
+                default=None,
+            )
             if actor_role and actor_role != "student":
                 raise BusinessError(
                     "Only students can access academic analysis",
                     status_code=403,
                 )
 
-            student_row = _query_student_profile(db, normalized_login_name)
+            student_row = _run_stage(
+                db=db,
+                stage="profile",
+                supplier=lambda: _query_student_profile(db, normalized_login_name),
+                default=None,
+            )
             if student_row is None:
                 raise BusinessError(
                     "Current user is not a student in academic database",
                     status_code=404,
                 )
 
-            term_row = _resolve_term(db, normalized_term_code)
+            term_row = _run_stage(
+                db=db,
+                stage="profile",
+                supplier=lambda: _resolve_term(db, normalized_term_code),
+                default=None,
+            )
             if term_row is None:
                 raise BusinessError("No term data available", status_code=404)
 
@@ -73,20 +118,49 @@ def get_my_academic_analysis(
                 term_no=_as_optional_int(term_row.get("term_no")),
             )
 
-            metrics = _load_metrics(db, student.student_id, term.term_id)
-            trend = _load_trend(db, student.student_id, limit=6)
-            course_scores = _load_course_scores(db, student.student_id, term.term_id)
-            cohort_comparison = _load_cohort_comparison(
+            metrics = _run_stage(
                 db=db,
-                term_id=term.term_id,
-                college_id=student.college_id,
-                college_name=student.college_name,
-                major_id=student.major_id,
-                major_name=student.major_name,
-                class_id=student.class_id,
-                class_name=student.class_name,
+                stage="metrics",
+                supplier=lambda: _load_metrics(db, student.student_id, term.term_id),
+                default=AcademicMetricSnapshot(),
             )
-            warnings = _load_warnings(db, student.student_id, term.term_id)
+            trend = _run_stage(
+                db=db,
+                stage="trend",
+                supplier=lambda: _safe_load_trend(db, student.student_id, limit=4),
+                default=[],
+            )
+            course_scores = _run_stage(
+                db=db,
+                stage="course_scores",
+                supplier=lambda: _safe_load_course_scores(
+                    db, student.student_id, term.term_id
+                ),
+                default=[],
+            )
+            cohort_comparison = _run_stage(
+                db=db,
+                stage="cohort",
+                supplier=lambda: _safe_load_cohort_comparison(
+                    db=db,
+                    term_id=term.term_id,
+                    college_id=student.college_id,
+                    college_name=student.college_name,
+                    major_id=student.major_id,
+                    major_name=student.major_name,
+                    class_id=student.class_id,
+                    class_name=student.class_name,
+                ),
+                default=[],
+            )
+            warnings = _run_stage(
+                db=db,
+                stage="warnings",
+                supplier=lambda: _safe_load_warnings(
+                    db, student.student_id, term.term_id
+                ),
+                default=[],
+            )
 
             risk_level = _evaluate_risk_level(metrics, warnings)
             key_findings = _build_key_findings(
@@ -103,7 +177,7 @@ def get_my_academic_analysis(
                 risk_level=risk_level,
             )
 
-            return AcademicAnalysisResponse(
+            response = AcademicAnalysisResponse(
                 student=student,
                 term=term,
                 metrics=metrics,
@@ -116,12 +190,24 @@ def get_my_academic_analysis(
                 recommendations=recommendations,
                 generated_at=datetime.now(timezone.utc),
             )
+            elapsed_ms = int((perf_counter() - started) * 1000)
+            logger.warning(
+                "academic analysis built: login=%s term=%s elapsed_ms=%s",
+                normalized_login_name,
+                term.term_code,
+                elapsed_ms,
+            )
+            with _ANALYSIS_CACHE_LOCK:
+                _ANALYSIS_CACHE[cache_key] = (perf_counter(), response)
+            return response
     except BusinessError:
         raise
     except SQLAlchemyError as exc:
         raise BusinessError("Academic database query failed", status_code=502) from exc
     except Exception as exc:  # pragma: no cover
-        raise BusinessError("Failed to build academic analysis", status_code=500) from exc
+        raise BusinessError(
+            "Failed to build academic analysis", status_code=500
+        ) from exc
 
 
 def _apply_query_timeout(db: Session) -> None:
@@ -134,6 +220,40 @@ def _apply_query_timeout(db: Session) -> None:
     )
 
 
+def _set_session_timeout(db: Session, timeout_seconds: int) -> None:
+    if not settings.academic_db_url.startswith("mysql"):
+        return
+    timeout_ms = max(1, int(timeout_seconds * 1000))
+    db.execute(
+        text("SET SESSION MAX_EXECUTION_TIME = :timeout_ms"),
+        {"timeout_ms": timeout_ms},
+    )
+
+
+def _run_stage(db: Session, stage: str, supplier, default):
+    timeout_seconds = _STAGE_TIMEOUT_SECONDS.get(
+        stage,
+        max(1, int(settings.academic_query_timeout_seconds)),
+    )
+    stage_start = perf_counter()
+    try:
+        _set_session_timeout(db, timeout_seconds)
+        value = supplier()
+        elapsed_ms = int((perf_counter() - stage_start) * 1000)
+        logger.warning("academic stage %s elapsed_ms=%s", stage, elapsed_ms)
+        return value
+    except SQLAlchemyError as exc:
+        elapsed_ms = int((perf_counter() - stage_start) * 1000)
+        logger.warning("academic stage %s failed in %sms: %s", stage, elapsed_ms, exc)
+        return default
+    except Exception as exc:
+        elapsed_ms = int((perf_counter() - stage_start) * 1000)
+        logger.warning("academic stage %s error in %sms: %s", stage, elapsed_ms, exc)
+        return default
+    finally:
+        _apply_query_timeout(db)
+
+
 def _query_student_profile(db: Session, login_name: str) -> dict | None:
     sql = text(
         """
@@ -142,39 +262,15 @@ def _query_student_profile(db: Session, login_name: str) -> dict | None:
           u.login_name AS login_name,
           s.student_no AS student_no,
           s.name AS student_name,
-          COALESCE(se.college_id, s.college_id) AS college_id,
-          COALESCE(dc.college_name, s.college, u.department_name) AS college_name,
-          COALESCE(se.major_id, s.major_id) AS major_id,
-          dm.major_name AS major_name,
-          COALESCE(se.class_id, s.class_id) AS class_id,
-          dcl.class_name AS class_name,
-          COALESCE(se.grade_year, s.grade_year, dcl.grade_year) AS grade_year
+          s.college_id AS college_id,
+          COALESCE(s.college, u.department_name) AS college_name,
+          s.major_id AS major_id,
+          NULL AS major_name,
+          s.class_id AS class_id,
+          NULL AS class_name,
+          s.grade_year AS grade_year
         FROM `user` u
         JOIN student s ON s.student_id = u.id
-        LEFT JOIN (
-          SELECT
-            se1.student_id,
-            se1.college_id,
-            se1.major_id,
-            se1.class_id,
-            se1.grade_year
-          FROM student_enrollment se1
-          JOIN (
-            SELECT student_id, MAX(enrollment_id) AS max_enrollment_id
-            FROM student_enrollment
-            WHERE status = 'active'
-            GROUP BY student_id
-          ) latest
-            ON latest.student_id = se1.student_id
-           AND latest.max_enrollment_id = se1.enrollment_id
-        ) se
-          ON se.student_id = s.student_id
-        LEFT JOIN dim_college dc
-          ON dc.college_id = COALESCE(se.college_id, s.college_id)
-        LEFT JOIN dim_major dm
-          ON dm.major_id = COALESCE(se.major_id, s.major_id)
-        LEFT JOIN dim_class dcl
-          ON dcl.class_id = COALESCE(se.class_id, s.class_id)
         WHERE u.login_name = :login_name
           AND u.role = 'student'
           AND u.is_deleted = 0
@@ -186,18 +282,22 @@ def _query_student_profile(db: Session, login_name: str) -> dict | None:
 
 
 def _query_academic_user_role(db: Session, login_name: str) -> str | None:
-    row = db.execute(
-        text(
-            """
+    row = (
+        db.execute(
+            text(
+                """
             SELECT role
             FROM `user`
             WHERE login_name = :login_name
               AND is_deleted = 0
             LIMIT 1
             """
-        ),
-        {"login_name": login_name},
-    ).mappings().first()
+            ),
+            {"login_name": login_name},
+        )
+        .mappings()
+        .first()
+    )
     if row is None:
         return None
     role = str(row.get("role") or "").strip().lower()
@@ -206,24 +306,29 @@ def _query_academic_user_role(db: Session, login_name: str) -> str | None:
 
 def _resolve_term(db: Session, term_code: str | None) -> dict | None:
     if term_code:
-        by_code = db.execute(
-            text(
-                """
+        by_code = (
+            db.execute(
+                text(
+                    """
                 SELECT
                   term_id, term_code, term_name, academic_year, term_no
                 FROM dim_term
                 WHERE term_code = :term_code
                 LIMIT 1
                 """
-            ),
-            {"term_code": term_code},
-        ).mappings().first()
+                ),
+                {"term_code": term_code},
+            )
+            .mappings()
+            .first()
+        )
         if by_code:
             return dict(by_code)
 
-    ongoing = db.execute(
-        text(
-            """
+    ongoing = (
+        db.execute(
+            text(
+                """
             SELECT
               term_id, term_code, term_name, academic_year, term_no
             FROM dim_term
@@ -231,29 +336,37 @@ def _resolve_term(db: Session, term_code: str | None) -> dict | None:
             ORDER BY academic_year DESC, term_no DESC, term_id DESC
             LIMIT 1
             """
+            )
         )
-    ).mappings().first()
+        .mappings()
+        .first()
+    )
     if ongoing:
         return dict(ongoing)
 
-    latest = db.execute(
-        text(
-            """
+    latest = (
+        db.execute(
+            text(
+                """
             SELECT
               term_id, term_code, term_name, academic_year, term_no
             FROM dim_term
             ORDER BY academic_year DESC, term_no DESC, term_id DESC
             LIMIT 1
             """
+            )
         )
-    ).mappings().first()
+        .mappings()
+        .first()
+    )
     return dict(latest) if latest else None
 
 
 def _load_metrics(db: Session, student_id: int, term_id: int) -> AcademicMetricSnapshot:
-    ftg_row = db.execute(
-        text(
-            """
+    ftg_row = (
+        db.execute(
+            text(
+                """
             SELECT
               avg_score,
               gpa,
@@ -268,13 +381,17 @@ def _load_metrics(db: Session, student_id: int, term_id: int) -> AcademicMetricS
               AND term_id = :term_id
             LIMIT 1
             """
-        ),
-        {"student_id": student_id, "term_id": term_id},
-    ).mappings().first()
+            ),
+            {"student_id": student_id, "term_id": term_id},
+        )
+        .mappings()
+        .first()
+    )
 
-    portrait_row = db.execute(
-        text(
-            """
+    portrait_row = (
+        db.execute(
+            text(
+                """
             SELECT
               cumulative_avg_score,
               cumulative_gpa,
@@ -286,15 +403,19 @@ def _load_metrics(db: Session, student_id: int, term_id: int) -> AcademicMetricS
             WHERE student_id = :student_id
             LIMIT 1
             """
-        ),
-        {"student_id": student_id},
-    ).mappings().first()
+            ),
+            {"student_id": student_id},
+        )
+        .mappings()
+        .first()
+    )
 
     legacy_row = None
     if ftg_row is None:
-        legacy_row = db.execute(
-            text(
-                """
+        legacy_row = (
+            db.execute(
+                text(
+                    """
                 SELECT
                   average_course_scores AS avg_score,
                   CASE
@@ -305,9 +426,12 @@ def _load_metrics(db: Session, student_id: int, term_id: int) -> AcademicMetricS
                 WHERE student_id = :student_id
                 LIMIT 1
                 """
-            ),
-            {"student_id": student_id},
-        ).mappings().first()
+                ),
+                {"student_id": student_id},
+            )
+            .mappings()
+            .first()
+        )
 
     merged = {}
     if ftg_row:
@@ -339,10 +463,13 @@ def _load_metrics(db: Session, student_id: int, term_id: int) -> AcademicMetricS
     )
 
 
-def _load_trend(db: Session, student_id: int, limit: int = 6) -> list[AcademicTrendPoint]:
-    rows = db.execute(
-        text(
-            """
+def _load_trend(
+    db: Session, student_id: int, limit: int = 6
+) -> list[AcademicTrendPoint]:
+    rows = (
+        db.execute(
+            text(
+                """
             SELECT
               dt.term_id,
               dt.term_code,
@@ -357,9 +484,12 @@ def _load_trend(db: Session, student_id: int, limit: int = 6) -> list[AcademicTr
             ORDER BY dt.academic_year DESC, dt.term_no DESC, dt.term_id DESC
             LIMIT :limit_count
             """
-        ),
-        {"student_id": student_id, "limit_count": limit},
-    ).mappings().all()
+            ),
+            {"student_id": student_id, "limit_count": limit},
+        )
+        .mappings()
+        .all()
+    )
 
     data = [
         AcademicTrendPoint(
@@ -377,12 +507,23 @@ def _load_trend(db: Session, student_id: int, limit: int = 6) -> list[AcademicTr
     return data
 
 
+def _safe_load_trend(
+    db: Session, student_id: int, limit: int = 4
+) -> list[AcademicTrendPoint]:
+    try:
+        return _load_trend(db=db, student_id=student_id, limit=limit)
+    except Exception as exc:
+        logger.warning("academic trend skipped: %s", exc)
+        return []
+
+
 def _load_course_scores(
     db: Session, student_id: int, term_id: int
 ) -> list[AcademicCourseScoreItem]:
-    rows = db.execute(
-        text(
-            """
+    rows = (
+        db.execute(
+            text(
+                """
             SELECT
               fcs.course_id,
               c.title AS course_name,
@@ -397,9 +538,12 @@ def _load_course_scores(
               AND fcs.term_id = :term_id
             ORDER BY fcs.final_score DESC, c.course_id ASC
             """
-        ),
-        {"student_id": student_id, "term_id": term_id},
-    ).mappings().all()
+            ),
+            {"student_id": student_id, "term_id": term_id},
+        )
+        .mappings()
+        .all()
+    )
 
     return [
         AcademicCourseScoreItem(
@@ -415,12 +559,23 @@ def _load_course_scores(
     ]
 
 
+def _safe_load_course_scores(
+    db: Session, student_id: int, term_id: int
+) -> list[AcademicCourseScoreItem]:
+    try:
+        return _load_course_scores(db=db, student_id=student_id, term_id=term_id)
+    except Exception as exc:
+        logger.warning("academic course scores skipped: %s", exc)
+        return []
+
+
 def _load_warnings(
     db: Session, student_id: int, term_id: int
 ) -> list[AcademicWarningItem]:
-    rows = db.execute(
-        text(
-            """
+    rows = (
+        db.execute(
+            text(
+                """
             SELECT
               warning_id,
               warning_type,
@@ -436,11 +591,14 @@ def _load_warnings(
               CASE status WHEN 'open' THEN 0 WHEN 'resolved' THEN 1 ELSE 2 END,
               risk_score DESC,
               opened_at DESC
-            LIMIT 20
+            LIMIT 10
             """
-        ),
-        {"student_id": student_id, "term_id": term_id},
-    ).mappings().all()
+            ),
+            {"student_id": student_id, "term_id": term_id},
+        )
+        .mappings()
+        .all()
+    )
 
     return [
         AcademicWarningItem(
@@ -454,6 +612,16 @@ def _load_warnings(
         )
         for row in rows
     ]
+
+
+def _safe_load_warnings(
+    db: Session, student_id: int, term_id: int
+) -> list[AcademicWarningItem]:
+    try:
+        return _load_warnings(db=db, student_id=student_id, term_id=term_id)
+    except Exception as exc:
+        logger.warning("academic warnings skipped: %s", exc)
+        return []
 
 
 def _load_cohort_comparison(
@@ -478,13 +646,6 @@ def _load_cohort_comparison(
 
         item = _query_agg_cohort_stat(db, term_id, scope_type, scope_id)
         if item is None:
-            item = _fallback_cohort_stat(
-                db=db,
-                term_id=term_id,
-                scope_id=scope_id,
-                fallback_column=fallback_column,
-            )
-        if item is None:
             continue
 
         result.append(
@@ -503,12 +664,39 @@ def _load_cohort_comparison(
     return result
 
 
+def _safe_load_cohort_comparison(
+    db: Session,
+    term_id: int,
+    college_id: int | None,
+    college_name: str | None,
+    major_id: int | None,
+    major_name: str | None,
+    class_id: int | None,
+    class_name: str | None,
+) -> list[AcademicCohortComparisonItem]:
+    try:
+        return _load_cohort_comparison(
+            db=db,
+            term_id=term_id,
+            college_id=college_id,
+            college_name=college_name,
+            major_id=major_id,
+            major_name=major_name,
+            class_id=class_id,
+            class_name=class_name,
+        )
+    except Exception as exc:
+        logger.warning("academic cohort comparison skipped: %s", exc)
+        return []
+
+
 def _query_agg_cohort_stat(
     db: Session, term_id: int, scope_type: str, scope_id: int
 ) -> dict | None:
-    row = db.execute(
-        text(
-            """
+    row = (
+        db.execute(
+            text(
+                """
             SELECT
               sample_size,
               avg_score,
@@ -525,9 +713,12 @@ def _query_agg_cohort_stat(
             ORDER BY gmt_modified DESC
             LIMIT 1
             """
-        ),
-        {"term_id": term_id, "scope_type": scope_type, "scope_id": scope_id},
-    ).mappings().first()
+            ),
+            {"term_id": term_id, "scope_type": scope_type, "scope_id": scope_id},
+        )
+        .mappings()
+        .first()
+    )
     return dict(row) if row else None
 
 
@@ -613,9 +804,7 @@ def _build_key_findings(
     if metrics.gpa is not None:
         findings.append(f"Term GPA: {metrics.gpa:.2f}.")
     if metrics.class_rank is not None and metrics.cohort_size:
-        findings.append(
-            f"Class rank: {metrics.class_rank}/{metrics.cohort_size}."
-        )
+        findings.append(f"Class rank: {metrics.class_rank}/{metrics.cohort_size}.")
 
     weak_courses = sorted(course_scores, key=lambda x: x.final_score)[:3]
     weak_courses = [item for item in weak_courses if item.final_score < 70]

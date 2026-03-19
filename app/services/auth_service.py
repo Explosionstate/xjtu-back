@@ -140,7 +140,25 @@ def _authenticate_external_user(login_name: str, password: str) -> dict | None:
                 .first()
             )
             if not row:
-                return None
+                admin_row = (
+                    adb.execute(
+                        text(
+                            """
+                        SELECT id, login_name, 'admin' AS role, name, email, department_name
+                        FROM admin_user
+                        WHERE login_name = :login_name
+                          AND password = :password
+                        LIMIT 1
+                        """
+                        ),
+                        {"login_name": login_name, "password": password},
+                    )
+                    .mappings()
+                    .first()
+                )
+                if not admin_row:
+                    return None
+                return dict(admin_row)
             return dict(row)
     except Exception:
         return None
@@ -154,6 +172,9 @@ def _upsert_external_user(
 ) -> User:
     source_role = str(external.get("role") or "student").strip().lower()
     mapped_role = "super_admin" if source_role == "admin" else "user"
+    persisted_role = (
+        source_role if source_role in {"admin", "teacher", "student"} else mapped_role
+    )
     login_name = str(external.get("login_name") or "").strip()
 
     user = existing_user
@@ -161,7 +182,7 @@ def _upsert_external_user(
         user = User(
             login_name=login_name,
             password=hash_password(plain_password),
-            role=mapped_role,
+            role=persisted_role,
             name=str(external.get("name") or login_name),
             email=str(external.get("email") or "") or None,
             department_name=str(external.get("department_name") or "") or None,
@@ -175,8 +196,8 @@ def _upsert_external_user(
         if user.is_deleted != 0:
             user.is_deleted = 0
             updated = True
-        if user.role != mapped_role:
-            user.role = mapped_role
+        if user.role != persisted_role:
+            user.role = persisted_role
             updated = True
         if not verify_password(plain_password, user.password):
             user.password = hash_password(plain_password)
@@ -233,6 +254,11 @@ def sso_exchange(db: Session, ticket: str) -> tuple[str, User, str, str]:
 
     normalized_source_role = str(source_role).strip().lower()
     mapped_role = _map_sso_role(normalized_source_role)
+    persisted_role = (
+        normalized_source_role
+        if normalized_source_role in {"admin", "teacher", "student"}
+        else mapped_role
+    )
     user = db.scalar(
         select(User).where(User.login_name == login_name, User.is_deleted == 0)
     )
@@ -241,7 +267,7 @@ def sso_exchange(db: Session, ticket: str) -> tuple[str, User, str, str]:
         user = User(
             login_name=login_name,
             password=hash_password(f"sso:{uuid4()}"),
-            role=mapped_role,
+            role=persisted_role,
             name=display_name or login_name,
             email=None,
             department_name=source_table,
@@ -254,8 +280,8 @@ def sso_exchange(db: Session, ticket: str) -> tuple[str, User, str, str]:
         if user.is_deleted != 0:
             user.is_deleted = 0
             updated = True
-        if user.role != mapped_role:
-            user.role = mapped_role
+        if user.role != persisted_role:
+            user.role = persisted_role
             updated = True
         if display_name and user.name != display_name:
             user.name = display_name

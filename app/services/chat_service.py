@@ -36,8 +36,8 @@ from app.services.system_config_service import (
 
 
 CHAT_TOTAL_TIMEOUT_SECONDS = 60
-WORKFLOW_TIMEOUT_SECONDS = 44
-GENERATION_STAGE_TIMEOUT_SECONDS = 28
+WORKFLOW_TIMEOUT_SECONDS = 52
+GENERATION_STAGE_TIMEOUT_SECONDS = 42
 ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 120
 ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 112
 ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
@@ -218,7 +218,19 @@ def _is_academic_analysis_query(agent_key: str | None, question: str) -> bool:
     if not _is_student_growth_agent(agent_key):
         return False
     q = (question or "").strip().lower()
-    return any(token in q for token in ["学业分析", "学习分析", "成绩分析", "学情分析"])
+    return any(
+        token in q
+        for token in [
+            "学业分析",
+            "学习分析",
+            "成绩分析",
+            "学情分析",
+            "学业",
+            "学情",
+            "学习情况",
+            "成绩情况",
+        ]
+    )
 
 
 def _format_academic_analysis_context(login_name: str) -> str:

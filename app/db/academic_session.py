@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from threading import Lock
+from threading import RLock
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -12,7 +12,7 @@ from app.core.config import settings
 
 _academic_engine: Engine | None = None
 _academic_session_factory: sessionmaker[Session] | None = None
-_academic_lock = Lock()
+_academic_lock = RLock()
 
 
 def get_academic_engine() -> Engine:
@@ -34,6 +34,10 @@ def get_academic_engine() -> Engine:
             _academic_engine = create_engine(
                 settings.academic_db_url,
                 pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=2,
+                pool_timeout=6,
+                pool_recycle=300,
                 future=True,
                 connect_args=connect_args,
             )
