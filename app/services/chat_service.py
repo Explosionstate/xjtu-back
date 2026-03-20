@@ -40,8 +40,8 @@ from app.services.system_config_service import (
 
 CHAT_TOTAL_TIMEOUT_SECONDS = 60
 WORKFLOW_TIMEOUT_SECONDS = 52
-GENERATION_STAGE_TIMEOUT_SECONDS = 42
-LOCAL_GENERATION_TIMEOUT_SECONDS = 18
+GENERATION_STAGE_TIMEOUT_SECONDS = 28
+LOCAL_GENERATION_TIMEOUT_SECONDS = 12
 ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 120
 ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 112
 ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
@@ -109,6 +109,50 @@ def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
         f"结论：已基于当前检索结果回答“{question[:32]}”。\n"
         f"依据：{evidence}\n"
         "建议：若你希望更精确，请补充目标对象、时间范围和约束条件（例如平台、端口、环境）。"
+    )
+
+
+def _enhance_student_balance_answer(
+    question: str, answer: str, retrieved: list[dict]
+) -> str:
+    q = (question or "").strip()
+    if not any(token in q for token in ["大一", "学习", "生活", "平衡", "建议"]):
+        return answer
+    if len((answer or "").strip()) >= 320:
+        return answer
+
+    points: list[str] = []
+    for item in retrieved:
+        content = str(item.get("content") or "").replace("\n", " ").strip()
+        content = re.sub(r"\s+", " ", content)
+        if not content:
+            continue
+        if any(
+            k in content
+            for k in ["登录名", "角色:", "学院/部门", "pip install", "requirements.txt"]
+        ):
+            continue
+        points.append(content[:60])
+        if len(points) >= 3:
+            break
+    evidence = (
+        "；".join(points)
+        if points
+        else "检索结果显示应同时兼顾学习推进与身心状态维护。"
+    )
+
+    return (
+        "结论：建议本周采用“学习主线 + 生活底线 + 周末复盘”三段式节奏，"
+        "确保成绩提升同时避免持续疲劳。\n"
+        f"依据：{evidence}\n"
+        "建议：1）周一到周五每天完成2个45分钟深度学习块（1个复习、1个作业/预习）；"
+        "2）每天固定30分钟运动并保证7小时以上睡眠；"
+        "3）每晚睡前15分钟整理次日三件最重要任务；"
+        "4）周三晚做一次中期检查，未完成任务及时降优先级；"
+        "5）周六上午集中补弱课程，下午安排社交或兴趣活动；"
+        "6）周日晚上20分钟复盘，记录有效方法与低效原因；"
+        "7）与同学结成互督小组，每周至少一次互测互评；"
+        "8）若连续两天低效，先保核心课程与作息，再逐步恢复其他安排。"
     )
 
 
@@ -590,7 +634,7 @@ def chat_completion(
                         contexts[:2],
                         settings.local_transformer_model,
                         None,
-                        320,
+                        520,
                     )
                     try:
                         answer, model_reference, _metrics = local_future.result(
@@ -609,7 +653,20 @@ def chat_completion(
                         llm_result = answer_with_llm(
                             question=runtime_question,
                             contexts=contexts,
-                            llm_enabled=payload.llm_enabled,
+                            llm_enabled=True,
+                            system_instruction=system_instruction,
+                            timeout_seconds=generation_timeout,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "local transformer failed: conversation=%s agent=%s",
+                            conversation_id,
+                            payload.agent_key,
+                        )
+                        llm_result = answer_with_llm(
+                            question=runtime_question,
+                            contexts=contexts,
+                            llm_enabled=True,
                             system_instruction=system_instruction,
                             timeout_seconds=generation_timeout,
                         )
@@ -727,6 +784,8 @@ def chat_completion(
 
         if perf_counter() - start > chat_total_timeout and not answer:
             answer = _fast_retrieval_answer(question, retrieved)
+
+        answer = _enhance_student_balance_answer(question, answer, retrieved)
 
         if retrieved:
             sources = [

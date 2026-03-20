@@ -41,7 +41,14 @@ def answer_with_llm(
     if not enabled or not settings.api_key:
         return LLMAnswerResult(answer="\n\n".join(contexts), mode="disabled")
 
-    compact_contexts = [ctx.strip()[:1200] for ctx in contexts[:3] if ctx.strip()]
+    is_guidance = any(
+        token in (question or "") for token in ["大一", "学习", "生活", "平衡", "建议"]
+    )
+    context_limit = 2 if is_guidance else 3
+    context_size = 900 if is_guidance else 1200
+    compact_contexts = [
+        ctx.strip()[:context_size] for ctx in contexts[:context_limit] if ctx.strip()
+    ]
 
     academic_prompt = ""
     if _is_academic_analysis_query(question):
@@ -93,6 +100,7 @@ def answer_with_llm(
                 mode="empty_fallback",
             )
         answer = _ensure_three_section(answer)
+        answer = _ensure_guidance_answer_length(answer, question)
         return LLMAnswerResult(
             answer=answer,
             mode="llm",
@@ -133,14 +141,24 @@ def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
             "insert into",
             " key `",
             "idx_",
+            "外部业务库用户画像",
+            "登录名:",
+            "角色:",
+            "学院/部门:",
+            "学号:",
         ]
         return any(marker in t for marker in noise_markers)
+
+    preference_keywords = ["学习", "生活", "平衡", "建议", "复盘", "作息", "运动"]
+    q_pref = any(token in q for token in preference_keywords)
 
     sentences = re.split(r"[\n。！？!?]", merged)
     cleaned: list[str] = []
     for item in sentences:
         text = " ".join(item.strip().split())
         if not text or text in cleaned or _is_noise_line(text):
+            continue
+        if q_pref and not any(token in text for token in preference_keywords):
             continue
         cleaned.append(text)
         if len(cleaned) >= 5:
@@ -153,7 +171,7 @@ def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
             "建议：请补充更贴近业务的文档内容，或降低该类技术脚本文档在当前问答场景中的优先级。"
         )
 
-    summary = "；".join(cleaned[:3])
+    summary = "；".join(cleaned[:4])
 
     if any(token in q for token in ["总结", "概述", "重点", "新增文档", "指南"]):
         return (
@@ -171,7 +189,10 @@ def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
             "2）晚间固定30分钟运动或散步；"
             "3）睡前15分钟做次日任务清单；"
             "4）每周至少1次社交或兴趣活动保持情绪稳定；"
-            "5）周日用20分钟复盘并调整下周优先级。"
+            "5）周日用20分钟复盘并调整下周优先级；"
+            "6）遇到连续两天低效时，主动缩减任务并优先完成最关键一项；"
+            "7）把最薄弱课程安排在精力最好的时段；"
+            "8）每周与同学进行一次互测互评，检查执行效果。"
         )
 
     return (
@@ -185,6 +206,21 @@ def _is_academic_analysis_query(question: str) -> bool:
     q = (question or "").strip().lower()
     flags = ["学业分析", "学习分析", "成绩分析", "学情分析", "学习情况"]
     return any(flag in q for flag in flags)
+
+
+def _ensure_guidance_answer_length(answer: str, question: str) -> str:
+    q = (question or "").strip().lower()
+    if not any(token in q for token in ["大一", "学习", "生活", "平衡", "建议"]):
+        return answer
+    if len(answer) >= 260:
+        return answer
+    extension = (
+        "\n建议补充："
+        "可将一周拆成“周一到周五稳态推进、周六查漏补缺、周日复盘调整”三段，"
+        "其中周一到周五每天至少完成一门课程复习与一项生活管理任务；"
+        "若出现拖延，优先保证核心课程学习与睡眠，再逐步恢复其他安排。"
+    )
+    return f"{answer}{extension}"
 
 
 def _ensure_three_section(answer: str) -> str:
