@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from functools import lru_cache
+import logging
+from time import perf_counter
 import re
 from typing import Any
 
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,7 @@ def get_chat_llm(
     top_p: float,
     frequency_penalty: float,
     presence_penalty: float,
+    request_timeout: int,
 ) -> ChatOpenAI:
     return ChatOpenAI(
         api_key=settings.api_key,
@@ -107,7 +111,7 @@ def get_chat_llm(
         top_p=top_p,
         frequency_penalty=frequency_penalty,
         presence_penalty=presence_penalty,
-        timeout=settings.llm_timeout_seconds,
+        timeout=max(6, int(request_timeout)),
         max_retries=0,
     )
 
@@ -118,6 +122,8 @@ def answer_with_llm(
     llm_enabled: bool | None = None,
     system_instruction: str | None = None,
     timeout_seconds: int | None = None,
+    allow_general_knowledge: bool = False,
+    retry_on_failure: bool = True,
 ) -> LLMAnswerResult:
     enabled = settings.llm_enabled if llm_enabled is None else llm_enabled
     if not enabled or not settings.api_key:
@@ -141,19 +147,46 @@ def answer_with_llm(
             "4) 下周行动计划（3条，可执行）\n"
         )
 
-    prompt = (
-        f"{(system_instruction or '').strip()}\n"
-        f"{academic_prompt}"
-        "你是知识库问答助手。必须基于给定资料作答，不得编造事实。\n"
-        f"回答类型：{profile.style}\n"
-        f"组织建议：{profile.organization_hint}\n"
-        "写作要求：\n"
-        "1) 优先回答用户当前问题，再补充必要依据。\n"
-        "2) 不要机械套用固定模板，按问题自然组织段落。\n"
-        "3) 资料不足时，明确不确定边界，并给出下一步可执行建议。\n\n"
-        f"问题：{question}\n\n"
-        f"资料：\n{chr(10).join(compact_contexts) if compact_contexts else '（当前未检索到高置信资料）'}"
+    base_policy = (
+        "你是知识库问答助手。优先基于给定资料作答，资料不足时可结合通用知识，但不得编造具体事实。\n"
+        if allow_general_knowledge
+        else "你是知识库问答助手。必须基于给定资料作答，不得编造事实。\n"
     )
+    general_hint = (
+        "4) 当前允许通用知识回答：当检索资料不足时，可结合模型通用知识与上下文给出完整回答，"
+        "并明确区分“资料依据”与“通用判断”。\n\n"
+        if allow_general_knowledge
+        else "\n"
+    )
+    if allow_general_knowledge and not compact_contexts:
+        prompt = (
+            f"{(system_instruction or '').strip()}\n"
+            "你是对话助手，请直接、自然地回答用户问题。\n"
+            "可使用通用知识，但不要编造具体数据或未确认事实。\n"
+            f"问题：{question}"
+        )
+    else:
+        prompt = (
+            f"{(system_instruction or '').strip()}\n"
+            f"{academic_prompt}"
+            f"{base_policy}"
+            f"回答类型：{profile.style}\n"
+            f"组织建议：{profile.organization_hint}\n"
+            "写作要求：\n"
+            "1) 优先回答用户当前问题，再补充必要依据。\n"
+            "2) 不要机械套用固定模板，按问题自然组织段落。\n"
+            "3) 资料不足时，明确不确定边界，并给出下一步可执行建议。\n"
+            f"{general_hint}"
+            f"问题：{question}\n\n"
+            f"资料：\n{chr(10).join(compact_contexts) if compact_contexts else '（当前未检索到高置信资料）'}"
+        )
+
+    if allow_general_knowledge:
+        prompt = _build_cloud_direct_prompt(
+            question=question,
+            compact_contexts=compact_contexts,
+            system_instruction=system_instruction,
+        )
 
     effective_timeout = max(
         2,
@@ -163,57 +196,162 @@ def answer_with_llm(
             else settings.llm_timeout_seconds
         ),
     )
+    if allow_general_knowledge:
+        # Keep cloud direct-chat mode under the frontend request budget.
+        timeout_cap = 30 if not compact_contexts else 26
+        effective_timeout = min(effective_timeout, timeout_cap)
+
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
     effective_tokens = max(120, min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens))
+    if allow_general_knowledge:
+        effective_tokens = min(effective_tokens, 180)
+    if allow_general_knowledge and not compact_contexts:
+        effective_tokens = min(effective_tokens, 140)
 
-    try:
-        executor = ThreadPoolExecutor(max_workers=1)
-        llm = get_chat_llm(
-            temperature=round(effective_temperature, 2),
-            top_p=round(profile.top_p, 2),
-            frequency_penalty=round(profile.frequency_penalty, 2),
-            presence_penalty=round(profile.presence_penalty, 2),
+    base_timeout = max(6, effective_timeout)
+    call_plan: list[tuple[str, str, int, int]] = [
+        ("primary", prompt, base_timeout, effective_tokens)
+    ]
+    if allow_general_knowledge and retry_on_failure:
+        retry_prompt = _build_compact_retry_prompt(
+            question=question,
+            compact_contexts=compact_contexts,
+            system_instruction=system_instruction,
         )
-        future = executor.submit(
-            llm.invoke,
-            prompt,
-            max_tokens=effective_tokens,
-        )
+        retry_timeout = 6
+        retry_tokens = max(96, min(180, effective_tokens))
+        call_plan.append(("retry", retry_prompt, retry_timeout, retry_tokens))
+
+    timeout_detected = False
+    last_exc: Exception | None = None
+    for attempt_name, attempt_prompt, attempt_timeout, attempt_tokens in call_plan:
+        started = perf_counter()
         try:
-            response = future.result(timeout=effective_timeout)
-        finally:
-            future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-        answer = _normalize_answer_text(_extract_text_content(getattr(response, "content", "")))
-        if not answer or len(answer) < 18:
-            return LLMAnswerResult(
-                answer=_fallback_natural_answer(question, compact_contexts),
-                mode="empty_fallback",
+            llm = get_chat_llm(
+                temperature=round(effective_temperature, 2),
+                top_p=round(profile.top_p, 2),
+                frequency_penalty=round(profile.frequency_penalty, 2),
+                presence_penalty=round(profile.presence_penalty, 2),
+                request_timeout=max(6, int(attempt_timeout)),
             )
-        return LLMAnswerResult(
-            answer=answer,
-            mode="llm",
-            reasoning=_extract_reasoning_text(response),
-        )
-    except FuturesTimeoutError:
-        return LLMAnswerResult(
-            answer=_fallback_natural_answer(question, compact_contexts),
-            mode="timeout_fallback",
-        )
-    except Exception:
-        # Keep endpoint responsive and still return readable text when LLM is unavailable.
-        return LLMAnswerResult(
-            answer=_fallback_natural_answer(question, compact_contexts),
-            mode="error_fallback",
+            response = llm.invoke(
+                attempt_prompt,
+                max_tokens=attempt_tokens,
+            )
+            answer = _normalize_answer_text(
+                _extract_text_content(getattr(response, "content", ""))
+            )
+            elapsed_ms = int((perf_counter() - started) * 1000)
+            logger.info(
+                "llm invoke success: mode=%s timeout=%ss tokens=%s elapsed_ms=%s contexts=%s",
+                attempt_name,
+                attempt_timeout,
+                attempt_tokens,
+                elapsed_ms,
+                len(compact_contexts),
+            )
+            if not answer or len(answer) < 18:
+                continue
+            return LLMAnswerResult(
+                answer=answer,
+                mode="llm" if attempt_name == "primary" else "llm_retry",
+                reasoning=_extract_reasoning_text(response),
+            )
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = int((perf_counter() - started) * 1000)
+            timeout_like = _looks_like_timeout_error(exc)
+            timeout_detected = timeout_detected or timeout_like
+            last_exc = exc
+            logger.warning(
+                "llm invoke failed: mode=%s timeout=%ss elapsed_ms=%s timeout_like=%s err=%s",
+                attempt_name,
+                attempt_timeout,
+                elapsed_ms,
+                timeout_like,
+                exc.__class__.__name__,
+            )
+            if timeout_like:
+                # Timeout often indicates upstream congestion; avoid stacking waits.
+                break
+            continue
+
+    if last_exc is not None:
+        logger.debug(
+            "llm invoke final failure",
+            exc_info=(type(last_exc), last_exc, last_exc.__traceback__),
         )
 
+    fallback_mode = "timeout_fallback" if timeout_detected else "error_fallback"
+    return LLMAnswerResult(
+        answer=_fallback_natural_answer(
+            question,
+            compact_contexts,
+            allow_general_knowledge=allow_general_knowledge,
+        ),
+        mode=fallback_mode,
+    )
 
-def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
+
+def _build_compact_retry_prompt(
+    question: str,
+    compact_contexts: list[str],
+    system_instruction: str | None = None,
+) -> str:
+    context_block = ""
+    if compact_contexts:
+        context_block = "\n".join(f"- {item}" for item in compact_contexts[:2])
+    return (
+        f"{(system_instruction or '').strip()}\n"
+        "你是对话助手，请直接回答用户问题，优先给出可执行结论。"
+        "若信息不足，请明确不确定边界，不要编造事实。\n"
+        f"问题：{question}\n"
+        f"参考信息：\n{context_block or '（暂无可靠参考信息）'}"
+    )
+
+
+def _build_cloud_direct_prompt(
+    question: str,
+    compact_contexts: list[str],
+    system_instruction: str | None = None,
+) -> str:
+    context_block = ""
+    if compact_contexts:
+        context_block = "\n".join(f"- {item}" for item in compact_contexts[:2])
+    return (
+        f"{(system_instruction or '').strip()}\n"
+        "你是对话助手，请像常规聊天模型一样直接回答用户问题，先给结论，再给简要依据。\n"
+        "如果信息不足，请明确不确定边界，不要编造事实。\n"
+        f"问题：{question}\n"
+        f"可选参考：\n{context_block or '（无强相关知识库片段）'}"
+    )
+
+
+def _looks_like_timeout_error(exc: Exception) -> bool:
+    class_name = exc.__class__.__name__.lower()
+    if "timeout" in class_name:
+        return True
+    message = str(exc).lower()
+    timeout_markers = [
+        "timed out",
+        "timeout",
+        "read operation timed out",
+        "request timed out",
+    ]
+    return any(marker in message for marker in timeout_markers)
+
+
+def _fallback_natural_answer(
+    question: str,
+    contexts: list[str],
+    allow_general_knowledge: bool = False,
+) -> str:
     style = _detect_answer_style(question)
     q = (question or "").strip().lower()
     question_focus = (question or "").strip()[:80] or "当前问题"
 
     if not contexts:
+        if allow_general_knowledge:
+            return _render_general_knowledge_fallback(style, question_focus)
         return _render_no_context_fallback(style, question_focus)
 
     merged = "\n".join(contexts)
@@ -252,6 +390,8 @@ def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
             break
 
     if not cleaned:
+        if allow_general_knowledge:
+            return _render_general_knowledge_fallback(style, question_focus)
         return _render_no_context_fallback(style, question_focus)
 
     evidence_lines = cleaned[:4]
@@ -338,6 +478,33 @@ def _render_no_context_fallback(style: str, question_focus: str) -> str:
     return (
         f"当前资料不足，暂时无法直接回答“{question_focus}”。\n"
         "你可以补充对象、时间范围和已知事实，我会给出更贴题的结论。"
+    )
+
+
+def _render_general_knowledge_fallback(style: str, question_focus: str) -> str:
+    if style == "comparison":
+        return (
+            f"当前知识库未命中“{question_focus}”的直接资料，我先基于通用经验给你比较框架：\n"
+            "1) 先定评价维度（效果/成本/风险）；2) 再按维度打分；3) 最后按你的优先级做取舍。"
+        )
+    if style == "summary":
+        return (
+            f"当前知识库未命中“{question_focus}”的有效片段。\n"
+            "我可先给你通用摘要模板：背景、核心要点、风险提示、下一步行动。"
+        )
+    if style == "guidance":
+        return (
+            f"当前资料不足，但“{question_focus}”可先按通用路径执行：\n"
+            "1) 明确目标与约束；2) 拆分可执行步骤；3) 每步设置检查点并滚动调整。"
+        )
+    if style == "analysis":
+        return (
+            f"当前知识库证据不足，我先给“{question_focus}”的通用分析框架：\n"
+            "现象 -> 可能成因 -> 影响范围 -> 验证指标 -> 处置优先级。"
+        )
+    return (
+        f"当前知识库暂未命中“{question_focus}”的直接资料。\n"
+        "我先基于通用知识给出可执行答案；若你补充业务上下文，我可再细化到场景级结论。"
     )
 
 
