@@ -9,21 +9,38 @@ from app.core.config import settings
 from app.core.errors import BusinessError
 from app.services.embedding_service import resolve_model_reference
 
-try:
-    import torch
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore[assignment]
-
-try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-except ImportError:  # pragma: no cover
-    AutoModelForCausalLM = None  # type: ignore[assignment]
-    AutoTokenizer = None  # type: ignore[assignment]
+_torch = None
+_AutoModelForCausalLM = None
+_AutoTokenizer = None
+_runtime_import_attempted = False
 
 
 _GENERATION_SEMAPHORE = BoundedSemaphore(
     value=max(1, settings.local_transformer_max_concurrency)
 )
+
+
+def _load_runtime_modules():
+    global _torch, _AutoModelForCausalLM, _AutoTokenizer, _runtime_import_attempted
+    if _runtime_import_attempted:
+        return _torch, _AutoModelForCausalLM, _AutoTokenizer
+
+    _runtime_import_attempted = True
+    try:
+        import torch as torch_module
+    except ImportError:  # pragma: no cover
+        torch_module = None
+    _torch = torch_module
+
+    try:
+        from transformers import AutoModelForCausalLM as model_cls
+        from transformers import AutoTokenizer as tokenizer_cls
+    except ImportError:  # pragma: no cover
+        model_cls = None
+        tokenizer_cls = None
+    _AutoModelForCausalLM = model_cls
+    _AutoTokenizer = tokenizer_cls
+    return _torch, _AutoModelForCausalLM, _AutoTokenizer
 
 
 def _resolve_transformer_model_reference(model_name: str | None) -> str:
@@ -39,37 +56,38 @@ def _resolve_transformer_model_reference(model_name: str | None) -> str:
 
 @lru_cache(maxsize=2)
 def _get_local_model(model_reference: str):
-    if AutoTokenizer is None or AutoModelForCausalLM is None:
+    torch_module, model_cls, tokenizer_cls = _load_runtime_modules()
+    if tokenizer_cls is None or model_cls is None:
         raise BusinessError(
             "未安装 transformers，无法加载本地Transformer模型。",
             status_code=500,
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_reference, trust_remote_code=True)
+    tokenizer = tokenizer_cls.from_pretrained(model_reference, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if (
         settings.transformer_device == "cuda"
-        and torch is not None
-        and torch.cuda.is_available()
+        and torch_module is not None
+        and torch_module.cuda.is_available()
     ):
         try:
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_cls.from_pretrained(
                 model_reference,
                 trust_remote_code=True,
-                torch_dtype=torch.float16,
+                torch_dtype=torch_module.float16,
             )
             model = model.to("cuda")
         except Exception:
             # Fallback to CPU when CUDA is unavailable at runtime or VRAM is insufficient.
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_cls.from_pretrained(
                 model_reference,
                 trust_remote_code=True,
             )
             model = model.to("cpu")
     else:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = model_cls.from_pretrained(
             model_reference,
             trust_remote_code=True,
         )
@@ -112,6 +130,7 @@ def generate_answer_with_local_transformer(
         )
 
     tokenizer, model = _get_local_model(model_reference)
+    torch_module, _, _ = _load_runtime_modules()
     initial_device = str(getattr(model, "device", "unknown"))
     start = perf_counter()
     fallback_cpu = False
@@ -135,13 +154,16 @@ def generate_answer_with_local_transformer(
 
         try:
             output = _generate(
-                model=model, model_inputs=model_inputs, kwargs=generation_kwargs
+                model=model,
+                model_inputs=model_inputs,
+                kwargs=generation_kwargs,
+                torch_module=torch_module,
             )
         except RuntimeError as exc:
-            if "out of memory" not in str(exc).lower() or torch is None:
+            if "out of memory" not in str(exc).lower() or torch_module is None:
                 raise
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if torch_module.cuda.is_available():
+                torch_module.cuda.empty_cache()
             model = model.to("cpu")
             fallback_cpu = True
             model_inputs = {k: v.to("cpu") for k, v in model_inputs.items()}
@@ -150,7 +172,10 @@ def generate_answer_with_local_transformer(
                 128, int(reduced_kwargs.get("max_new_tokens", 128))
             )
             output = _generate(
-                model=model, model_inputs=model_inputs, kwargs=reduced_kwargs
+                model=model,
+                model_inputs=model_inputs,
+                kwargs=reduced_kwargs,
+                torch_module=torch_module,
             )
 
         prompt_tokens = model_inputs["input_ids"].shape[1]
@@ -172,16 +197,19 @@ def generate_answer_with_local_transformer(
         _GENERATION_SEMAPHORE.release()
 
 
-def _generate(model, model_inputs: dict, kwargs: dict):
-    if torch is not None:
-        with torch.inference_mode():
+def _generate(model, model_inputs: dict, kwargs: dict, torch_module=None):
+    if torch_module is not None:
+        with torch_module.inference_mode():
             return model.generate(**model_inputs, **kwargs)
     return model.generate(**model_inputs, **kwargs)
 
 
 def local_transformer_runtime() -> dict[str, int | str | bool]:
+    torch_module, _, _ = _load_runtime_modules()
     active_device = settings.transformer_device
-    cuda_available = bool(torch is not None and torch.cuda.is_available())
+    cuda_available = bool(
+        torch_module is not None and torch_module.cuda.is_available()
+    )
     if settings.transformer_device == "cuda" and not cuda_available:
         active_device = "cpu"
     return {

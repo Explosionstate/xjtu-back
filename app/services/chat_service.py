@@ -50,6 +50,10 @@ ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
 ACADEMIC_PROFILE_TIMEOUT_SECONDS = 8.0
 DEFAULT_PROFILE_TIMEOUT_SECONDS = 1.5
 MIN_RELAXED_THRESHOLD = 0.12
+LONG_TERM_MEMORY_ROLE = "system"
+LONG_TERM_MEMORY_PREFIX = "[CONTEXT_MEMORY]"
+LONG_TERM_MEMORY_MAX_CHARS = 1200
+LONG_TERM_MEMORY_MAX_LINES = 14
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -79,33 +83,121 @@ def _compact_text(text: str, max_chars: int) -> str:
     return compact[:max_chars]
 
 
+def _is_long_term_memory_message(message: Message) -> bool:
+    return (
+        (message.role or "").strip().lower() == LONG_TERM_MEMORY_ROLE
+        and (message.content or "").startswith(LONG_TERM_MEMORY_PREFIX)
+    )
+
+
+def _extract_long_term_memory(history: list[Message]) -> str:
+    for message in reversed(history):
+        if not _is_long_term_memory_message(message):
+            continue
+        return (message.content or "").replace(LONG_TERM_MEMORY_PREFIX, "", 1).strip()
+    return ""
+
+
+def _format_long_term_memory(memory: str) -> str:
+    compact = _compact_text(memory, LONG_TERM_MEMORY_MAX_CHARS)
+    if not compact:
+        return ""
+    return f"{LONG_TERM_MEMORY_PREFIX}\n{compact}"
+
+
+def _looks_like_key_user_context(text: str) -> bool:
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    if len(lowered) >= 24:
+        return True
+    key_tokens = [
+        "目标",
+        "背景",
+        "约束",
+        "范围",
+        "时间",
+        "课程",
+        "学生",
+        "老师",
+        "管理员",
+        "学分",
+        "risk",
+        "deadline",
+        "port",
+        "环境",
+    ]
+    return any(token in lowered for token in key_tokens)
+
+
+def _merge_memory_lines(existing_memory: str, new_lines: list[str]) -> str:
+    merged_lines: list[str] = []
+    for raw in ([line for line in existing_memory.split("\n") if line.strip()] + new_lines):
+        line = raw.strip()
+        if not line or line in merged_lines:
+            continue
+        merged_lines.append(line)
+
+    if len(merged_lines) > LONG_TERM_MEMORY_MAX_LINES:
+        merged_lines = merged_lines[-LONG_TERM_MEMORY_MAX_LINES:]
+    merged = "\n".join(merged_lines)
+    return merged[:LONG_TERM_MEMORY_MAX_CHARS]
+
+
+def _build_long_term_memory_update(
+    existing_memory: str,
+    dropped_messages: list[Message],
+) -> str:
+    memory_lines: list[str] = []
+    for message in dropped_messages:
+        text = _compact_text(message.content, 120 if message.role == "user" else 90)
+        if not text:
+            continue
+        if message.role == "user":
+            if _looks_like_key_user_context(text):
+                memory_lines.append(f"用户背景: {text}")
+        elif message.role == "assistant":
+            if any(flag in text for flag in ["结论", "建议", "方案", "风险", "计划"]):
+                memory_lines.append(f"助手结论: {text}")
+        if len(memory_lines) >= 10:
+            break
+    return _merge_memory_lines(existing_memory, memory_lines)
+
+
 def _build_history_context_brief(
-    history: list[Message], question: str, max_chars: int = 720
+    history: list[Message],
+    question: str,
+    long_term_memory: str = "",
+    max_chars: int = 980,
 ) -> str:
     if not history:
-        return ""
+        base = _compact_text(long_term_memory, 320)
+        return f"长期记忆:\n{base}" if base else ""
 
-    recent = history[-6:]
+    recent = history[-10:]
     user_lines = [
-        _compact_text(item.content, 120)
+        _compact_text(item.content, 150)
         for item in recent
         if item.role == "user" and item.content.strip()
     ]
     assistant_lines = [
-        _compact_text(item.content, 90)
+        _compact_text(item.content, 120)
         for item in recent
         if item.role == "assistant" and item.content.strip()
     ]
 
     sections: list[str] = []
+    memory_block = _compact_text(long_term_memory, 320)
+    if memory_block:
+        sections.append(f"长期记忆:\n- {memory_block}")
     if user_lines:
         sections.append(
-            "近期用户问题:\n" + "\n".join(f"- {line}" for line in user_lines[-4:] if line)
+            "近期用户问题:\n" + "\n".join(f"- {line}" for line in user_lines[-6:] if line)
         )
     if assistant_lines:
         sections.append(
             "近期助手回答:\n"
-            + "\n".join(f"- {line}" for line in assistant_lines[-2:] if line)
+            + "\n".join(f"- {line}" for line in assistant_lines[-3:] if line)
         )
 
     current = _compact_text(question, 140)
@@ -298,10 +390,17 @@ def _truncate_history(
 ) -> list[Message]:
     if not history:
         return []
+    chat_history = [
+        msg
+        for msg in history
+        if msg.role in {"user", "assistant"} and not _is_long_term_memory_message(msg)
+    ]
+    if not chat_history:
+        return []
     kept: list[Message] = []
     token_sum = 0
     max_messages = max_rounds * 2
-    for msg in reversed(history):
+    for msg in reversed(chat_history):
         tokens = _estimate_tokens(msg.content)
         if kept and (len(kept) >= max_messages or token_sum + tokens > max_tokens):
             break
@@ -310,13 +409,18 @@ def _truncate_history(
     return list(reversed(kept))
 
 
-def _build_retrieval_query(history: list[Message], question: str) -> str:
+def _build_retrieval_query(
+    history: list[Message], question: str, long_term_memory: str = ""
+) -> str:
     summary_keywords = ["总结", "概述", "重点", "本周新增文档", "学生指南"]
     if any(keyword in question for keyword in summary_keywords):
         # For summary-style requests, avoid dragging unrelated chat history.
         return question
 
     if not history:
+        memory = _compact_text(long_term_memory, 220)
+        if memory:
+            return f"长期记忆: {memory}\n{_compact_text(question, 200)}"
         return question
     user_snippets = [
         _compact_text(item.content, 120)
@@ -331,10 +435,13 @@ def _build_retrieval_query(history: list[Message], question: str) -> str:
     snippets = [item for item in user_snippets[-3:] if item]
     if assistant_snippets:
         snippets.append(assistant_snippets[-1])
+    memory = _compact_text(long_term_memory, 220)
+    if memory:
+        snippets.insert(0, f"长期记忆: {memory}")
     if not snippets:
         return question
     retrieval_query = "\n".join(snippets + [_compact_text(question, 200)])
-    return retrieval_query[:720]
+    return retrieval_query[:880]
 
 
 def _expand_academic_query(agent_key: str | None, question: str) -> str:
@@ -596,12 +703,13 @@ def chat_completion(
             .order_by(Message.created_at.asc())
         ).all()
     )
+    long_term_memory = _extract_long_term_memory(history)
     trimmed_history = _truncate_history(
         history=history, max_rounds=max_rounds, max_tokens=max_tokens
     )
     retrieval_query = _expand_academic_query(
         payload.agent_key,
-        _build_retrieval_query(trimmed_history, question),
+        _build_retrieval_query(trimmed_history, question, long_term_memory),
     )
     is_academic_analysis = _is_academic_analysis_query(payload.agent_key, question)
     chat_total_timeout = (
@@ -726,7 +834,11 @@ def chat_completion(
             )
             query = _expand_academic_query(
                 payload.agent_key,
-                _build_retrieval_query(trimmed_history, runtime_question),
+                _build_retrieval_query(
+                    trimmed_history,
+                    runtime_question,
+                    long_term_memory,
+                ),
             )
             try:
                 retrieved = hybrid_retrieve(
@@ -806,7 +918,11 @@ def chat_completion(
                 status="start",
                 detail="正在生成最终回答...",
             )
-            history_context = _build_history_context_brief(trimmed_history, runtime_question)
+            history_context = _build_history_context_brief(
+                trimmed_history,
+                runtime_question,
+                long_term_memory=long_term_memory,
+            )
             generation_contexts = (
                 [history_context] + contexts if history_context else list(contexts)
             )
@@ -985,7 +1101,11 @@ def chat_completion(
                         db=db,
                         query=_expand_academic_query(
                             payload.agent_key,
-                            _build_retrieval_query(trimmed_history, question),
+                            _build_retrieval_query(
+                                trimmed_history,
+                                question,
+                                long_term_memory,
+                            ),
                         ),
                         kb_ids=kb_ids,
                         document_ids=payload.document_ids,
@@ -1157,10 +1277,39 @@ def chat_completion(
             .order_by(Message.created_at.asc())
         ).all()
     )
+    existing_memory = _extract_long_term_memory(refreshed_history)
+    memory_messages = [
+        item for item in refreshed_history if _is_long_term_memory_message(item)
+    ]
+    latest_memory_message = memory_messages[-1] if memory_messages else None
+    non_memory_history = [
+        item for item in refreshed_history if not _is_long_term_memory_message(item)
+    ]
     trimmed_after = _truncate_history(
-        history=refreshed_history, max_rounds=max_rounds, max_tokens=max_tokens
+        history=non_memory_history, max_rounds=max_rounds, max_tokens=max_tokens
     )
     keep_ids = {item.id for item in trimmed_after}
+    dropped_messages = [
+        item for item in non_memory_history if item.id not in keep_ids
+    ]
+    updated_memory = _build_long_term_memory_update(existing_memory, dropped_messages)
+
+    if updated_memory:
+        memory_payload = _format_long_term_memory(updated_memory)
+        if latest_memory_message is None:
+            latest_memory_message = Message(
+                conversation_id=conversation_id,
+                role=LONG_TERM_MEMORY_ROLE,
+                content=memory_payload,
+            )
+            db.add(latest_memory_message)
+            db.flush()
+        elif latest_memory_message.content != memory_payload:
+            latest_memory_message.content = memory_payload
+        keep_ids.add(latest_memory_message.id)
+    elif latest_memory_message is not None:
+        keep_ids.add(latest_memory_message.id)
+
     if keep_ids:
         db.query(Message).filter(
             Message.conversation_id == conversation_id,

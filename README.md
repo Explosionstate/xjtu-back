@@ -18,7 +18,7 @@ app/
   api/routes/chat.py
   api/routes/documents.py
   api/routes/knowledge_bases.py
-  api/routes/rbac.py
+  api优化思考时间优化思考速度/routes/rbac.py
   api/deps.py
   core/security.py
   models/document.py
