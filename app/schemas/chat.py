@@ -23,6 +23,7 @@ class ChatCompletionRequest(BaseModel):
     context_max_rounds: int | None = Field(default=None, ge=1, le=100)
     context_max_tokens: int | None = Field(default=None, ge=100, le=16000)
     llm_enabled: bool | None = None
+    local_transformer_enabled: bool | None = None
 
 
 class SourceItem(BaseModel):

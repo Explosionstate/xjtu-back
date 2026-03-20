@@ -17,6 +17,9 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
 from app.schemas.chat import ChatCompletionRequest, ChatThinking, SourceItem
 from app.services.llm_service import LLMAnswerResult, answer_with_llm
+from app.services.local_transformer_service import (
+    generate_answer_with_local_transformer,
+)
 from app.services.external_profile_service import load_user_profile_context
 from app.services.academic_service import get_my_academic_analysis
 from app.services.langgraph_service import run_chat_workflow_graph
@@ -574,13 +577,26 @@ def chat_completion(
             workflow_stage = "generation"
             stage_start = perf_counter()
             try:
-                llm_result = answer_with_llm(
-                    question=runtime_question,
-                    contexts=contexts,
-                    llm_enabled=payload.llm_enabled,
-                    system_instruction=system_instruction,
-                    timeout_seconds=generation_timeout,
-                )
+                if payload.local_transformer_enabled:
+                    answer, model_reference, _metrics = (
+                        generate_answer_with_local_transformer(
+                            question=runtime_question,
+                            contexts=contexts,
+                            model_name=settings.local_transformer_model,
+                        )
+                    )
+                    llm_result = LLMAnswerResult(
+                        answer=answer,
+                        mode=f"local_transformer:{model_reference}",
+                    )
+                else:
+                    llm_result = answer_with_llm(
+                        question=runtime_question,
+                        contexts=contexts,
+                        llm_enabled=payload.llm_enabled,
+                        system_instruction=system_instruction,
+                        timeout_seconds=generation_timeout,
+                    )
             except Exception:
                 logger.exception(
                     "generation failed: conversation=%s agent=%s",
