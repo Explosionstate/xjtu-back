@@ -84,7 +84,8 @@ def _build_prompt(question: str, contexts: list[str]) -> str:
     return (
         "你是西交AI助手，请基于检索资料回答。"
         "若资料不足请明确指出，不要编造。"
-        "输出结构：结论、要点、建议。\n\n"
+        "输出结构：结论、依据、建议。"
+        "回答不少于220字，建议至少5条且可执行。\n\n"
         f"问题：{question}\n\n"
         f"资料：\n{context_block}"
     )

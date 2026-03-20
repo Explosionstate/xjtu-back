@@ -41,6 +41,7 @@ from app.services.system_config_service import (
 CHAT_TOTAL_TIMEOUT_SECONDS = 60
 WORKFLOW_TIMEOUT_SECONDS = 52
 GENERATION_STAGE_TIMEOUT_SECONDS = 42
+LOCAL_GENERATION_TIMEOUT_SECONDS = 18
 ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 120
 ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 112
 ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
@@ -578,17 +579,43 @@ def chat_completion(
             stage_start = perf_counter()
             try:
                 if payload.local_transformer_enabled:
-                    answer, model_reference, _metrics = (
-                        generate_answer_with_local_transformer(
+                    local_timeout = max(
+                        4,
+                        min(LOCAL_GENERATION_TIMEOUT_SECONDS, generation_timeout - 2),
+                    )
+                    local_executor = ThreadPoolExecutor(max_workers=1)
+                    local_future = local_executor.submit(
+                        generate_answer_with_local_transformer,
+                        runtime_question,
+                        contexts[:2],
+                        settings.local_transformer_model,
+                        None,
+                        320,
+                    )
+                    try:
+                        answer, model_reference, _metrics = local_future.result(
+                            timeout=local_timeout
+                        )
+                        llm_result = LLMAnswerResult(
+                            answer=answer,
+                            mode=f"local_transformer:{model_reference}",
+                        )
+                    except FuturesTimeoutError:
+                        logger.warning(
+                            "local transformer timeout: conversation=%s agent=%s",
+                            conversation_id,
+                            payload.agent_key,
+                        )
+                        llm_result = answer_with_llm(
                             question=runtime_question,
                             contexts=contexts,
-                            model_name=settings.local_transformer_model,
+                            llm_enabled=payload.llm_enabled,
+                            system_instruction=system_instruction,
+                            timeout_seconds=generation_timeout,
                         )
-                    )
-                    llm_result = LLMAnswerResult(
-                        answer=answer,
-                        mode=f"local_transformer:{model_reference}",
-                    )
+                    finally:
+                        local_future.cancel()
+                        local_executor.shutdown(wait=False, cancel_futures=True)
                 else:
                     llm_result = answer_with_llm(
                         question=runtime_question,
