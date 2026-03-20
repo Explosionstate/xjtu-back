@@ -27,7 +27,7 @@ FIXED_LLM_TIMEOUT_SECONDS = 24
 FIXED_XJTUEXER_SSO_CONSUME_URL = "http://127.0.0.1:8080/api/sso/consume"
 FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS = 5
 FIXED_ACADEMIC_DB_URL = (
-    "mysql+pymysql://root:admin@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
+    "mysql+pymysql://root:zzyhhz19708@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
 )
 FIXED_ACADEMIC_QUERY_TIMEOUT_SECONDS = 8
 FIXED_LOCAL_TRANSFORMER_ENABLED = True
@@ -142,7 +142,7 @@ def get_settings() -> Settings:
         else local_models_root,
         local_modules_root=local_modules_root,
         local_models_root=local_models_root,
-        chat_stream_delay_ms=int(os.getenv("CHAT_STREAM_DELAY_MS", "10")),
+        chat_stream_delay_ms=int(os.getenv("CHAT_STREAM_DELAY_MS", "0")),
         default_log_retention_days=int(os.getenv("DEFAULT_LOG_RETENTION_DAYS", "30")),
         reranker_enabled=FIXED_RERANKER_ENABLED,
         reranker_model=FIXED_RERANKER_MODEL,

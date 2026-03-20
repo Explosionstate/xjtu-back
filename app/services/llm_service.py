@@ -18,6 +18,13 @@ class LLMAnswerResult:
     reasoning: str | None = None
 
 
+LLM_MAX_OUTPUT_TOKENS = 360
+DEFAULT_CONTEXT_LIMIT = 3
+GUIDANCE_CONTEXT_LIMIT = 3
+DEFAULT_CONTEXT_CHARS = 860
+GUIDANCE_CONTEXT_CHARS = 760
+
+
 @lru_cache(maxsize=1)
 def get_chat_llm() -> ChatOpenAI:
     return ChatOpenAI(
@@ -44,8 +51,8 @@ def answer_with_llm(
     is_guidance = any(
         token in (question or "") for token in ["大一", "学习", "生活", "平衡", "建议"]
     )
-    context_limit = 2 if is_guidance else 3
-    context_size = 900 if is_guidance else 1200
+    context_limit = GUIDANCE_CONTEXT_LIMIT if is_guidance else DEFAULT_CONTEXT_LIMIT
+    context_size = GUIDANCE_CONTEXT_CHARS if is_guidance else DEFAULT_CONTEXT_CHARS
     compact_contexts = [
         ctx.strip()[:context_size] for ctx in contexts[:context_limit] if ctx.strip()
     ]
@@ -63,18 +70,15 @@ def answer_with_llm(
     prompt = (
         f"{(system_instruction or '').strip()}\n"
         f"{academic_prompt}"
-        "你是知识库问答助手。请严格依据给定资料作答，不编造事实。"
-        "回答必须严格按以下结构输出：\n"
+        "你是知识库问答助手。必须基于给定资料作答，不得编造事实。\n"
+        "请按以下结构输出：\n"
         "结论：...\n"
         "依据：...\n"
         "建议：...\n"
-        "输出长度要求：不少于220字。"
-        "建议部分请给出至少5条可执行动作，并尽量包含时间频次（如每天/每周）。"
-        "请优先使用自然语言总结，先给结论再给简洁步骤。"
-        "除非用户明确要求，不要原样大段复制文档或连续命令列表。"
-        "如果资料不足，请明确说明资料不足。\n\n"
+        "建议部分给出 3-5 条可执行动作，尽量包含条件或时间频次。"
+        "如果资料不足：明确不确定范围，同时给出可执行的通用方案，并列出需要补充的信息。\n\n"
         f"问题：{question}\n\n"
-        f"资料：\n{chr(10).join(compact_contexts)}"
+        f"资料：\n{chr(10).join(compact_contexts) if compact_contexts else '（当前未检索到高置信资料）'}"
     )
     effective_timeout = max(
         2,
@@ -87,7 +91,11 @@ def answer_with_llm(
 
     try:
         executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(get_chat_llm().invoke, prompt)
+        future = executor.submit(
+            get_chat_llm().invoke,
+            prompt,
+            max_tokens=LLM_MAX_OUTPUT_TOKENS,
+        )
         try:
             response = future.result(timeout=effective_timeout)
         finally:
@@ -122,7 +130,14 @@ def answer_with_llm(
 def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
     q = (question or "").strip().lower()
     if not contexts:
-        return "结论：未在知识库中检索到可用于回答的资料。\n依据：当前检索结果为空。\n建议：请补充更具体问题或增加知识库资料后重试。"
+        question_focus = (question or "").strip()[:80] or "当前问题"
+        return (
+            f"结论：当前资料不足，暂时无法对“{question_focus}”给出确定事实结论。\n"
+            "依据：知识库未命中可直接支撑结论的高置信片段。\n"
+            "建议：1) 补充目标对象、时间范围和约束条件；"
+            "2) 提供你已知的关键事实或样例；"
+            "3) 我可以先给出“执行步骤 + 风险点 + 待确认信息”的结构化方案。"
+        )
 
     merged = "\n".join(contexts)
 

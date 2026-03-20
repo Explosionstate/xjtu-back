@@ -42,11 +42,65 @@ def _iter_thinking_chunks(text: str) -> list[str]:
     return chunks or [text]
 
 
-def _iter_answer_chunks(text: str, chunk_size: int = 24) -> list[str]:
+def _iter_answer_chunks(text: str, chunk_size: int = 48) -> list[str]:
     if not text:
         return []
     safe_size = max(1, chunk_size)
     return [text[index : index + safe_size] for index in range(0, len(text), safe_size)]
+
+
+def _stage_label(stage: str) -> str:
+    return {
+        "profile": "画像加载",
+        "retrieval": "知识检索",
+        "generation": "答案生成",
+        "finalize": "结果整理",
+        "rule": "规则命中",
+    }.get(stage, stage or "流程")
+
+
+def _format_progress_delta(event: dict[str, object]) -> str:
+    stage = str(event.get("stage") or "")
+    status = str(event.get("status") or "")
+    detail = str(event.get("detail") or "").strip()
+    if detail:
+        return detail
+
+    label = _stage_label(stage)
+    if status == "start":
+        return f"{label}中..."
+    if status == "done":
+        stage_ms = event.get("stage_ms")
+        if isinstance(stage_ms, int):
+            return f"{label}完成（{stage_ms}ms）"
+        return f"{label}完成"
+    if status == "fallback":
+        return f"{label}触发降级策略"
+    if status == "timeout":
+        return f"{label}超时，已切换快速兜底"
+    if status == "error":
+        return f"{label}失败，已继续后续流程"
+    return ""
+
+
+async def _emit_progress_event(websocket: WebSocket, event: dict[str, object]) -> None:
+    delta_text = _format_progress_delta(event)
+    if delta_text:
+        await websocket.send_json(
+            {
+                "type": "thinking",
+                "status": "delta",
+                "title": "处理进度",
+                "content": f"{delta_text}\n",
+                "kind": "summary",
+                "is_real": False,
+                "done": False,
+            }
+        )
+
+    preview = str(event.get("preview") or "").strip()
+    if preview:
+        await websocket.send_json({"type": "preview", "content": preview})
 
 
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
@@ -206,7 +260,41 @@ async def ws_chat_completions(
                 }
             )
 
-            result = chat_completion(db=db, payload=payload, current_user=user)
+            progress_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def _on_progress(event: dict[str, object]) -> None:
+                try:
+                    asyncio.run_coroutine_threadsafe(progress_queue.put(event), loop)
+                except Exception:
+                    return
+
+            def _run_chat_completion():
+                worker_db = SessionLocal()
+                try:
+                    return chat_completion(
+                        db=worker_db,
+                        payload=payload,
+                        current_user=user,
+                        progress_callback=_on_progress,
+                    )
+                finally:
+                    worker_db.close()
+
+            completion_task = asyncio.create_task(asyncio.to_thread(_run_chat_completion))
+            try:
+                while True:
+                    if completion_task.done() and progress_queue.empty():
+                        break
+                    try:
+                        event = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        continue
+                    await _emit_progress_event(websocket, event)
+                result = await completion_task
+            except Exception as exc:
+                await websocket.send_json({"type": "error", "detail": str(exc) or "问答失败"})
+                continue
 
             await websocket.send_json(
                 {
@@ -241,6 +329,7 @@ async def ws_chat_completions(
                 }
             )
 
+            await websocket.send_json({"type": "answer", "status": "start"})
             for chunk in _iter_answer_chunks(result.answer):
                 await websocket.send_json({"type": "delta", "content": chunk})
                 if settings.chat_stream_delay_ms > 0:

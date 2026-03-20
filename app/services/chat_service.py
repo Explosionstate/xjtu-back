@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from time import perf_counter
 import logging
 import re
+from typing import Any, Callable
 import uuid
 
 from sqlalchemy import select
@@ -42,12 +43,16 @@ CHAT_TOTAL_TIMEOUT_SECONDS = 60
 WORKFLOW_TIMEOUT_SECONDS = 52
 GENERATION_STAGE_TIMEOUT_SECONDS = 28
 LOCAL_GENERATION_TIMEOUT_SECONDS = 12
+WORKFLOW_POLL_INTERVAL_SECONDS = 0.35
 ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 120
 ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 112
 ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
 ACADEMIC_PROFILE_TIMEOUT_SECONDS = 8.0
 DEFAULT_PROFILE_TIMEOUT_SECONDS = 1.5
+MIN_RELAXED_THRESHOLD = 0.12
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,82 @@ class ChatCompletionResult:
     answer: str
     sources: list[SourceItem]
     thinking: ChatThinking
+
+
+def _emit_progress(progress_callback: ProgressCallback | None, **payload: Any) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(payload)
+    except Exception:
+        logger.debug("progress callback failed", exc_info=True)
+
+
+def _compact_text(text: str, max_chars: int) -> str:
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if not compact:
+        return ""
+    return compact[:max_chars]
+
+
+def _build_history_context_brief(
+    history: list[Message], question: str, max_chars: int = 720
+) -> str:
+    if not history:
+        return ""
+
+    recent = history[-6:]
+    user_lines = [
+        _compact_text(item.content, 120)
+        for item in recent
+        if item.role == "user" and item.content.strip()
+    ]
+    assistant_lines = [
+        _compact_text(item.content, 90)
+        for item in recent
+        if item.role == "assistant" and item.content.strip()
+    ]
+
+    sections: list[str] = []
+    if user_lines:
+        sections.append(
+            "近期用户问题:\n" + "\n".join(f"- {line}" for line in user_lines[-4:] if line)
+        )
+    if assistant_lines:
+        sections.append(
+            "近期助手回答:\n"
+            + "\n".join(f"- {line}" for line in assistant_lines[-2:] if line)
+        )
+
+    current = _compact_text(question, 140)
+    if current:
+        sections.append(f"当前问题:\n- {current}")
+
+    merged = "\n".join(section for section in sections if section).strip()
+    if not merged:
+        return ""
+    if len(merged) > max_chars:
+        merged = merged[:max_chars]
+    return f"对话上下文摘要:\n{merged}"
+
+
+def _build_retrieval_shortfall_answer(
+    question: str, trimmed_history: list[Message]
+) -> str:
+    short_question = _compact_text(question, 80) or "当前问题"
+    user_history = [
+        _compact_text(item.content, 50)
+        for item in trimmed_history
+        if item.role == "user" and item.content.strip()
+    ]
+    history_hint = "；".join(item for item in user_history[-2:] if item) or "暂无稳定历史事实"
+    return (
+        f"结论：当前资料不足以对“{short_question}”给出确定事实结论，但可以先提供可执行方案。\n"
+        f"依据：本轮检索命中不足，且可复用对话上下文为：{history_hint}。\n"
+        "建议：1) 明确目标对象、时间范围与输出格式；"
+        "2) 给出你已知的关键事实（例如约束条件、已有结论）；"
+        "3) 我会在现有信息上先给出“可执行步骤 + 风险点 + 待补充信息”三段式回答。"
+    )
 
 
 def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
@@ -237,10 +318,23 @@ def _build_retrieval_query(history: list[Message], question: str) -> str:
 
     if not history:
         return question
-    snippets = [item.content for item in history[-4:] if item.content.strip()]
+    user_snippets = [
+        _compact_text(item.content, 120)
+        for item in history
+        if item.role == "user" and item.content.strip()
+    ]
+    assistant_snippets = [
+        _compact_text(item.content, 90)
+        for item in history
+        if item.role == "assistant" and item.content.strip()
+    ]
+    snippets = [item for item in user_snippets[-3:] if item]
+    if assistant_snippets:
+        snippets.append(assistant_snippets[-1])
     if not snippets:
         return question
-    return "\n".join(snippets + [question])
+    retrieval_query = "\n".join(snippets + [_compact_text(question, 200)])
+    return retrieval_query[:720]
 
 
 def _expand_academic_query(agent_key: str | None, question: str) -> str:
@@ -436,6 +530,7 @@ def chat_completion(
     db: Session,
     payload: ChatCompletionRequest,
     current_user: User | None,
+    progress_callback: ProgressCallback | None = None,
 ) -> ChatCompletionResult:
     raw_question = _get_latest_user_question([m.model_dump() for m in payload.messages])
     sensitive_words = get_sensitive_words(db)
@@ -477,8 +572,8 @@ def chat_completion(
     alpha = float(retrieval_config["alpha"])
 
     if _is_guidance_query(question):
-        top_k = min(top_k, 5)
-        score_threshold = max(score_threshold, 0.25)
+        top_k = min(max(top_k, 4), 6)
+        score_threshold = min(score_threshold, 0.24)
 
     configured_max_rounds = get_int_config(
         db, "context_max_rounds", DEFAULT_CONTEXT_MAX_ROUNDS
@@ -543,6 +638,13 @@ def chat_completion(
         answer = rule_answer_text
         sources: list[SourceItem] = []
         system_instruction = ""
+        _emit_progress(
+            progress_callback,
+            type="stage",
+            stage="rule",
+            status="done",
+            detail="命中内置规则回答，已直接返回结果。",
+        )
     else:
 
         def _load_profile(_: str) -> str:
@@ -551,6 +653,13 @@ def chat_completion(
             if current_user is None:
                 return ""
             stage_start = perf_counter()
+            _emit_progress(
+                progress_callback,
+                type="stage",
+                stage="profile",
+                status="start",
+                detail="正在加载用户画像上下文...",
+            )
             try:
                 profile_executor = ThreadPoolExecutor(max_workers=1)
                 profile_future = (
@@ -573,19 +682,48 @@ def chat_completion(
                         payload.agent_key,
                         is_academic_analysis,
                     )
+                    _emit_progress(
+                        progress_callback,
+                        type="stage",
+                        stage="profile",
+                        status="timeout",
+                        detail="用户画像加载超时，已继续后续流程。",
+                    )
                     return ""
                 finally:
                     profile_future.cancel()
                     profile_executor.shutdown(wait=False, cancel_futures=True)
             except Exception:
+                _emit_progress(
+                    progress_callback,
+                    type="stage",
+                    stage="profile",
+                    status="error",
+                    detail="用户画像加载失败，已继续后续流程。",
+                )
                 return ""
             finally:
-                profile_ms += int((perf_counter() - stage_start) * 1000)
+                stage_ms = int((perf_counter() - stage_start) * 1000)
+                profile_ms += stage_ms
+                _emit_progress(
+                    progress_callback,
+                    type="stage",
+                    stage="profile",
+                    status="done",
+                    stage_ms=stage_ms,
+                )
 
         def _retrieve(runtime_question: str) -> tuple[list[str], list[dict]]:
             nonlocal retrieved, retrieval_ms, workflow_stage
             workflow_stage = "retrieval"
             stage_start = perf_counter()
+            _emit_progress(
+                progress_callback,
+                type="stage",
+                stage="retrieval",
+                status="start",
+                detail="正在检索知识库资料...",
+            )
             query = _expand_academic_query(
                 payload.agent_key,
                 _build_retrieval_query(trimmed_history, runtime_question),
@@ -602,6 +740,27 @@ def chat_completion(
                     alpha=alpha,
                     agent_key=payload.agent_key,
                 )
+                if not retrieved:
+                    relaxed_top_k = min(8, max(top_k + 2, 3))
+                    relaxed_threshold = max(
+                        MIN_RELAXED_THRESHOLD,
+                        min(0.24, score_threshold - 0.06),
+                    )
+                    if (
+                        relaxed_top_k > top_k
+                        or relaxed_threshold < score_threshold
+                    ):
+                        retrieved = hybrid_retrieve(
+                            db=db,
+                            query=query,
+                            kb_ids=kb_ids,
+                            document_ids=payload.document_ids,
+                            top_k=relaxed_top_k,
+                            score_threshold=relaxed_threshold,
+                            fusion_mode=fusion_mode,
+                            alpha=alpha,
+                            agent_key=payload.agent_key,
+                        )
             except Exception:
                 logger.exception(
                     "retrieval failed: conversation=%s agent=%s",
@@ -610,7 +769,26 @@ def chat_completion(
                 )
                 retrieved = []
             finally:
-                retrieval_ms += int((perf_counter() - stage_start) * 1000)
+                stage_ms = int((perf_counter() - stage_start) * 1000)
+                retrieval_ms += stage_ms
+                preview = ""
+                if retrieved:
+                    first_hit = _compact_text(str(retrieved[0].get("content") or ""), 80)
+                    preview = (
+                        f"已命中 {len(retrieved)} 条相关资料，正在组织答案。"
+                        + (f"\n参考片段：{first_hit}" if first_hit else "")
+                    )
+                else:
+                    preview = "高置信检索命中不足，正在基于上下文生成可执行建议。"
+                _emit_progress(
+                    progress_callback,
+                    type="stage",
+                    stage="retrieval",
+                    status="done",
+                    count=len(retrieved),
+                    stage_ms=stage_ms,
+                    preview=preview,
+                )
             return [item["content"] for item in retrieved], retrieved
 
         def _generate(
@@ -621,6 +799,17 @@ def chat_completion(
             nonlocal llm_result, llm_ms, workflow_stage
             workflow_stage = "generation"
             stage_start = perf_counter()
+            _emit_progress(
+                progress_callback,
+                type="stage",
+                stage="generation",
+                status="start",
+                detail="正在生成最终回答...",
+            )
+            history_context = _build_history_context_brief(trimmed_history, runtime_question)
+            generation_contexts = (
+                [history_context] + contexts if history_context else list(contexts)
+            )
             try:
                 if payload.local_transformer_enabled:
                     local_timeout = max(
@@ -631,7 +820,7 @@ def chat_completion(
                     local_future = local_executor.submit(
                         generate_answer_with_local_transformer,
                         runtime_question,
-                        contexts[:2],
+                        generation_contexts[:3],
                         settings.local_transformer_model,
                         None,
                         520,
@@ -650,9 +839,16 @@ def chat_completion(
                             conversation_id,
                             payload.agent_key,
                         )
+                        _emit_progress(
+                            progress_callback,
+                            type="stage",
+                            stage="generation",
+                            status="fallback",
+                            detail="本地模型响应超时，已切换云端模型继续生成。",
+                        )
                         llm_result = answer_with_llm(
                             question=runtime_question,
-                            contexts=contexts,
+                            contexts=generation_contexts,
                             llm_enabled=True,
                             system_instruction=system_instruction,
                             timeout_seconds=generation_timeout,
@@ -663,9 +859,16 @@ def chat_completion(
                             conversation_id,
                             payload.agent_key,
                         )
+                        _emit_progress(
+                            progress_callback,
+                            type="stage",
+                            stage="generation",
+                            status="fallback",
+                            detail="本地模型调用失败，已切换云端模型继续生成。",
+                        )
                         llm_result = answer_with_llm(
                             question=runtime_question,
-                            contexts=contexts,
+                            contexts=generation_contexts,
                             llm_enabled=True,
                             system_instruction=system_instruction,
                             timeout_seconds=generation_timeout,
@@ -676,7 +879,7 @@ def chat_completion(
                 else:
                     llm_result = answer_with_llm(
                         question=runtime_question,
-                        contexts=contexts,
+                        contexts=generation_contexts,
                         llm_enabled=payload.llm_enabled,
                         system_instruction=system_instruction,
                         timeout_seconds=generation_timeout,
@@ -691,7 +894,16 @@ def chat_completion(
                     answer="结论：当前生成失败，已切换到简化回答。\n依据：模型推理阶段发生异常。\n建议：请稍后重试，或缩小问题范围后再提问。",
                     mode="error_fallback",
                 )
-            llm_ms += int((perf_counter() - stage_start) * 1000)
+            stage_ms = int((perf_counter() - stage_start) * 1000)
+            llm_ms += stage_ms
+            _emit_progress(
+                progress_callback,
+                type="stage",
+                stage="generation",
+                status="done",
+                mode=llm_result.mode if llm_result else "unknown",
+                stage_ms=stage_ms,
+            )
             return llm_result.answer
 
         workflow_timeout = max(
@@ -711,46 +923,92 @@ def chat_completion(
             generate_fn=_generate,
         )
         wait_start = perf_counter()
-        try:
-            graph_result = future.result(timeout=workflow_timeout)
-            workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
-            workflow_stage = "done"
-        except FuturesTimeoutError:
-            workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
-            logger.warning(
-                "workflow timeout: conversation=%s agent=%s stage=%s elapsed_ms=%s",
-                conversation_id,
-                payload.agent_key,
-                workflow_stage,
-                workflow_wait_ms,
+        graph_result: dict[str, Any] = {}
+        timed_out = False
+        generation_guard_timeout = (
+            max(
+                16,
+                min(generation_timeout + 6, 72 if is_academic_analysis else 34),
             )
-            try:
-                # Ensure user gets a practical answer instead of a pure timeout message.
-                stage_start = perf_counter()
-                retrieved = hybrid_retrieve(
-                    db=db,
-                    query=_expand_academic_query(
-                        payload.agent_key,
-                        _build_retrieval_query(trimmed_history, question),
-                    ),
-                    kb_ids=kb_ids,
-                    document_ids=payload.document_ids,
-                    top_k=min(2, top_k),
-                    score_threshold=max(score_threshold, 0.35),
-                    fusion_mode=fusion_mode,
-                    alpha=alpha,
-                    agent_key=payload.agent_key,
+            if not payload.local_transformer_enabled
+            else max(
+                10,
+                min(generation_timeout - 8, 22 if is_academic_analysis else 16),
+            )
+        )
+        try:
+            while True:
+                elapsed_wait = perf_counter() - wait_start
+                remaining_wait = workflow_timeout - elapsed_wait
+                if remaining_wait <= 0:
+                    timed_out = True
+                    break
+                try:
+                    graph_result = future.result(
+                        timeout=min(WORKFLOW_POLL_INTERVAL_SECONDS, remaining_wait)
+                    )
+                    workflow_stage = "done"
+                    break
+                except FuturesTimeoutError:
+                    if (
+                        workflow_stage == "generation"
+                        and elapsed_wait >= generation_guard_timeout
+                    ):
+                        timed_out = True
+                        break
+                    continue
+            workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
+            if timed_out:
+                logger.warning(
+                    "workflow timeout: conversation=%s agent=%s stage=%s elapsed_ms=%s",
+                    conversation_id,
+                    payload.agent_key,
+                    workflow_stage,
+                    workflow_wait_ms,
                 )
-                retrieval_ms += int((perf_counter() - stage_start) * 1000)
-            except Exception:
-                retrieved = []
-            graph_result = {
-                "error": "WORKFLOW_TIMEOUT",
-                "system_instruction": "",
-                "answer": _fast_retrieval_answer(question, retrieved),
-                "blocked_stage": "",
-                "blocked_word": "",
-            }
+                _emit_progress(
+                    progress_callback,
+                    type="stage",
+                    stage=workflow_stage,
+                    status="timeout",
+                    detail="生成阶段等待过长，已切换快速兜底策略。",
+                    elapsed_ms=workflow_wait_ms,
+                )
+                try:
+                    stage_start = perf_counter()
+                    fallback_top_k = min(8, max(top_k + 1, 3))
+                    fallback_threshold = max(
+                        MIN_RELAXED_THRESHOLD,
+                        min(0.24, score_threshold - 0.08),
+                    )
+                    retrieved = hybrid_retrieve(
+                        db=db,
+                        query=_expand_academic_query(
+                            payload.agent_key,
+                            _build_retrieval_query(trimmed_history, question),
+                        ),
+                        kb_ids=kb_ids,
+                        document_ids=payload.document_ids,
+                        top_k=fallback_top_k,
+                        score_threshold=fallback_threshold,
+                        fusion_mode=fusion_mode,
+                        alpha=alpha,
+                        agent_key=payload.agent_key,
+                    )
+                    retrieval_ms += int((perf_counter() - stage_start) * 1000)
+                except Exception:
+                    retrieved = []
+                graph_result = {
+                    "error": "WORKFLOW_TIMEOUT",
+                    "system_instruction": "",
+                    "answer": (
+                        _fast_retrieval_answer(question, retrieved)
+                        if retrieved
+                        else _build_retrieval_shortfall_answer(question, trimmed_history)
+                    ),
+                    "blocked_stage": "",
+                    "blocked_word": "",
+                }
         finally:
             future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
@@ -780,10 +1038,21 @@ def chat_completion(
         system_instruction = str(graph_result.get("system_instruction") or "")
         answer = str(graph_result.get("answer") or "").strip()
         if not answer:
-            answer = "结论：未检索到可用答案。\n依据：当前知识库上下文不足。\n建议：请补充更具体问题或导入相关文档。"
+            answer = (
+                _fast_retrieval_answer(question, retrieved)
+                if retrieved
+                else _build_retrieval_shortfall_answer(question, trimmed_history)
+            )
 
         if perf_counter() - start > chat_total_timeout and not answer:
-            answer = _fast_retrieval_answer(question, retrieved)
+            answer = (
+                _fast_retrieval_answer(question, retrieved)
+                if retrieved
+                else _build_retrieval_shortfall_answer(question, trimmed_history)
+            )
+
+        if not retrieved and len(answer) < 120:
+            answer = _build_retrieval_shortfall_answer(question, trimmed_history)
 
         answer = _enhance_student_balance_answer(question, answer, retrieved)
 
@@ -898,6 +1167,15 @@ def chat_completion(
             ~Message.id.in_(keep_ids),
         ).delete(synchronize_session=False)
         db.commit()
+
+    _emit_progress(
+        progress_callback,
+        type="stage",
+        stage="finalize",
+        status="done",
+        detail="回答已生成完成。",
+        total_ms=elapsed_ms,
+    )
 
     return ChatCompletionResult(
         conversation_id=conversation_id,
