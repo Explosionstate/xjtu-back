@@ -215,6 +215,7 @@ def _build_history_context_brief(
 def _build_retrieval_shortfall_answer(
     question: str, trimmed_history: list[Message]
 ) -> str:
+    style = _detect_answer_style(question)
     short_question = _compact_text(question, 80) or "当前问题"
     user_history = [
         _compact_text(item.content, 50)
@@ -222,16 +223,39 @@ def _build_retrieval_shortfall_answer(
         if item.role == "user" and item.content.strip()
     ]
     history_hint = "；".join(item for item in user_history[-2:] if item) or "暂无稳定历史事实"
+    if style == "comparison":
+        return (
+            f"当前资料不足，暂时无法对“{short_question}”给出可靠对比结论。\n"
+            f"已可复用的历史信息：{history_hint}。\n"
+            "请补充比较对象、评价维度和优先级，我会输出清晰对比结果。"
+        )
+    if style == "summary":
+        return (
+            f"关于“{short_question}”，当前命中资料不足以形成有效摘要。\n"
+            f"可参考的历史线索：{history_hint}。\n"
+            "建议指定文档范围或主题关键词，我再按重点清单快速整理。"
+        )
+    if style == "analysis":
+        return (
+            f"目前还缺少支撑“{short_question}”的关键证据，无法做可靠原因判断。\n"
+            f"现有可复用上下文：{history_hint}。\n"
+            "你可以补充背景、时间线和关键指标，我会给出更完整的因果分析。"
+        )
+    if style == "guidance":
+        return (
+            f"当前资料不足以直接回答“{short_question}”，但可以先启动可执行方案。\n"
+            f"当前可复用上下文：{history_hint}。\n"
+            "先给我目标对象、时间范围和约束条件，我会按步骤给出落地动作。"
+        )
     return (
-        f"结论：当前资料不足以对“{short_question}”给出确定事实结论，但可以先提供可执行方案。\n"
-        f"依据：本轮检索命中不足，且可复用对话上下文为：{history_hint}。\n"
-        "建议：1) 明确目标对象、时间范围与输出格式；"
-        "2) 给出你已知的关键事实（例如约束条件、已有结论）；"
-        "3) 我会在现有信息上先给出“可执行步骤 + 风险点 + 待补充信息”三段式回答。"
+        f"当前资料不足，暂时无法直接回答“{short_question}”。\n"
+        f"可复用对话信息：{history_hint}。\n"
+        "补充目标对象、时间范围或已知事实后，我可以给出更精准结论。"
     )
 
 
 def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
+    style = _detect_answer_style(question)
     lowered = (question or "").lower()
     if "xjtu-back" in lowered and any(
         token in question for token in ["启动", "运行", "start"]
@@ -244,11 +268,15 @@ def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
         )
 
     if not retrieved:
-        return (
-            "结论：当前未检索到足够的直接依据。\n"
-            "依据：系统已在限定时间内完成快速检索，但有效片段不足。\n"
-            "建议：请补充具体场景（例如课程、作息、时间安排）后重试。"
-        )
+        if style == "summary":
+            return "当前未检索到足够依据，暂时无法输出可靠摘要。请补充主题范围后重试。"
+        if style == "comparison":
+            return "当前缺少可比较资料，暂时无法给出对比结论。请补充比较对象与维度。"
+        if style == "analysis":
+            return "当前证据不足，暂时无法给出可靠分析判断。请补充背景和关键指标。"
+        if style == "guidance":
+            return "当前资料不足，但你可先补充目标和约束条件，我会给出可执行步骤。"
+        return "当前未检索到足够依据，请补充更具体场景后重试。"
 
     summarize_keywords = ["总结", "重点", "概述", "本周", "新增文档"]
     if any(token in question for token in summarize_keywords):
@@ -260,11 +288,15 @@ def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
             if len(source_names) >= 4:
                 break
         refs = "、".join(source_names) if source_names else "当前检索命中文档"
-        return (
-            f"结论：已基于本周新增资料给出重点概览（来源：{refs}）。\n"
-            "依据：检索结果集中在方法论表达升级、落地场景设计与系统稳定性改进。\n"
-            "建议：可继续指定“面向学生/教师/管理员”其一，我将输出对应版本的三点重点与行动清单。"
-        )
+        highlights: list[str] = []
+        for item in retrieved[:4]:
+            text = _compact_text(str(item.get("content") or ""), 80)
+            if text:
+                highlights.append(text)
+        if not highlights:
+            return f"已完成资料汇总（来源：{refs}），但高质量摘要片段仍不足。"
+        bullets = "\n".join(f"- {item}" for item in highlights[:4])
+        return f"已基于命中资料提炼重点（来源：{refs}）：\n{bullets}"
 
     snippets: list[str] = []
     for item in retrieved[:3]:
@@ -277,11 +309,32 @@ def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
             continue
         if content:
             snippets.append(content[:140])
-    evidence = "；".join(snippets) if snippets else "已检索到相关片段。"
+    if not snippets:
+        snippets = ["已检索到相关片段，但可直接引用的文本较少。"]
+    evidence = "；".join(snippets[:3])
+    if style == "comparison":
+        return (
+            f"基于当前命中资料，可先对“{question[:30]}”做初步对比。\n"
+            f"关键依据：{evidence}\n"
+            "如需明确推荐，请补充比较对象与优先级。"
+        )
+    if style == "analysis":
+        return (
+            f"针对“{question[:30]}”，可以先给出初步分析判断。\n"
+            f"主要依据：{evidence}\n"
+            "你也可以继续追问具体原因链路或风险优先级。"
+        )
+    if style == "guidance":
+        return (
+            f"围绕“{question[:30]}”，建议先按步骤执行：\n"
+            f"1) 优先处理最关键环节（依据：{snippets[0]}）；\n"
+            "2) 设置短周期检查点；\n"
+            "3) 根据执行结果再迭代细节。"
+        )
     return (
-        f"结论：已基于当前检索结果回答“{question[:32]}”。\n"
-        f"依据：{evidence}\n"
-        "建议：若你希望更精确，请补充目标对象、时间范围和约束条件（例如平台、端口、环境）。"
+        f"已基于检索结果回答“{question[:32]}”。\n"
+        f"关键依据：{evidence}\n"
+        "如需更精确结论，可补充目标对象、时间范围或约束条件。"
     )
 
 
@@ -289,7 +342,12 @@ def _enhance_student_balance_answer(
     question: str, answer: str, retrieved: list[dict]
 ) -> str:
     q = (question or "").strip()
-    if not any(token in q for token in ["大一", "学习", "生活", "平衡", "建议"]):
+    q_lower = q.lower()
+    is_balance_topic = (
+        ("学习" in q and "生活" in q)
+        or any(token in q_lower for token in ["平衡", "作息", "精力", "疲劳"])
+    )
+    if not is_balance_topic:
         return answer
     if len((answer or "").strip()) >= 320:
         return answer
@@ -327,6 +385,21 @@ def _enhance_student_balance_answer(
         "7）与同学结成互督小组，每周至少一次互测互评；"
         "8）若连续两天低效，先保核心课程与作息，再逐步恢复其他安排。"
     )
+
+
+def _detect_answer_style(question: str) -> str:
+    q = (question or "").strip().lower()
+    if not q:
+        return "direct"
+    if any(token in q for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]):
+        return "comparison"
+    if any(token in q for token in ["总结", "概述", "重点", "梳理", "归纳", "总览"]):
+        return "summary"
+    if any(token in q for token in ["怎么", "如何", "步骤", "方案", "计划", "建议", "修复", "排查", "优化"]):
+        return "guidance"
+    if any(token in q for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]):
+        return "analysis"
+    return "direct"
 
 
 def _get_latest_user_question(messages: list[dict]) -> str:

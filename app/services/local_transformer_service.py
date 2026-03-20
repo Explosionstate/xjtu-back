@@ -96,14 +96,22 @@ def _get_local_model(model_reference: str):
 
 
 def _build_prompt(question: str, contexts: list[str]) -> str:
+    style = _detect_answer_style(question)
     context_block = "\n\n".join(
         item.strip()[:1200] for item in contexts[:4] if item.strip()
     )
+    style_hint = {
+        "direct": "先直接回答，再补充必要依据。",
+        "analysis": "先给判断，再解释原因与影响。",
+        "comparison": "按差异维度并列对比后给建议。",
+        "guidance": "按步骤给出可执行方案。",
+        "summary": "提炼 3-5 条重点信息。",
+    }.get(style, "按问题自然组织回答。")
     return (
         "你是西交AI助手，请基于检索资料回答。"
         "若资料不足请明确指出，不要编造。"
-        "输出结构：结论、依据、建议。"
-        "回答不少于220字，建议至少5条且可执行。\n\n"
+        "不要机械套用固定模板。"
+        f"{style_hint}\n\n"
         f"问题：{question}\n\n"
         f"资料：\n{context_block}"
     )
@@ -136,18 +144,29 @@ def generate_answer_with_local_transformer(
     fallback_cpu = False
 
     try:
+        style = _detect_answer_style(question)
         prompt = _build_prompt(question=question, contexts=contexts)
         model_inputs = tokenizer(prompt, return_tensors="pt")
         if hasattr(model, "device"):
             model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
 
-        generation_kwargs = {
-            "max_new_tokens": max_new_tokens
-            or settings.local_transformer_max_new_tokens,
-            "temperature": temperature
+        target_tokens, temperature_floor = _local_generation_profile(style)
+        chosen_max_tokens = min(
+            max_new_tokens or settings.local_transformer_max_new_tokens,
+            target_tokens,
+        )
+        chosen_temperature = max(
+            temperature
             if temperature is not None
             else settings.local_transformer_temperature,
+            temperature_floor,
+        )
+        generation_kwargs = {
+            "max_new_tokens": max(120, int(chosen_max_tokens)),
+            "temperature": round(float(chosen_temperature), 2),
             "do_sample": True,
+            "top_p": 0.88,
+            "repetition_penalty": 1.05,
             "pad_token_id": tokenizer.pad_token_id,
             "eos_token_id": tokenizer.eos_token_id,
         }
@@ -195,6 +214,32 @@ def generate_answer_with_local_transformer(
         return answer, model_reference, metrics
     finally:
         _GENERATION_SEMAPHORE.release()
+
+
+def _detect_answer_style(question: str) -> str:
+    q = (question or "").strip().lower()
+    if not q:
+        return "direct"
+    if any(token in q for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]):
+        return "comparison"
+    if any(token in q for token in ["总结", "概述", "重点", "梳理", "归纳", "总览"]):
+        return "summary"
+    if any(token in q for token in ["怎么", "如何", "步骤", "方案", "计划", "建议", "修复", "排查", "优化"]):
+        return "guidance"
+    if any(token in q for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]):
+        return "analysis"
+    return "direct"
+
+
+def _local_generation_profile(style: str) -> tuple[int, float]:
+    profile = {
+        "direct": (220, 0.2),
+        "analysis": (280, 0.22),
+        "comparison": (280, 0.24),
+        "guidance": (320, 0.25),
+        "summary": (240, 0.2),
+    }
+    return profile.get(style, (240, 0.2))
 
 
 def _generate(model, model_inputs: dict, kwargs: dict, torch_module=None):

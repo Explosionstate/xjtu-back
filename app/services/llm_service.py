@@ -18,20 +18,95 @@ class LLMAnswerResult:
     reasoning: str | None = None
 
 
-LLM_MAX_OUTPUT_TOKENS = 360
-DEFAULT_CONTEXT_LIMIT = 3
-GUIDANCE_CONTEXT_LIMIT = 3
-DEFAULT_CONTEXT_CHARS = 860
-GUIDANCE_CONTEXT_CHARS = 760
+@dataclass(frozen=True)
+class AnswerStyleProfile:
+    style: str
+    context_limit: int
+    context_chars: int
+    max_tokens: int
+    temperature_floor: float
+    top_p: float
+    frequency_penalty: float
+    presence_penalty: float
+    organization_hint: str
 
 
-@lru_cache(maxsize=1)
-def get_chat_llm() -> ChatOpenAI:
+LLM_MAX_OUTPUT_TOKENS = 340
+
+STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
+    "direct": AnswerStyleProfile(
+        style="direct",
+        context_limit=3,
+        context_chars=820,
+        max_tokens=220,
+        temperature_floor=0.12,
+        top_p=0.82,
+        frequency_penalty=0.2,
+        presence_penalty=0.05,
+        organization_hint="先直接回答，再补充 1-2 条关键依据，避免冗长铺垫。",
+    ),
+    "analysis": AnswerStyleProfile(
+        style="analysis",
+        context_limit=4,
+        context_chars=760,
+        max_tokens=300,
+        temperature_floor=0.18,
+        top_p=0.86,
+        frequency_penalty=0.25,
+        presence_penalty=0.08,
+        organization_hint="优先给出判断，再分点解释主要原因与影响。",
+    ),
+    "comparison": AnswerStyleProfile(
+        style="comparison",
+        context_limit=4,
+        context_chars=720,
+        max_tokens=300,
+        temperature_floor=0.2,
+        top_p=0.9,
+        frequency_penalty=0.2,
+        presence_penalty=0.12,
+        organization_hint="围绕差异维度进行并列对比，再给出选择建议。",
+    ),
+    "guidance": AnswerStyleProfile(
+        style="guidance",
+        context_limit=4,
+        context_chars=720,
+        max_tokens=320,
+        temperature_floor=0.22,
+        top_p=0.9,
+        frequency_penalty=0.3,
+        presence_penalty=0.12,
+        organization_hint="按可执行步骤输出，每步写清目标与动作。",
+    ),
+    "summary": AnswerStyleProfile(
+        style="summary",
+        context_limit=4,
+        context_chars=740,
+        max_tokens=280,
+        temperature_floor=0.16,
+        top_p=0.84,
+        frequency_penalty=0.24,
+        presence_penalty=0.06,
+        organization_hint="提炼 3-5 条重点，按主题归并，不要重复句式。",
+    ),
+}
+
+
+@lru_cache(maxsize=16)
+def get_chat_llm(
+    temperature: float,
+    top_p: float,
+    frequency_penalty: float,
+    presence_penalty: float,
+) -> ChatOpenAI:
     return ChatOpenAI(
         api_key=settings.api_key,
         base_url=settings.llm_base_url,
         model=settings.llm_model,
-        temperature=settings.llm_temperature,
+        temperature=temperature,
+        top_p=top_p,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
         timeout=settings.llm_timeout_seconds,
         max_retries=0,
     )
@@ -48,14 +123,13 @@ def answer_with_llm(
     if not enabled or not settings.api_key:
         return LLMAnswerResult(answer="\n\n".join(contexts), mode="disabled")
 
-    is_guidance = any(
-        token in (question or "") for token in ["大一", "学习", "生活", "平衡", "建议"]
+    style = _detect_answer_style(question)
+    profile = STYLE_PROFILES.get(style, STYLE_PROFILES["direct"])
+    compact_contexts = _compact_contexts(
+        contexts=contexts,
+        limit=profile.context_limit,
+        max_chars=profile.context_chars,
     )
-    context_limit = GUIDANCE_CONTEXT_LIMIT if is_guidance else DEFAULT_CONTEXT_LIMIT
-    context_size = GUIDANCE_CONTEXT_CHARS if is_guidance else DEFAULT_CONTEXT_CHARS
-    compact_contexts = [
-        ctx.strip()[:context_size] for ctx in contexts[:context_limit] if ctx.strip()
-    ]
 
     academic_prompt = ""
     if _is_academic_analysis_query(question):
@@ -71,15 +145,16 @@ def answer_with_llm(
         f"{(system_instruction or '').strip()}\n"
         f"{academic_prompt}"
         "你是知识库问答助手。必须基于给定资料作答，不得编造事实。\n"
-        "请按以下结构输出：\n"
-        "结论：...\n"
-        "依据：...\n"
-        "建议：...\n"
-        "建议部分给出 3-5 条可执行动作，尽量包含条件或时间频次。"
-        "如果资料不足：明确不确定范围，同时给出可执行的通用方案，并列出需要补充的信息。\n\n"
+        f"回答类型：{profile.style}\n"
+        f"组织建议：{profile.organization_hint}\n"
+        "写作要求：\n"
+        "1) 优先回答用户当前问题，再补充必要依据。\n"
+        "2) 不要机械套用固定模板，按问题自然组织段落。\n"
+        "3) 资料不足时，明确不确定边界，并给出下一步可执行建议。\n\n"
         f"问题：{question}\n\n"
         f"资料：\n{chr(10).join(compact_contexts) if compact_contexts else '（当前未检索到高置信资料）'}"
     )
+
     effective_timeout = max(
         2,
         int(
@@ -88,27 +163,33 @@ def answer_with_llm(
             else settings.llm_timeout_seconds
         ),
     )
+    effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
+    effective_tokens = max(120, min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens))
 
     try:
         executor = ThreadPoolExecutor(max_workers=1)
+        llm = get_chat_llm(
+            temperature=round(effective_temperature, 2),
+            top_p=round(profile.top_p, 2),
+            frequency_penalty=round(profile.frequency_penalty, 2),
+            presence_penalty=round(profile.presence_penalty, 2),
+        )
         future = executor.submit(
-            get_chat_llm().invoke,
+            llm.invoke,
             prompt,
-            max_tokens=LLM_MAX_OUTPUT_TOKENS,
+            max_tokens=effective_tokens,
         )
         try:
             response = future.result(timeout=effective_timeout)
         finally:
             future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
-        answer = _extract_text_content(getattr(response, "content", ""))
-        if not answer:
+        answer = _normalize_answer_text(_extract_text_content(getattr(response, "content", "")))
+        if not answer or len(answer) < 18:
             return LLMAnswerResult(
                 answer=_fallback_natural_answer(question, compact_contexts),
                 mode="empty_fallback",
             )
-        answer = _ensure_three_section(answer)
-        answer = _ensure_guidance_answer_length(answer, question)
         return LLMAnswerResult(
             answer=answer,
             mode="llm",
@@ -128,16 +209,12 @@ def answer_with_llm(
 
 
 def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
+    style = _detect_answer_style(question)
     q = (question or "").strip().lower()
+    question_focus = (question or "").strip()[:80] or "当前问题"
+
     if not contexts:
-        question_focus = (question or "").strip()[:80] or "当前问题"
-        return (
-            f"结论：当前资料不足，暂时无法对“{question_focus}”给出确定事实结论。\n"
-            "依据：知识库未命中可直接支撑结论的高置信片段。\n"
-            "建议：1) 补充目标对象、时间范围和约束条件；"
-            "2) 提供你已知的关键事实或样例；"
-            "3) 我可以先给出“执行步骤 + 风险点 + 待确认信息”的结构化方案。"
-        )
+        return _render_no_context_fallback(style, question_focus)
 
     merged = "\n".join(contexts)
 
@@ -164,57 +241,21 @@ def _fallback_natural_answer(question: str, contexts: list[str]) -> str:
         ]
         return any(marker in t for marker in noise_markers)
 
-    preference_keywords = ["学习", "生活", "平衡", "建议", "复盘", "作息", "运动"]
-    q_pref = any(token in q for token in preference_keywords)
-
     sentences = re.split(r"[\n。！？!?]", merged)
     cleaned: list[str] = []
     for item in sentences:
         text = " ".join(item.strip().split())
         if not text or text in cleaned or _is_noise_line(text):
             continue
-        if q_pref and not any(token in text for token in preference_keywords):
-            continue
         cleaned.append(text)
-        if len(cleaned) >= 5:
+        if len(cleaned) >= 6:
             break
 
     if not cleaned:
-        return (
-            "结论：已完成检索，但可直接引用的高质量片段不足。\n"
-            "依据：命中内容以命令/配置片段为主，不适合作为自然语言回答依据。\n"
-            "建议：请补充更贴近业务的文档内容，或降低该类技术脚本文档在当前问答场景中的优先级。"
-        )
+        return _render_no_context_fallback(style, question_focus)
 
-    summary = "；".join(cleaned[:4])
-
-    if any(token in q for token in ["总结", "概述", "重点", "新增文档", "指南"]):
-        return (
-            "结论：根据当前检索内容，可提炼出本次资料的主要关注点。\n"
-            f"依据：{summary}。\n"
-            "建议：如需更可执行的版本，请指定对象（学生/教师/管理员）和输出格式（三点清单/一周行动表）。"
-        )
-
-    if any(token in q for token in ["大一", "学习", "生活", "平衡", "建议"]):
-        return (
-            "结论：建议采用“学习主线 + 生活底线 + 每周复盘”的节奏，避免单日突击导致失衡。\n"
-            f"依据：{summary}。\n"
-            "建议："
-            "1）每天安排2个45分钟深度学习时段；"
-            "2）晚间固定30分钟运动或散步；"
-            "3）睡前15分钟做次日任务清单；"
-            "4）每周至少1次社交或兴趣活动保持情绪稳定；"
-            "5）周日用20分钟复盘并调整下周优先级；"
-            "6）遇到连续两天低效时，主动缩减任务并优先完成最关键一项；"
-            "7）把最薄弱课程安排在精力最好的时段；"
-            "8）每周与同学进行一次互测互评，检查执行效果。"
-        )
-
-    return (
-        f"结论：根据当前检索结果，问题可从资料中部分回答。\n"
-        f"依据：{summary}。\n"
-        "建议：如需更精准结论，请补充上下文或限定具体场景。"
-    )
+    evidence_lines = cleaned[:4]
+    return _render_context_fallback(style, question_focus, evidence_lines, q)
 
 
 def _is_academic_analysis_query(question: str) -> bool:
@@ -223,34 +264,117 @@ def _is_academic_analysis_query(question: str) -> bool:
     return any(flag in q for flag in flags)
 
 
-def _ensure_guidance_answer_length(answer: str, question: str) -> str:
+def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
-    if not any(token in q for token in ["大一", "学习", "生活", "平衡", "建议"]):
-        return answer
-    if len(answer) >= 260:
-        return answer
-    extension = (
-        "\n建议补充："
-        "可将一周拆成“周一到周五稳态推进、周六查漏补缺、周日复盘调整”三段，"
-        "其中周一到周五每天至少完成一门课程复习与一项生活管理任务；"
-        "若出现拖延，优先保证核心课程学习与睡眠，再逐步恢复其他安排。"
-    )
-    return f"{answer}{extension}"
+    if not q:
+        return "direct"
+    if any(token in q for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]):
+        return "comparison"
+    if any(token in q for token in ["总结", "概述", "重点", "梳理", "归纳", "总览"]):
+        return "summary"
+    if any(token in q for token in ["怎么", "如何", "步骤", "方案", "计划", "建议", "修复", "排查", "优化"]):
+        return "guidance"
+    if any(token in q for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]):
+        return "analysis"
+    return "direct"
 
 
-def _ensure_three_section(answer: str) -> str:
+def _compact_contexts(contexts: list[str], limit: int, max_chars: int) -> list[str]:
+    compact: list[str] = []
+    seen: set[str] = set()
+    for ctx in contexts:
+        text = " ".join((ctx or "").split())
+        if not text:
+            continue
+        key = text[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        compact.append(text[:max_chars])
+        if len(compact) >= limit:
+            break
+    return compact
+
+
+def _normalize_answer_text(answer: str) -> str:
     text = (answer or "").strip()
     if not text:
-        return "结论：暂无有效回答。\n依据：模型未返回内容。\n建议：请调整问题后重试。"
+        return ""
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if cleaned_lines and cleaned_lines[-1]:
+                cleaned_lines.append("")
+            continue
+        if cleaned_lines and stripped == cleaned_lines[-1]:
+            continue
+        cleaned_lines.append(stripped)
+    return "\n".join(cleaned_lines).strip()
 
-    if all(tag in text for tag in ("结论", "依据", "建议")):
-        return text
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    head = lines[0] if lines else text
-    rest = "；".join(lines[1:3]) if len(lines) > 1 else text[:160]
-    tail = lines[-1] if len(lines) > 2 else "建议结合更多上下文继续追问。"
-    return f"结论：{head}\n依据：{rest}\n建议：{tail}"
+def _render_no_context_fallback(style: str, question_focus: str) -> str:
+    if style == "comparison":
+        return (
+            f"当前还缺少可比依据，暂时不能对“{question_focus}”给出可靠对比结论。\n"
+            "你可以补充：比较对象、评价维度（如成本/效果/风险）和时间范围。"
+        )
+    if style == "summary":
+        return (
+            f"当前资料不足，暂时无法对“{question_focus}”做有效摘要。\n"
+            "建议先补充目标文档范围或主题关键词，我再按重点清单快速整理。"
+        )
+    if style == "guidance":
+        return (
+            f"关于“{question_focus}”，当前依据不足，但可以先按这三步推进：\n"
+            "1) 明确目标与约束；2) 给出已知事实；3) 我据此输出可执行步骤和风险检查点。"
+        )
+    if style == "analysis":
+        return (
+            f"目前缺少支撑“{question_focus}”的关键证据，无法做可靠原因判断。\n"
+            "建议补充事件背景、时间线和关键指标，我再给出有证据链的分析。"
+        )
+    return (
+        f"当前资料不足，暂时无法直接回答“{question_focus}”。\n"
+        "你可以补充对象、时间范围和已知事实，我会给出更贴题的结论。"
+    )
+
+
+def _render_context_fallback(
+    style: str,
+    question_focus: str,
+    evidence_lines: list[str],
+    normalized_question: str,
+) -> str:
+    summary = "；".join(evidence_lines[:4])
+    if style == "comparison":
+        return (
+            f"基于当前命中内容，可先对“{question_focus}”做初步对比：\n"
+            f"- 关键依据：{summary}\n"
+            "- 若需最终结论，请补充明确的比较对象和决策优先级。"
+        )
+    if style == "summary":
+        bullets = "\n".join(f"- {item}" for item in evidence_lines[:4])
+        return f"本轮可提炼的重点如下：\n{bullets}"
+    if style == "guidance":
+        return (
+            f"结合现有资料，建议你围绕“{question_focus}”先执行：\n"
+            f"1) 锁定当前优先问题（依据：{evidence_lines[0]}）；\n"
+            "2) 制定本周可落地动作并设置检查点；\n"
+            "3) 下一轮补充执行结果，我再帮你迭代方案。"
+        )
+    if style == "analysis" or any(token in normalized_question for token in ["原因", "分析", "风险"]):
+        return (
+            f"初步判断：该问题可以从已有资料中部分解释。\n"
+            f"主要依据：{summary}。\n"
+            "如果你希望更深入，我可以继续拆解成“成因-影响-优先级”三层分析。"
+        )
+    return (
+        f"目前能确认的是：{evidence_lines[0]}。\n"
+        f"补充依据：{summary}。\n"
+        "若需要更精确结论，请补充具体场景或约束条件。"
+    )
 
 
 def _extract_text_content(content: Any) -> str:
