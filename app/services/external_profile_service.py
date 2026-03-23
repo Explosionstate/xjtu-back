@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+from time import monotonic
+
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.academic_session import academic_session_scope
 
+_PROFILE_CACHE_TTL_SECONDS = 180.0
+_PROFILE_CACHE: dict[str, tuple[float, str]] = {}
+
 
 def load_user_profile_context(login_name: str) -> str:
     if not login_name or not login_name.strip():
         return ""
+    cache_key = login_name.strip().lower()
+    cached = _PROFILE_CACHE.get(cache_key)
+    now = monotonic()
+    if cached and cached[0] > now:
+        return cached[1]
 
     try:
         with academic_session_scope() as db:
@@ -28,6 +38,7 @@ def load_user_profile_context(login_name: str) -> str:
                 .first()
             )
             if not user_row:
+                _PROFILE_CACHE[cache_key] = (now + 30.0, "")
                 return ""
 
             role = str(user_row.get("role") or "").strip().lower()
@@ -96,6 +107,8 @@ def load_user_profile_context(login_name: str) -> str:
                         ]
                     )
 
-            return "\n".join(lines)
+            output = "\n".join(lines)
+            _PROFILE_CACHE[cache_key] = (now + _PROFILE_CACHE_TTL_SECONDS, output)
+            return output
     except SQLAlchemyError:
         return ""

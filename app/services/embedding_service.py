@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Any
 
 from app.core.config import settings
@@ -127,7 +128,18 @@ def embed_texts(texts: list[str], model_name: str) -> list[list[float]]:
 
 
 def embed_query(query: str, model_name: str) -> list[float]:
-    values = embed_texts([query], model_name=model_name)
-    if not values:
+    normalized_query = re.sub(r"\s+", " ", (query or "").strip())
+    if not normalized_query:
         return []
-    return values[0]
+    reference = resolve_local_model_reference(model_name)
+    cached = _embed_query_cached(reference, normalized_query)
+    return list(cached)
+
+
+@lru_cache(maxsize=512)
+def _embed_query_cached(model_reference: str, normalized_query: str) -> tuple[float, ...]:
+    embedder = _get_embedder(model_reference)
+    vectors = embedder.encode([normalized_query], normalize_embeddings=True)
+    if vectors is None or len(vectors) == 0:
+        return ()
+    return tuple(float(value) for value in vectors[0].tolist())

@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
@@ -48,6 +49,15 @@ def _create_client(path: Path):
     return chromadb.PersistentClient(path=str(path))
 
 
+@lru_cache(maxsize=64)
+def _cached_client(path_value: str):
+    return _create_client(Path(path_value))
+
+
+def _clear_client_cache() -> None:
+    _cached_client.cache_clear()
+
+
 def kb_vectorstore_path(kb_id: str) -> Path:
     return settings.chroma_root / kb_id
 
@@ -57,7 +67,7 @@ def ensure_kb_vectorstore(kb_id: str) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
 
     if chromadb is not None:
-        client = _create_client(target_dir)
+        client = _cached_client(str(target_dir))
         if client is None:
             return
         client.get_or_create_collection(name="documents")
@@ -65,7 +75,7 @@ def ensure_kb_vectorstore(kb_id: str) -> None:
 
 def _get_collection(kb_id: str):
     try:
-        client = _create_client(kb_vectorstore_path(kb_id))
+        client = _cached_client(str(kb_vectorstore_path(kb_id)))
         if client is None:
             return None
         return client.get_or_create_collection(name="documents")
@@ -179,6 +189,8 @@ def search_similar_chunks(
 def delete_kb_vectorstore(kb_id: str, raise_on_failure: bool = True) -> bool:
     target_dir = kb_vectorstore_path(kb_id)
     if not target_dir.exists():
+        _CHROMA_FAIL_UNTIL.pop(kb_id, None)
+        _clear_client_cache()
         return True
 
     def _onerror(func, path, exc_info):
@@ -193,6 +205,8 @@ def delete_kb_vectorstore(kb_id: str, raise_on_failure: bool = True) -> bool:
     for _ in range(6):
         try:
             shutil.rmtree(target_dir, onerror=_onerror)
+            _CHROMA_FAIL_UNTIL.pop(kb_id, None)
+            _clear_client_cache()
             return True
         except PermissionError as exc:
             last_error = exc
@@ -215,3 +229,5 @@ def clone_kb_vectorstore(source_kb_id: str, target_kb_id: str) -> None:
         shutil.copytree(source_dir, target_dir)
     else:
         target_dir.mkdir(parents=True, exist_ok=True)
+    _CHROMA_FAIL_UNTIL.pop(target_kb_id, None)
+    _clear_client_cache()

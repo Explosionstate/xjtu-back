@@ -26,6 +26,7 @@ from app.schemas.retrieval_debug import (
     RetrievalDebugScoreItem,
 )
 from app.services.auth_service import get_active_user
+from app.services.agent_profile_service import list_agent_profiles
 from app.services.chat_service import (
     chat_completion,
     clear_conversation_context,
@@ -42,7 +43,7 @@ def _iter_thinking_chunks(text: str) -> list[str]:
     return chunks or [text]
 
 
-def _iter_answer_chunks(text: str, chunk_size: int = 48) -> list[str]:
+def _iter_answer_chunks(text: str, chunk_size: int = 96) -> list[str]:
     if not text:
         return []
     safe_size = max(1, chunk_size)
@@ -101,6 +102,13 @@ async def _emit_progress_event(websocket: WebSocket, event: dict[str, object]) -
     preview = str(event.get("preview") or "").strip()
     if preview:
         await websocket.send_json({"type": "preview", "content": preview})
+
+
+@router.get("/chat/agents")
+def list_agents(current_user=Depends(get_current_user)) -> dict[str, object]:
+    _ = current_user
+    items = list_agent_profiles(include_default=False)
+    return {"total": len(items), "items": items}
 
 
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
@@ -287,7 +295,7 @@ async def ws_chat_completions(
                     if completion_task.done() and progress_queue.empty():
                         break
                     try:
-                        event = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
+                        event = await asyncio.wait_for(progress_queue.get(), timeout=0.08)
                     except asyncio.TimeoutError:
                         continue
                     await _emit_progress_event(websocket, event)

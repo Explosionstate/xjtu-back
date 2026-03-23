@@ -1,22 +1,14 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any, Callable, TypedDict
+
+from app.services.agent_profile_service import build_agent_system_instruction
 
 try:
     from langgraph.graph import END, StateGraph
 except ImportError:  # pragma: no cover
     END = None  # type: ignore[assignment]
     StateGraph = None  # type: ignore[assignment]
-
-
-AGENT_SYSTEM_PROMPTS: dict[str, str] = {
-    "student-growth": "你是学生成长助手，回答要具体、可执行，兼顾学习与生活建议。",
-    "teacher-assistant": "你是教师助教助手，回答要聚焦教学设计、课堂互动和评估反馈。",
-    "counselor-ideology": "你是辅导员思政助手，回答要注重价值引导、沟通方式和管理可行性。",
-    "risk-warning": "你是学情预警助手，回答要给出风险分级、证据和优先处置建议。",
-    "report-assistant": "你是学情报告助手，输出结构化报告，包含结论、依据、建议。",
-    "policy-qa": "你是思政知识问答助手，回答需准确、可追溯并给出政策依据。",
-}
 
 
 class ChatGraphState(TypedDict):
@@ -54,11 +46,7 @@ def _input_guard(state: ChatGraphState) -> ChatGraphState:
 
 
 def _route_prompt(state: ChatGraphState) -> ChatGraphState:
-    default_prompt = "你是西交 AI 智能体，请基于知识库给出准确、简洁、结构化的回答。"
-    state["system_instruction"] = AGENT_SYSTEM_PROMPTS.get(
-        state.get("agent_key", ""),
-        default_prompt,
-    )
+    state["system_instruction"] = build_agent_system_instruction(state.get("agent_key", ""))
     return state
 
 
@@ -172,10 +160,7 @@ def run_chat_workflow_graph(
                 "sources": [],
                 "answer": "",
             }
-        instruction = AGENT_SYSTEM_PROMPTS.get(
-            (agent_key or "").strip().lower(),
-            "你是西交 AI 智能体，请基于知识库给出准确、简洁、结构化的回答。",
-        )
+        instruction = build_agent_system_instruction((agent_key or "").strip().lower())
         profile = load_profile_fn(normalized_question)
         contexts, sources = retrieve_fn(normalized_question)
         merged_contexts = ([profile] if profile else []) + list(contexts)

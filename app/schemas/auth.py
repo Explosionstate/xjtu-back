@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class LoginRequest(BaseModel):
-    login_name: str = Field(min_length=1, max_length=64)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    login_name: str = Field(
+        min_length=1,
+        max_length=64,
+        validation_alias=AliasChoices("login_name", "loginName"),
+    )
     password: str = Field(min_length=1, max_length=128)
 
 
@@ -14,6 +20,8 @@ class TokenResponse(BaseModel):
 
 
 class SSOExchangeRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
     ticket: str = Field(min_length=1, max_length=256)
 
 

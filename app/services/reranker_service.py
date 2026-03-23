@@ -46,6 +46,10 @@ def rerank_candidates(
 ) -> list[dict]:
     if not candidates or not settings.reranker_enabled:
         return candidates
+    if len(candidates) <= 2:
+        return candidates
+    if len((query or "").strip()) <= 2:
+        return candidates
 
     top_n = max(1, min(len(candidates), settings.reranker_top_n))
     head = candidates[:top_n]

@@ -20,9 +20,13 @@ def generate_answer_by_provider(
     provider_name = (provider or "").strip().lower() or "local_transformer"
     if provider_name == "qwen":
         start = perf_counter()
-        answer = answer_with_llm(question=question, contexts=contexts, llm_enabled=True)
+        llm_result = answer_with_llm(
+            question=question,
+            contexts=contexts,
+            llm_enabled=True,
+        )
         return (
-            answer,
+            llm_result.answer,
             model or "qwen3.5-plus",
             {
                 "provider": "qwen",

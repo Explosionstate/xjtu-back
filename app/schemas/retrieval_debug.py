@@ -1,15 +1,36 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class RetrievalDebugRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
     query: str = Field(min_length=1)
-    kb_ids: list[str] | None = None
-    document_ids: list[str] | None = None
-    top_k: int | None = Field(default=None, ge=1, le=50)
-    score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
-    fusion_mode: str | None = None
+    kb_ids: list[str] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("kb_ids", "kbIds"),
+    )
+    document_ids: list[str] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("document_ids", "documentIds"),
+    )
+    top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=50,
+        validation_alias=AliasChoices("top_k", "topK"),
+    )
+    score_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices("score_threshold", "scoreThreshold"),
+    )
+    fusion_mode: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("fusion_mode", "fusionMode"),
+    )
     alpha: float | None = Field(default=None, ge=0.0, le=1.0)
 
 

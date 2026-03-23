@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class RetrievalConfigItem(BaseModel):
@@ -11,7 +11,22 @@ class RetrievalConfigItem(BaseModel):
 
 
 class RetrievalConfigUpdateRequest(BaseModel):
-    retrieval_top_k: int | None = Field(default=None, ge=1, le=50)
-    score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
-    fusion_mode: str | None = None
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    retrieval_top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=50,
+        validation_alias=AliasChoices("retrieval_top_k", "retrievalTopK", "top_k", "topK"),
+    )
+    score_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices("score_threshold", "scoreThreshold"),
+    )
+    fusion_mode: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("fusion_mode", "fusionMode"),
+    )
     alpha: float | None = Field(default=None, ge=0.0, le=1.0)

@@ -17,6 +17,11 @@ from app.models.chat import ChatLog, ChatPerfLog, Conversation, Message
 from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
 from app.schemas.chat import ChatCompletionRequest, ChatThinking, SourceItem
+from app.services.agent_profile_service import (
+    get_agent_no_answer_strategy,
+    needs_profile_context,
+    normalize_agent_key,
+)
 from app.services.llm_service import LLMAnswerResult, answer_with_llm
 from app.services.local_transformer_service import (
     generate_answer_with_local_transformer,
@@ -35,7 +40,7 @@ from app.services.sensitive_service import (
 from app.services.system_config_service import (
     DEFAULT_CONTEXT_MAX_ROUNDS,
     DEFAULT_CONTEXT_MAX_TOKENS,
-    get_int_config,
+    get_config_values,
 )
 
 
@@ -250,10 +255,18 @@ def _build_history_context_brief(
 
 
 def _build_retrieval_shortfall_answer(
-    question: str, trimmed_history: list[Message]
+    question: str,
+    trimmed_history: list[Message],
+    agent_key: str | None = None,
 ) -> str:
     style = _detect_answer_style(question)
     short_question = _compact_text(question, 80) or "当前问题"
+    no_answer_rules = get_agent_no_answer_strategy(agent_key)
+    no_answer_hint = (
+        "；".join(no_answer_rules[:2])
+        if no_answer_rules
+        else "补充目标对象、时间范围和关键事实后继续"
+    )
     user_history = [
         _compact_text(item.content, 50)
         for item in trimmed_history
@@ -264,30 +277,30 @@ def _build_retrieval_shortfall_answer(
         return (
             f"当前资料不足，暂时无法对“{short_question}”给出可靠对比结论。\n"
             f"已可复用的历史信息：{history_hint}。\n"
-            "请补充比较对象、评价维度和优先级，我会输出清晰对比结果。"
+            f"建议：{no_answer_hint}。"
         )
     if style == "summary":
         return (
             f"关于“{short_question}”，当前命中资料不足以形成有效摘要。\n"
             f"可参考的历史线索：{history_hint}。\n"
-            "建议指定文档范围或主题关键词，我再按重点清单快速整理。"
+            f"建议：{no_answer_hint}。"
         )
     if style == "analysis":
         return (
             f"目前还缺少支撑“{short_question}”的关键证据，无法做可靠原因判断。\n"
             f"现有可复用上下文：{history_hint}。\n"
-            "你可以补充背景、时间线和关键指标，我会给出更完整的因果分析。"
+            f"建议：{no_answer_hint}。"
         )
     if style == "guidance":
         return (
             f"当前资料不足以直接回答“{short_question}”，但可以先启动可执行方案。\n"
             f"当前可复用上下文：{history_hint}。\n"
-            "先给我目标对象、时间范围和约束条件，我会按步骤给出落地动作。"
+            f"建议：{no_answer_hint}。"
         )
     return (
         f"当前资料不足，暂时无法直接回答“{short_question}”。\n"
         f"可复用对话信息：{history_hint}。\n"
-        "补充目标对象、时间范围或已知事实后，我可以给出更精准结论。"
+        f"建议：{no_answer_hint}。"
     )
 
 
@@ -295,8 +308,13 @@ def _build_kb_bounded_shortfall_answer(
     question: str,
     trimmed_history: list[Message],
     route_mode: str,
+    agent_key: str | None = None,
 ) -> str:
-    base = _build_retrieval_shortfall_answer(question, trimmed_history)
+    base = _build_retrieval_shortfall_answer(
+        question=question,
+        trimmed_history=trimmed_history,
+        agent_key=agent_key,
+    )
     if route_mode == MODEL_ROUTE_LOCAL_ONLY:
         return (
             "当前为“仅本地 Qwen + 本地知识库”模式，回答必须受知识库约束。\n"
@@ -363,9 +381,54 @@ def _build_cloud_timeout_degraded_answer(
     )
 
 
-def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
+def _format_retrieval_contexts_for_generation(
+    retrieved: list[dict],
+    limit: int = 4,
+) -> list[str]:
+    formatted: list[str] = []
+    seen: set[str] = set()
+    for item in retrieved:
+        content = _compact_text(str(item.get("content") or ""), 320)
+        if not content:
+            continue
+        key = content[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        source = _compact_text(str(item.get("source_location") or "未知来源"), 48) or "未知来源"
+        score = item.get("score")
+        score_text = ""
+        if isinstance(score, (int, float)):
+            score_text = f" | 相关度:{float(score):.3f}"
+        formatted.append(
+            f"[证据{len(formatted) + 1} | 来源:{source}{score_text}] {content}"
+        )
+        if len(formatted) >= limit:
+            break
+    return formatted
+
+
+def _fast_retrieval_answer(
+    question: str,
+    retrieved: list[dict],
+    agent_key: str | None = None,
+) -> str:
     style = _detect_answer_style(question)
     lowered = (question or "").lower()
+    no_answer_rules = get_agent_no_answer_strategy(agent_key)
+    no_answer_hint = (
+        "；".join(no_answer_rules[:2])
+        if no_answer_rules
+        else "补充关键事实后继续"
+    )
+    agent_focus = {
+        "student-growth": "学习成长",
+        "teacher-assistant": "课堂教学",
+        "counselor-ideology": "学生事务与思政",
+        "risk-warning": "学业风险预警",
+        "report-assistant": "学情报告",
+        "policy-qa": "政策制度问答",
+    }.get((agent_key or "").strip().lower(), "知识库问答")
     if "xjtu-back" in lowered and any(
         token in question for token in ["启动", "运行", "start"]
     ):
@@ -378,14 +441,29 @@ def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
 
     if not retrieved:
         if style == "summary":
-            return "当前未检索到足够依据，暂时无法输出可靠摘要。请补充主题范围后重试。"
+            return (
+                f"当前未检索到足够依据，暂时无法输出可靠摘要（{agent_focus}）。\n"
+                f"建议：{no_answer_hint}。"
+            )
         if style == "comparison":
-            return "当前缺少可比较资料，暂时无法给出对比结论。请补充比较对象与维度。"
+            return (
+                f"当前缺少可比较资料，暂时无法给出对比结论（{agent_focus}）。\n"
+                f"建议：{no_answer_hint}。"
+            )
         if style == "analysis":
-            return "当前证据不足，暂时无法给出可靠分析判断。请补充背景和关键指标。"
+            return (
+                f"当前证据不足，暂时无法给出可靠分析判断（{agent_focus}）。\n"
+                f"建议：{no_answer_hint}。"
+            )
         if style == "guidance":
-            return "当前资料不足，但你可先补充目标和约束条件，我会给出可执行步骤。"
-        return "当前未检索到足够依据，请补充更具体场景后重试。"
+            return (
+                f"当前资料不足，暂时无法给出稳妥执行方案（{agent_focus}）。\n"
+                f"建议：{no_answer_hint}。"
+            )
+        return (
+            f"当前未检索到足够依据（{agent_focus}）。\n"
+            f"建议：{no_answer_hint}。"
+        )
 
     summarize_keywords = ["总结", "重点", "概述", "本周", "新增文档"]
     if any(token in question for token in summarize_keywords):
@@ -423,25 +501,25 @@ def _fast_retrieval_answer(question: str, retrieved: list[dict]) -> str:
     evidence = "；".join(snippets[:3])
     if style == "comparison":
         return (
-            f"基于当前命中资料，可先对“{question[:30]}”做初步对比。\n"
+            f"基于当前命中资料（{agent_focus}），可先对“{question[:30]}”做初步对比。\n"
             f"关键依据：{evidence}\n"
             "如需明确推荐，请补充比较对象与优先级。"
         )
     if style == "analysis":
         return (
-            f"针对“{question[:30]}”，可以先给出初步分析判断。\n"
+            f"针对“{question[:30]}”（{agent_focus}），可以先给出初步分析判断。\n"
             f"主要依据：{evidence}\n"
             "你也可以继续追问具体原因链路或风险优先级。"
         )
     if style == "guidance":
         return (
-            f"围绕“{question[:30]}”，建议先按步骤执行：\n"
+            f"围绕“{question[:30]}”（{agent_focus}），建议先按步骤执行：\n"
             f"1) 优先处理最关键环节（依据：{snippets[0]}）；\n"
             "2) 设置短周期检查点；\n"
             "3) 根据执行结果再迭代细节。"
         )
     return (
-        f"已基于检索结果回答“{question[:32]}”。\n"
+        f"已基于检索结果回答“{question[:32]}”（{agent_focus}）。\n"
         f"关键依据：{evidence}\n"
         "如需更精确结论，可补充目标对象、时间范围或约束条件。"
     )
@@ -654,8 +732,7 @@ def _expand_academic_query(agent_key: str | None, question: str) -> str:
 
 
 def _is_student_growth_agent(agent_key: str | None) -> bool:
-    key = (agent_key or "").strip().lower()
-    return key in {"student-growth", "student_growth", "student"}
+    return normalize_agent_key(agent_key) == "student-growth"
 
 
 def _is_academic_analysis_query(agent_key: str | None, question: str) -> bool:
@@ -882,15 +959,26 @@ def chat_completion(
     alpha = float(retrieval_config["alpha"])
 
     if _is_guidance_query(question):
-        top_k = min(max(top_k, 4), 6)
+        # Guidance tasks need enough recall coverage; avoid over-aggressive truncation.
+        top_k = min(max(top_k, 4), 12)
         score_threshold = min(score_threshold, 0.24)
 
-    configured_max_rounds = get_int_config(
-        db, "context_max_rounds", DEFAULT_CONTEXT_MAX_ROUNDS
+    context_cfg = get_config_values(
+        db,
+        ["context_max_rounds", "context_max_tokens"],
     )
-    configured_max_tokens = get_int_config(
-        db, "context_max_tokens", DEFAULT_CONTEXT_MAX_TOKENS
-    )
+    try:
+        configured_max_rounds = int(
+            context_cfg.get("context_max_rounds", DEFAULT_CONTEXT_MAX_ROUNDS)
+        )
+    except (TypeError, ValueError):
+        configured_max_rounds = DEFAULT_CONTEXT_MAX_ROUNDS
+    try:
+        configured_max_tokens = int(
+            context_cfg.get("context_max_tokens", DEFAULT_CONTEXT_MAX_TOKENS)
+        )
+    except (TypeError, ValueError):
+        configured_max_tokens = DEFAULT_CONTEXT_MAX_TOKENS
     max_rounds = payload.context_max_rounds or configured_max_rounds
     max_tokens = payload.context_max_tokens or configured_max_tokens
 
@@ -910,10 +998,50 @@ def chat_completion(
     trimmed_history = _truncate_history(
         history=history, max_rounds=max_rounds, max_tokens=max_tokens
     )
-    retrieval_query = _expand_academic_query(
-        payload.agent_key,
-        _build_retrieval_query(trimmed_history, question, long_term_memory),
-    )
+    retrieval_query_cache: dict[str, str] = {}
+    retrieval_result_cache: dict[tuple[str, int, float], list[dict]] = {}
+
+    def _resolve_retrieval_query(runtime_question: str) -> str:
+        key = (runtime_question or "").strip()
+        if not key:
+            return ""
+        cached_query = retrieval_query_cache.get(key)
+        if cached_query is not None:
+            return cached_query
+        built_query = _expand_academic_query(
+            payload.agent_key,
+            _build_retrieval_query(trimmed_history, key, long_term_memory),
+        )
+        retrieval_query_cache[key] = built_query
+        return built_query
+
+    def _run_retrieval_query(
+        runtime_query: str,
+        runtime_top_k: int,
+        runtime_threshold: float,
+    ) -> list[dict]:
+        cache_key = (
+            runtime_query,
+            runtime_top_k,
+            round(runtime_threshold, 4),
+        )
+        cached_result = retrieval_result_cache.get(cache_key)
+        if cached_result is not None:
+            return list(cached_result)
+        output = hybrid_retrieve(
+            db=db,
+            query=runtime_query,
+            kb_ids=kb_ids,
+            document_ids=payload.document_ids,
+            top_k=runtime_top_k,
+            score_threshold=runtime_threshold,
+            fusion_mode=fusion_mode,
+            alpha=alpha,
+            agent_key=payload.agent_key,
+        )
+        retrieval_result_cache[cache_key] = list(output)
+        return output
+
     is_academic_analysis = _is_academic_analysis_query(payload.agent_key, question)
     chat_total_timeout = (
         ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS
@@ -967,6 +1095,7 @@ def chat_completion(
     start = perf_counter()
     llm_result: LLMAnswerResult | None = None
     retrieved: list[dict] = []
+    profile_context_text = ""
     profile_ms = 0
     retrieval_ms = 0
     llm_ms = 0
@@ -987,9 +1116,13 @@ def chat_completion(
     else:
 
         def _load_profile(_: str) -> str:
-            nonlocal profile_ms, workflow_stage
+            nonlocal profile_ms, workflow_stage, profile_context_text
             workflow_stage = "profile"
             if current_user is None:
+                profile_context_text = ""
+                return ""
+            if not is_academic_analysis and not needs_profile_context(payload.agent_key):
+                profile_context_text = ""
                 return ""
             stage_start = perf_counter()
             _emit_progress(
@@ -1001,6 +1134,7 @@ def chat_completion(
             )
             try:
                 if route_mode == MODEL_ROUTE_CLOUD_ONLY and not is_academic_analysis:
+                    profile_context_text = ""
                     return ""
                 profile_executor = ThreadPoolExecutor(max_workers=1)
                 profile_future = (
@@ -1015,7 +1149,8 @@ def chat_completion(
                     )
                 )
                 try:
-                    return profile_future.result(timeout=profile_timeout_seconds)
+                    profile_context_text = profile_future.result(timeout=profile_timeout_seconds)
+                    return profile_context_text
                 except FuturesTimeoutError:
                     logger.warning(
                         "profile timeout: conversation=%s agent=%s academic=%s",
@@ -1030,6 +1165,7 @@ def chat_completion(
                         status="timeout",
                         detail="用户画像加载超时，已继续后续流程。",
                     )
+                    profile_context_text = ""
                     return ""
                 finally:
                     profile_future.cancel()
@@ -1042,6 +1178,7 @@ def chat_completion(
                     status="error",
                     detail="用户画像加载失败，已继续后续流程。",
                 )
+                profile_context_text = ""
                 return ""
             finally:
                 stage_ms = int((perf_counter() - stage_start) * 1000)
@@ -1066,30 +1203,13 @@ def chat_completion(
                 status="start",
                 detail="正在检索知识库资料...",
             )
-            query = _expand_academic_query(
-                payload.agent_key,
-                _build_retrieval_query(
-                    trimmed_history,
-                    runtime_question,
-                    long_term_memory,
-                ),
-            )
+            query = _resolve_retrieval_query(runtime_question)
             try:
-                if route_mode == MODEL_ROUTE_CLOUD_ONLY and not payload.document_ids:
+                if route_mode == MODEL_ROUTE_CLOUD_ONLY:
                     retrieval_skipped = True
                     retrieved = []
                     return [], []
-                retrieved = hybrid_retrieve(
-                    db=db,
-                    query=query,
-                    kb_ids=kb_ids,
-                    document_ids=payload.document_ids,
-                    top_k=top_k,
-                    score_threshold=score_threshold,
-                    fusion_mode=fusion_mode,
-                    alpha=alpha,
-                    agent_key=payload.agent_key,
-                )
+                retrieved = _run_retrieval_query(query, top_k, score_threshold)
                 if not retrieved:
                     relaxed_top_k = min(8, max(top_k + 2, 3))
                     relaxed_threshold = max(
@@ -1100,16 +1220,10 @@ def chat_completion(
                         relaxed_top_k > top_k
                         or relaxed_threshold < score_threshold
                     ):
-                        retrieved = hybrid_retrieve(
-                            db=db,
-                            query=query,
-                            kb_ids=kb_ids,
-                            document_ids=payload.document_ids,
-                            top_k=relaxed_top_k,
-                            score_threshold=relaxed_threshold,
-                            fusion_mode=fusion_mode,
-                            alpha=alpha,
-                            agent_key=payload.agent_key,
+                        retrieved = _run_retrieval_query(
+                            query,
+                            relaxed_top_k,
+                            relaxed_threshold,
                         )
             except Exception:
                 logger.exception(
@@ -1146,7 +1260,7 @@ def chat_completion(
                     stage_ms=stage_ms,
                     preview=preview,
                 )
-            return [item["content"] for item in retrieved], retrieved
+            return _format_retrieval_contexts_for_generation(retrieved), retrieved
 
         def _generate(
             runtime_question: str,
@@ -1168,16 +1282,59 @@ def chat_completion(
                 runtime_question,
                 long_term_memory=long_term_memory,
             )
+            retrieval_contexts = _format_retrieval_contexts_for_generation(retrieved)
+            background_contexts: list[str] = []
+            if history_context:
+                background_contexts.append(
+                    f"[会话背景] {_compact_text(history_context, 360)}"
+                )
+            if profile_context_text:
+                background_contexts.append(
+                    f"[用户画像] {_compact_text(profile_context_text, 320)}"
+                )
+            if not background_contexts and contexts:
+                for item in contexts[:2]:
+                    compact = _compact_text(item, 280)
+                    if compact:
+                        background_contexts.append(compact)
             generation_contexts = (
-                [history_context] + contexts if history_context else list(contexts)
+                (retrieval_contexts + background_contexts)[:4]
+                if (retrieval_contexts or background_contexts)
+                else []
             )
             try:
-                if route_mode in {MODEL_ROUTE_HYBRID, MODEL_ROUTE_LOCAL_ONLY} and not retrieved:
+                if route_mode == MODEL_ROUTE_LOCAL_ONLY and not retrieved:
                     llm_result = LLMAnswerResult(
                         answer=_build_kb_bounded_shortfall_answer(
                             runtime_question,
                             trimmed_history,
                             route_mode=route_mode,
+                            agent_key=payload.agent_key,
+                        ),
+                        mode=f"{route_mode}:kb_shortfall",
+                    )
+                elif route_mode == MODEL_ROUTE_HYBRID and not retrieved and cloud_enabled:
+                    # Hybrid mode fallback: no KB hit -> let cloud model answer naturally.
+                    llm_result = answer_with_llm(
+                        question=runtime_question,
+                        contexts=background_contexts,
+                        llm_enabled=True,
+                        system_instruction="",
+                        agent_key=payload.agent_key,
+                        timeout_seconds=generation_timeout,
+                        allow_general_knowledge=True,
+                        kb_hit=False,
+                        retrieval_contexts=[],
+                        background_contexts=background_contexts,
+                    )
+                elif route_mode == MODEL_ROUTE_HYBRID and not retrieved:
+                    # Defensive branch (normally hybrid always has cloud enabled).
+                    llm_result = LLMAnswerResult(
+                        answer=_build_kb_bounded_shortfall_answer(
+                            runtime_question,
+                            trimmed_history,
+                            route_mode=route_mode,
+                            agent_key=payload.agent_key,
                         ),
                         mode=f"{route_mode}:kb_shortfall",
                     )
@@ -1190,10 +1347,12 @@ def chat_completion(
                     local_future = local_executor.submit(
                         generate_answer_with_local_transformer,
                         runtime_question,
-                        generation_contexts[:3],
+                        generation_contexts[:4],
                         settings.local_transformer_model,
                         None,
                         520,
+                        system_instruction,
+                        bool(retrieved),
                     )
                     try:
                         answer, model_reference, _metrics = local_future.result(
@@ -1230,8 +1389,12 @@ def chat_completion(
                                 contexts=generation_contexts,
                                 llm_enabled=True,
                                 system_instruction=system_instruction,
+                                agent_key=payload.agent_key,
                                 timeout_seconds=generation_timeout,
                                 allow_general_knowledge=False,
+                                kb_hit=bool(retrieved),
+                                retrieval_contexts=retrieval_contexts,
+                                background_contexts=background_contexts,
                             )
                     except Exception:
                         logger.exception(
@@ -1260,30 +1423,46 @@ def chat_completion(
                                 contexts=generation_contexts,
                                 llm_enabled=True,
                                 system_instruction=system_instruction,
+                                agent_key=payload.agent_key,
                                 timeout_seconds=generation_timeout,
                                 allow_general_knowledge=False,
+                                kb_hit=bool(retrieved),
+                                retrieval_contexts=retrieval_contexts,
+                                background_contexts=background_contexts,
                             )
                     finally:
                         local_future.cancel()
                         local_executor.shutdown(wait=False, cancel_futures=True)
                 elif cloud_enabled:
+                    allow_general_mode = route_mode == MODEL_ROUTE_CLOUD_ONLY
                     llm_result = answer_with_llm(
                         question=runtime_question,
                         contexts=generation_contexts,
                         llm_enabled=cloud_enabled,
-                        system_instruction=system_instruction,
+                        system_instruction=""
+                        if (allow_general_mode and not retrieved)
+                        else system_instruction,
+                        agent_key=payload.agent_key,
                         timeout_seconds=generation_timeout,
-                        allow_general_knowledge=(route_mode == MODEL_ROUTE_CLOUD_ONLY),
+                        allow_general_knowledge=allow_general_mode,
+                        kb_hit=False if allow_general_mode else bool(retrieved),
+                        retrieval_contexts=retrieval_contexts,
+                        background_contexts=background_contexts,
                     )
                 else:
                     llm_result = LLMAnswerResult(
                         answer=(
-                            _fast_retrieval_answer(runtime_question, retrieved)
+                            _fast_retrieval_answer(
+                                runtime_question,
+                                retrieved,
+                                agent_key=payload.agent_key,
+                            )
                             if retrieved
                             else _build_kb_bounded_shortfall_answer(
                                 runtime_question,
                                 trimmed_history,
                                 route_mode=MODEL_ROUTE_RETRIEVAL_ONLY,
+                                agent_key=payload.agent_key,
                             )
                         ),
                         mode=MODEL_ROUTE_RETRIEVAL_ONLY,
@@ -1300,8 +1479,9 @@ def chat_completion(
                             runtime_question,
                             trimmed_history,
                             route_mode=route_mode,
+                            agent_key=payload.agent_key,
                         )
-                        if route_mode in {MODEL_ROUTE_HYBRID, MODEL_ROUTE_LOCAL_ONLY}
+                        if route_mode == MODEL_ROUTE_LOCAL_ONLY
                         else "当前生成失败，已切换到简化回答。请稍后重试，或缩小问题范围后再提问。"
                     ),
                     mode="error_fallback",
@@ -1399,6 +1579,16 @@ def chat_completion(
                         answer=timeout_answer,
                         mode="cloud_timeout_fast_fallback",
                     )
+                elif route_mode == MODEL_ROUTE_HYBRID and cloud_enabled:
+                    timeout_answer = _build_cloud_timeout_degraded_answer(
+                        question=question,
+                        trimmed_history=trimmed_history,
+                        long_term_memory=long_term_memory,
+                    )
+                    llm_result = LLMAnswerResult(
+                        answer=timeout_answer,
+                        mode="hybrid_cloud_timeout_fast_fallback",
+                    )
                 else:
                     try:
                         stage_start = perf_counter()
@@ -1407,34 +1597,27 @@ def chat_completion(
                             MIN_RELAXED_THRESHOLD,
                             min(0.24, score_threshold - 0.08),
                         )
-                        retrieved = hybrid_retrieve(
-                            db=db,
-                            query=_expand_academic_query(
-                                payload.agent_key,
-                                _build_retrieval_query(
-                                    trimmed_history,
-                                    question,
-                                    long_term_memory,
-                                ),
-                            ),
-                            kb_ids=kb_ids,
-                            document_ids=payload.document_ids,
-                            top_k=fallback_top_k,
-                            score_threshold=fallback_threshold,
-                            fusion_mode=fusion_mode,
-                            alpha=alpha,
-                            agent_key=payload.agent_key,
+                        fallback_query = _resolve_retrieval_query(question)
+                        retrieved = _run_retrieval_query(
+                            fallback_query,
+                            fallback_top_k,
+                            fallback_threshold,
                         )
                         retrieval_ms += int((perf_counter() - stage_start) * 1000)
                     except Exception:
                         retrieved = []
                     timeout_answer = (
-                        _fast_retrieval_answer(question, retrieved)
+                        _fast_retrieval_answer(
+                            question,
+                            retrieved,
+                            agent_key=payload.agent_key,
+                        )
                         if retrieved
                         else _build_kb_bounded_shortfall_answer(
                             question,
                             trimmed_history,
                             route_mode=route_mode,
+                            agent_key=payload.agent_key,
                         )
                     )
                 graph_result = {
@@ -1473,49 +1656,93 @@ def chat_completion(
         system_instruction = str(graph_result.get("system_instruction") or "")
         answer = str(graph_result.get("answer") or "").strip()
         if not answer:
-            if route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
+            if (
+                (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled)
+                or (route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not retrieved)
+            ):
                 fallback_history = _build_history_context_brief(
                     trimmed_history,
                     question,
                     long_term_memory=long_term_memory,
                 )
-                fallback_contexts = [item.get("content", "") for item in retrieved[:3]]
+                fallback_retrieval_contexts = _format_retrieval_contexts_for_generation(
+                    retrieved
+                )
+                fallback_background_contexts: list[str] = []
                 if fallback_history:
-                    fallback_contexts = [fallback_history] + fallback_contexts
+                    fallback_background_contexts.append(
+                        f"[会话背景] {_compact_text(fallback_history, 360)}"
+                    )
                 llm_result = answer_with_llm(
                     question=question,
-                    contexts=fallback_contexts,
+                    contexts=fallback_retrieval_contexts + fallback_background_contexts,
                     llm_enabled=True,
-                    system_instruction=system_instruction,
+                    system_instruction="",
+                    agent_key=payload.agent_key,
                     timeout_seconds=max(4, min(8, generation_timeout)),
                     allow_general_knowledge=True,
                     retry_on_failure=False,
+                    kb_hit=False,
+                    retrieval_contexts=fallback_retrieval_contexts,
+                    background_contexts=fallback_background_contexts,
                 )
                 answer = llm_result.answer
             else:
                 answer = (
-                    _fast_retrieval_answer(question, retrieved)
+                    _fast_retrieval_answer(
+                        question,
+                        retrieved,
+                        agent_key=payload.agent_key,
+                    )
                     if retrieved
                     else _build_kb_bounded_shortfall_answer(
                         question,
                         trimmed_history,
                         route_mode=route_mode,
+                        agent_key=payload.agent_key,
+                    )
+                )
+        if (
+            not answer
+            and (
+                (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled)
+                or (route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not retrieved)
+            )
+        ):
+            answer = _build_cloud_timeout_degraded_answer(
+                question=question,
+                trimmed_history=trimmed_history,
+                long_term_memory=long_term_memory,
+            )
+
+        if perf_counter() - start > chat_total_timeout and not answer:
+            if (
+                (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled)
+                or (route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not retrieved)
+            ):
+                answer = _build_cloud_timeout_degraded_answer(
+                    question=question,
+                    trimmed_history=trimmed_history,
+                    long_term_memory=long_term_memory,
+                )
+            else:
+                answer = (
+                    _fast_retrieval_answer(
+                        question,
+                        retrieved,
+                        agent_key=payload.agent_key,
+                    )
+                    if retrieved
+                    else _build_kb_bounded_shortfall_answer(
+                        question,
+                        trimmed_history,
+                        route_mode=route_mode,
+                        agent_key=payload.agent_key,
                     )
                 )
 
-        if perf_counter() - start > chat_total_timeout and not answer:
-            answer = (
-                _fast_retrieval_answer(question, retrieved)
-                if retrieved
-                else _build_kb_bounded_shortfall_answer(
-                    question,
-                    trimmed_history,
-                    route_mode=route_mode,
-                )
-            )
-
         if (
-            route_mode in {MODEL_ROUTE_HYBRID, MODEL_ROUTE_LOCAL_ONLY, MODEL_ROUTE_RETRIEVAL_ONLY}
+            route_mode in {MODEL_ROUTE_LOCAL_ONLY, MODEL_ROUTE_RETRIEVAL_ONLY}
             and not retrieved
             and len(answer) < 160
         ):
@@ -1523,6 +1750,7 @@ def chat_completion(
                 question,
                 trimmed_history,
                 route_mode=route_mode,
+                agent_key=payload.agent_key,
             )
 
         answer = _enhance_student_balance_answer(question, answer, retrieved)

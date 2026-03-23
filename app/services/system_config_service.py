@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -8,6 +10,40 @@ from app.core.config import settings
 
 DEFAULT_CONTEXT_MAX_ROUNDS = 10
 DEFAULT_CONTEXT_MAX_TOKENS = 3000
+_CONFIG_CACHE_TTL_SECONDS = 12.0
+_CONFIG_VALUES_CACHE: dict[tuple[str, ...], tuple[float, dict[str, str]]] = {}
+
+
+def get_config_values(db: Session, keys: list[str]) -> dict[str, str]:
+    if not keys:
+        return {}
+    normalized_keys = tuple(sorted(set(keys)))
+    cache_hit = _CONFIG_VALUES_CACHE.get(normalized_keys)
+    now = time.time()
+    if cache_hit is not None:
+        expires_at, cached_values = cache_hit
+        if expires_at > now:
+            return dict(cached_values)
+        _CONFIG_VALUES_CACHE.pop(normalized_keys, None)
+
+    rows = list(
+        db.scalars(
+            select(SysConfig).where(
+                SysConfig.config_key.in_(normalized_keys),
+                SysConfig.is_deleted == 0,
+            )
+        ).all()
+    )
+    output = {
+        item.config_key: item.config_value
+        for item in rows
+        if item.config_key and item.config_value is not None
+    }
+    _CONFIG_VALUES_CACHE[normalized_keys] = (
+        now + _CONFIG_CACHE_TTL_SECONDS,
+        dict(output),
+    )
+    return output
 
 
 def list_system_configs(db: Session) -> list[SysConfig]:
@@ -43,6 +79,7 @@ def upsert_system_config(
         item.is_deleted = 0
     db.commit()
     db.refresh(item)
+    _CONFIG_VALUES_CACHE.clear()
     return item
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import logging
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -9,10 +10,20 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.chat import ConversationSetting
 from app.services.system_config_service import (
-    get_float_config,
-    get_int_config,
-    get_str_config,
+    get_config_values,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_fusion_mode(raw_mode: str | None) -> str:
+    mode = (raw_mode or settings.retrieval_fusion_mode).strip().lower()
+    if mode == "simple":
+        logger.info("fusion_mode=simple mapped to weighted compatibility mode")
+        return "weighted"
+    if mode not in {"weighted", "rrf"}:
+        return "weighted"
+    return mode
 
 
 def _normalize_retrieval_config(
@@ -23,14 +34,12 @@ def _normalize_retrieval_config(
         config.get("score_threshold") or settings.retrieval_score_threshold
     )
     alpha = float(config.get("alpha") or settings.retrieval_alpha)
-    fusion_mode = str(config.get("fusion_mode") or settings.retrieval_fusion_mode)
+    fusion_mode = _normalize_fusion_mode(str(config.get("fusion_mode") or ""))
 
-    # Real-time oriented defaults to keep end-to-end response under 30s.
-    top_k = max(2, min(8, top_k))
-    threshold = max(0.1, min(0.5, threshold))
+    # Keep aligned with xjtuexer debug panel semantics while preserving safeguards.
+    top_k = max(1, min(20, top_k))
+    threshold = max(0.0, min(1.0, threshold))
     alpha = max(0.0, min(1.0, alpha))
-    if fusion_mode not in {"weighted", "rrf"}:
-        fusion_mode = "weighted"
 
     normalized: dict[str, float | int | str] = {
         "retrieval_top_k": top_k,
@@ -41,18 +50,38 @@ def _normalize_retrieval_config(
     return normalized
 
 
+def _safe_int(value: str | int | float | None, default: int) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: str | int | float | None, default: float) -> float:
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def get_global_retrieval_config(db: Session) -> dict[str, float | int | str]:
+    raw = get_config_values(
+        db,
+        [
+            "retrieval_top_k",
+            "retrieval_score_threshold",
+            "retrieval_fusion_mode",
+            "retrieval_alpha",
+        ],
+    )
     config = {
-        "retrieval_top_k": get_int_config(
-            db, "retrieval_top_k", settings.retrieval_top_k
+        "retrieval_top_k": _safe_int(raw.get("retrieval_top_k"), settings.retrieval_top_k),
+        "score_threshold": _safe_float(
+            raw.get("retrieval_score_threshold"),
+            settings.retrieval_score_threshold,
         ),
-        "score_threshold": get_float_config(
-            db, "retrieval_score_threshold", settings.retrieval_score_threshold
-        ),
-        "fusion_mode": get_str_config(
-            db, "retrieval_fusion_mode", settings.retrieval_fusion_mode
-        ),
-        "alpha": get_float_config(db, "retrieval_alpha", settings.retrieval_alpha),
+        "fusion_mode": str(raw.get("retrieval_fusion_mode") or settings.retrieval_fusion_mode),
+        "alpha": _safe_float(raw.get("retrieval_alpha"), settings.retrieval_alpha),
     }
     return _normalize_retrieval_config(config)
 

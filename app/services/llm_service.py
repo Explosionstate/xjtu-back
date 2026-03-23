@@ -10,6 +10,10 @@ from typing import Any
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
+from app.services.agent_profile_service import (
+    build_agent_output_hint,
+    get_agent_no_answer_strategy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,9 +125,13 @@ def answer_with_llm(
     contexts: list[str],
     llm_enabled: bool | None = None,
     system_instruction: str | None = None,
+    agent_key: str | None = None,
     timeout_seconds: int | None = None,
     allow_general_knowledge: bool = False,
     retry_on_failure: bool = True,
+    kb_hit: bool | None = None,
+    retrieval_contexts: list[str] | None = None,
+    background_contexts: list[str] | None = None,
 ) -> LLMAnswerResult:
     enabled = settings.llm_enabled if llm_enabled is None else llm_enabled
     if not enabled or not settings.api_key:
@@ -131,10 +139,35 @@ def answer_with_llm(
 
     style = _detect_answer_style(question)
     profile = STYLE_PROFILES.get(style, STYLE_PROFILES["direct"])
-    compact_contexts = _compact_contexts(
-        contexts=contexts,
+    raw_retrieval_contexts = (
+        list(retrieval_contexts)
+        if retrieval_contexts is not None
+        else ([] if kb_hit is False else list(contexts))
+    )
+    compact_retrieval_contexts = _compact_contexts(
+        contexts=raw_retrieval_contexts,
         limit=profile.context_limit,
         max_chars=profile.context_chars,
+    )
+    if kb_hit is None:
+        kb_hit = bool(compact_retrieval_contexts)
+    if not kb_hit:
+        compact_retrieval_contexts = []
+
+    raw_background_contexts = (
+        list(background_contexts)
+        if background_contexts is not None
+        else ([] if retrieval_contexts is None else list(contexts))
+    )
+    compact_background_contexts = _compact_contexts(
+        contexts=raw_background_contexts,
+        limit=2,
+        max_chars=360,
+    )
+    agent_hint = build_agent_output_hint(
+        agent_key,
+        kb_hit=kb_hit,
+        allow_general_knowledge=allow_general_knowledge,
     )
 
     academic_prompt = ""
@@ -147,46 +180,27 @@ def answer_with_llm(
             "4) 下周行动计划（3条，可执行）\n"
         )
 
-    base_policy = (
-        "你是知识库问答助手。优先基于给定资料作答，资料不足时可结合通用知识，但不得编造具体事实。\n"
-        if allow_general_knowledge
-        else "你是知识库问答助手。必须基于给定资料作答，不得编造事实。\n"
+    prompt = _build_structured_prompt(
+        question=question,
+        system_instruction=system_instruction,
+        academic_prompt=academic_prompt,
+        style_profile=profile,
+        retrieval_contexts=compact_retrieval_contexts,
+        background_contexts=compact_background_contexts,
+        kb_hit=bool(kb_hit),
+        allow_general_knowledge=allow_general_knowledge,
+        agent_key=agent_key,
     )
-    general_hint = (
-        "4) 当前允许通用知识回答：当检索资料不足时，可结合模型通用知识与上下文给出完整回答，"
-        "并明确区分“资料依据”与“通用判断”。\n\n"
-        if allow_general_knowledge
-        else "\n"
-    )
-    if allow_general_knowledge and not compact_contexts:
-        prompt = (
-            f"{(system_instruction or '').strip()}\n"
-            "你是对话助手，请直接、自然地回答用户问题。\n"
-            "可使用通用知识，但不要编造具体数据或未确认事实。\n"
-            f"问题：{question}"
-        )
-    else:
-        prompt = (
-            f"{(system_instruction or '').strip()}\n"
-            f"{academic_prompt}"
-            f"{base_policy}"
-            f"回答类型：{profile.style}\n"
-            f"组织建议：{profile.organization_hint}\n"
-            "写作要求：\n"
-            "1) 优先回答用户当前问题，再补充必要依据。\n"
-            "2) 不要机械套用固定模板，按问题自然组织段落。\n"
-            "3) 资料不足时，明确不确定边界，并给出下一步可执行建议。\n"
-            f"{general_hint}"
-            f"问题：{question}\n\n"
-            f"资料：\n{chr(10).join(compact_contexts) if compact_contexts else '（当前未检索到高置信资料）'}"
-        )
 
-    if allow_general_knowledge:
+    if allow_general_knowledge and not kb_hit:
         prompt = _build_cloud_direct_prompt(
             question=question,
-            compact_contexts=compact_contexts,
+            compact_contexts=compact_background_contexts,
             system_instruction=system_instruction,
+            no_answer_rules=get_agent_no_answer_strategy(agent_key),
         )
+    if agent_hint:
+        prompt = f"{agent_hint}\n{prompt}"
 
     effective_timeout = max(
         2,
@@ -196,28 +210,31 @@ def answer_with_llm(
             else settings.llm_timeout_seconds
         ),
     )
-    if allow_general_knowledge:
+    if allow_general_knowledge and not kb_hit:
         # Keep cloud direct-chat mode under the frontend request budget.
-        timeout_cap = 30 if not compact_contexts else 26
+        timeout_cap = 30 if not compact_retrieval_contexts else 26
         effective_timeout = min(effective_timeout, timeout_cap)
 
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
     effective_tokens = max(120, min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens))
-    if allow_general_knowledge:
+    if allow_general_knowledge and not kb_hit:
         effective_tokens = min(effective_tokens, 180)
-    if allow_general_knowledge and not compact_contexts:
+    if allow_general_knowledge and not compact_retrieval_contexts:
         effective_tokens = min(effective_tokens, 140)
 
     base_timeout = max(6, effective_timeout)
     call_plan: list[tuple[str, str, int, int]] = [
         ("primary", prompt, base_timeout, effective_tokens)
     ]
-    if allow_general_knowledge and retry_on_failure:
+    if allow_general_knowledge and retry_on_failure and not kb_hit:
         retry_prompt = _build_compact_retry_prompt(
             question=question,
-            compact_contexts=compact_contexts,
+            compact_contexts=compact_background_contexts,
             system_instruction=system_instruction,
+            no_answer_rules=get_agent_no_answer_strategy(agent_key),
         )
+        if agent_hint:
+            retry_prompt = f"{agent_hint}\n{retry_prompt}"
         retry_timeout = 6
         retry_tokens = max(96, min(180, effective_tokens))
         call_plan.append(("retry", retry_prompt, retry_timeout, retry_tokens))
@@ -248,7 +265,7 @@ def answer_with_llm(
                 attempt_timeout,
                 attempt_tokens,
                 elapsed_ms,
-                len(compact_contexts),
+                len(compact_retrieval_contexts),
             )
             if not answer or len(answer) < 18:
                 continue
@@ -285,10 +302,60 @@ def answer_with_llm(
     return LLMAnswerResult(
         answer=_fallback_natural_answer(
             question,
-            compact_contexts,
+            compact_retrieval_contexts,
             allow_general_knowledge=allow_general_knowledge,
+            agent_key=agent_key,
         ),
         mode=fallback_mode,
+    )
+
+
+def _build_structured_prompt(
+    *,
+    question: str,
+    system_instruction: str | None,
+    academic_prompt: str,
+    style_profile: AnswerStyleProfile,
+    retrieval_contexts: list[str],
+    background_contexts: list[str],
+    kb_hit: bool,
+    allow_general_knowledge: bool,
+    agent_key: str | None,
+) -> str:
+    evidence_block = "\n".join(f"- {item}" for item in retrieval_contexts[:4])
+    background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
+    no_answer_rules = get_agent_no_answer_strategy(agent_key)
+    no_answer_hint = "；".join(no_answer_rules[:2]) if no_answer_rules else "明确边界并给下一步。"
+
+    if kb_hit:
+        evidence_policy = (
+            "知识库已命中：先给结论，再给1-2条关键证据；"
+            "证据不足处明确写“暂无法确认”。"
+        )
+    elif allow_general_knowledge:
+        evidence_policy = (
+            "知识库未命中：可结合通用知识回答，但需要明确哪些是通用判断。"
+        )
+    else:
+        evidence_policy = (
+            "知识库未命中：不编造事实；"
+            f"按该智能体无答案策略执行：{no_answer_hint}"
+        )
+
+    return (
+        f"{(system_instruction or '').strip()}\n"
+        f"{academic_prompt}"
+        "你是知识库增强问答助手。\n"
+        f"{evidence_policy}\n"
+        f"回答类型：{style_profile.style}\n"
+        f"组织建议：{style_profile.organization_hint}\n"
+        "写作要求：\n"
+        "1) 第一段直接回答用户问题，不写寒暄。\n"
+        "2) 有证据时尽量贴合证据原意，不要泛化改写成空话。\n"
+        "3) 无证据时自然说明不足，并给最小可执行建议。\n"
+        f"问题：{question}\n\n"
+        f"知识库证据：\n{evidence_block or '（未命中高置信知识库证据）'}\n\n"
+        f"背景补充（可选）：\n{background_block or '（无额外背景）'}"
     )
 
 
@@ -296,14 +363,16 @@ def _build_compact_retry_prompt(
     question: str,
     compact_contexts: list[str],
     system_instruction: str | None = None,
+    no_answer_rules: tuple[str, ...] = (),
 ) -> str:
     context_block = ""
     if compact_contexts:
         context_block = "\n".join(f"- {item}" for item in compact_contexts[:2])
+    fallback_line = "；".join(no_answer_rules[:2]) if no_answer_rules else "明确边界并给可执行下一步"
     return (
         f"{(system_instruction or '').strip()}\n"
         "你是对话助手，请直接回答用户问题，优先给出可执行结论。"
-        "若信息不足，请明确不确定边界，不要编造事实。\n"
+        f"若信息不足，请{fallback_line}，不要编造事实。\n"
         f"问题：{question}\n"
         f"参考信息：\n{context_block or '（暂无可靠参考信息）'}"
     )
@@ -313,16 +382,18 @@ def _build_cloud_direct_prompt(
     question: str,
     compact_contexts: list[str],
     system_instruction: str | None = None,
+    no_answer_rules: tuple[str, ...] = (),
 ) -> str:
     context_block = ""
     if compact_contexts:
         context_block = "\n".join(f"- {item}" for item in compact_contexts[:2])
+    fallback_line = "；".join(no_answer_rules[:2]) if no_answer_rules else "自然说明信息不足并给补充建议"
     return (
         f"{(system_instruction or '').strip()}\n"
         "你是对话助手，请像常规聊天模型一样直接回答用户问题，先给结论，再给简要依据。\n"
-        "如果信息不足，请明确不确定边界，不要编造事实。\n"
+        f"如果信息不足，请{fallback_line}，不要编造事实。\n"
         f"问题：{question}\n"
-        f"可选参考：\n{context_block or '（无强相关知识库片段）'}"
+        f"可选参考上下文：\n{context_block or '（无额外上下文）'}"
     )
 
 
@@ -344,15 +415,18 @@ def _fallback_natural_answer(
     question: str,
     contexts: list[str],
     allow_general_knowledge: bool = False,
+    agent_key: str | None = None,
 ) -> str:
     style = _detect_answer_style(question)
     q = (question or "").strip().lower()
     question_focus = (question or "").strip()[:80] or "当前问题"
+    no_answer_rules = get_agent_no_answer_strategy(agent_key)
+    no_answer_text = "；".join(no_answer_rules[:2]) if no_answer_rules else "补充关键事实后继续"
 
     if not contexts:
         if allow_general_knowledge:
             return _render_general_knowledge_fallback(style, question_focus)
-        return _render_no_context_fallback(style, question_focus)
+        return _render_no_context_fallback(style, question_focus, no_answer_text)
 
     merged = "\n".join(contexts)
 
@@ -392,7 +466,7 @@ def _fallback_natural_answer(
     if not cleaned:
         if allow_general_knowledge:
             return _render_general_knowledge_fallback(style, question_focus)
-        return _render_no_context_fallback(style, question_focus)
+        return _render_no_context_fallback(style, question_focus, no_answer_text)
 
     evidence_lines = cleaned[:4]
     return _render_context_fallback(style, question_focus, evidence_lines, q)
@@ -454,16 +528,20 @@ def _normalize_answer_text(answer: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
-def _render_no_context_fallback(style: str, question_focus: str) -> str:
+def _render_no_context_fallback(
+    style: str,
+    question_focus: str,
+    no_answer_text: str,
+) -> str:
     if style == "comparison":
         return (
             f"当前还缺少可比依据，暂时不能对“{question_focus}”给出可靠对比结论。\n"
-            "你可以补充：比较对象、评价维度（如成本/效果/风险）和时间范围。"
+            f"建议：{no_answer_text}。"
         )
     if style == "summary":
         return (
             f"当前资料不足，暂时无法对“{question_focus}”做有效摘要。\n"
-            "建议先补充目标文档范围或主题关键词，我再按重点清单快速整理。"
+            f"建议：{no_answer_text}。"
         )
     if style == "guidance":
         return (
@@ -473,38 +551,38 @@ def _render_no_context_fallback(style: str, question_focus: str) -> str:
     if style == "analysis":
         return (
             f"目前缺少支撑“{question_focus}”的关键证据，无法做可靠原因判断。\n"
-            "建议补充事件背景、时间线和关键指标，我再给出有证据链的分析。"
+            f"建议：{no_answer_text}。"
         )
     return (
         f"当前资料不足，暂时无法直接回答“{question_focus}”。\n"
-        "你可以补充对象、时间范围和已知事实，我会给出更贴题的结论。"
+        f"建议：{no_answer_text}。"
     )
 
 
 def _render_general_knowledge_fallback(style: str, question_focus: str) -> str:
     if style == "comparison":
         return (
-            f"当前知识库未命中“{question_focus}”的直接资料，我先基于通用经验给你比较框架：\n"
+            f"关于“{question_focus}”，我先按通用经验给你比较框架：\n"
             "1) 先定评价维度（效果/成本/风险）；2) 再按维度打分；3) 最后按你的优先级做取舍。"
         )
     if style == "summary":
         return (
-            f"当前知识库未命中“{question_focus}”的有效片段。\n"
-            "我可先给你通用摘要模板：背景、核心要点、风险提示、下一步行动。"
+            f"关于“{question_focus}”，我先给你一个可直接使用的通用摘要结构：\n"
+            "背景、核心要点、风险提示、下一步行动。"
         )
     if style == "guidance":
         return (
-            f"当前资料不足，但“{question_focus}”可先按通用路径执行：\n"
+            f"关于“{question_focus}”，可先按这条通用路径执行：\n"
             "1) 明确目标与约束；2) 拆分可执行步骤；3) 每步设置检查点并滚动调整。"
         )
     if style == "analysis":
         return (
-            f"当前知识库证据不足，我先给“{question_focus}”的通用分析框架：\n"
+            f"关于“{question_focus}”，我先给你通用分析框架：\n"
             "现象 -> 可能成因 -> 影响范围 -> 验证指标 -> 处置优先级。"
         )
     return (
-        f"当前知识库暂未命中“{question_focus}”的直接资料。\n"
-        "我先基于通用知识给出可执行答案；若你补充业务上下文，我可再细化到场景级结论。"
+        f"我先基于通用知识回答“{question_focus}”；"
+        "你补充业务上下文后，我可以继续细化到场景级结论。"
     )
 
 

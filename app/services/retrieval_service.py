@@ -1,22 +1,33 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from collections import defaultdict
+from copy import deepcopy
+import time
 
 from rank_bm25 import BM25Okapi
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.document import DocumentChunk
 from app.models.knowledge_base import KnowledgeBase
-from app.core.config import settings
+from app.services.agent_profile_service import (
+    get_agent_retrieval_focus_terms,
+    get_agent_source_bias,
+    normalize_agent_key,
+)
 from app.services.embedding_service import embed_query, normalize_embedding_model_name
 from app.services.reranker_service import rerank_candidates
 from app.vectorstore.chroma_manager import search_similar_chunks
 
+_RETRIEVAL_CACHE_TTL_SECONDS = 18.0
+_RETRIEVAL_CACHE_MAX_SIZE = 256
+_RETRIEVAL_CACHE: dict[str, tuple[float, list[dict], list[dict]]] = {}
+
 
 def _tokenize(text: str) -> list[str]:
-    cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", text.lower())
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", (text or "").lower())
     return [tok for tok in cleaned.split() if tok]
 
 
@@ -80,8 +91,21 @@ def _is_guidance_query(query: str) -> bool:
 
 
 def _is_student_growth_agent(agent_key: str | None) -> bool:
-    key = (agent_key or "").strip().lower()
-    return key in {"student-growth", "student_growth", "student"}
+    key = normalize_agent_key(agent_key)
+    return key == "student-growth"
+
+
+def _expand_query_for_agent(agent_key: str | None, query: str) -> str:
+    base = (query or "").strip()
+    if not base:
+        return base
+    focus_terms = list(get_agent_retrieval_focus_terms(agent_key))
+    if not focus_terms:
+        return base
+    supplements = [term for term in focus_terms if term and term not in base][:4]
+    if not supplements:
+        return base
+    return f"{base}\n检索侧重点: {'、'.join(supplements)}"
 
 
 def _is_mojibake_text(content: str) -> bool:
@@ -91,37 +115,35 @@ def _is_mojibake_text(content: str) -> bool:
     replacement_ratio = text.count("�") / max(1, len(text))
     if replacement_ratio >= 0.03:
         return True
-    mojibake_markers = ["Ã", "Â", "ä¸", "ç", "å", "æ", "ï¼", "é"]
+    mojibake_markers = ["脙", "脗", "盲赂", "莽", "氓", "忙", "茂录", "茅"]
     marker_hits = sum(text.count(marker) for marker in mojibake_markers)
     return marker_hits >= 12 and marker_hits / max(1, len(text)) > 0.05
 
 
 def _source_weight(agent_key: str | None, source_location: str, query: str) -> float:
-    if not _is_student_growth_agent(agent_key):
-        return 1.0
-
     src = (source_location or "").lower()
     q = (query or "").lower()
-    positive = ["学生", "学业", "成长", "指南", "手册", "学习", "预警", "辅导"]
-    negative = [
-        "xjtu-back",
-        "xjtu-front",
-        "readme",
-        "ops.py",
-        "接口",
-        "部署",
-        "开发",
-        "脚本",
-        "api",
-    ]
+    positive, negative = get_agent_source_bias(agent_key)
 
     weight = 1.0
-    if any(key in q for key in ["学业", "学生", "学习", "成长", "指南", "建议"]):
-        if any(token in src for token in positive):
+    if any(token.lower() in src for token in positive):
+        weight *= 1.2
+    if any(token.lower() in src for token in negative):
+        weight *= 0.5
+
+    normalized_agent_key = normalize_agent_key(agent_key)
+    if normalized_agent_key == "risk-warning" and any(
+        token in q for token in ["风险", "预警", "异常", "warning"]
+    ):
+        if "risk" in src or "warning" in src or "预警" in src:
+            weight *= 1.18
+    if normalized_agent_key == "policy-qa" and any(
+        token in q for token in ["政策", "条例", "制度", "规范"]
+    ):
+        if any(token in src for token in ["policy", "条例", "制度", "规范", "办法"]):
             weight *= 1.22
-        if any(token in src for token in negative):
-            weight *= 0.35
-    return max(0.2, min(1.4, weight))
+
+    return max(0.2, min(1.5, weight))
 
 
 def _is_academic_query(query: str) -> bool:
@@ -166,6 +188,9 @@ def _keyword_bonus(query: str, source_location: str, content: str) -> float:
         ("成长", 0.08),
         ("建议", 0.08),
         ("生活", 0.06),
+        ("政策", 0.10),
+        ("条例", 0.08),
+        ("预警", 0.09),
     ]
     for keyword, weight in keyword_weights:
         if keyword in q and (keyword in src or keyword in body[:260]):
@@ -195,15 +220,67 @@ def _fuse_weighted(
     }
 
 
-def _fuse_rrf(
-    bm25_rank: list[str], dense_rank: list[str], k: int = 60
-) -> dict[str, float]:
+def _fuse_rrf(bm25_rank: list[str], dense_rank: list[str], k: int = 60) -> dict[str, float]:
     score_map: dict[str, float] = defaultdict(float)
     for rank, chunk_id in enumerate(bm25_rank):
         score_map[chunk_id] += 1.0 / (k + rank + 1)
     for rank, chunk_id in enumerate(dense_rank):
         score_map[chunk_id] += 1.0 / (k + rank + 1)
     return dict(score_map)
+
+
+def _build_retrieval_cache_key(
+    *,
+    query: str,
+    kb_ids: list[str],
+    document_ids: list[str] | None,
+    top_k: int,
+    score_threshold: float,
+    fusion_mode: str,
+    alpha: float,
+    agent_key: str | None,
+) -> str:
+    kb_key = ",".join(sorted(dict.fromkeys(kb_ids)))
+    doc_key = ",".join(sorted(dict.fromkeys(document_ids or [])))
+    return "|".join(
+        [
+            query.strip(),
+            kb_key,
+            doc_key,
+            str(int(top_k)),
+            f"{float(score_threshold):.4f}",
+            fusion_mode.strip().lower(),
+            f"{float(alpha):.4f}",
+            normalize_agent_key(agent_key),
+        ]
+    )
+
+
+def _retrieval_cache_get(cache_key: str) -> tuple[list[dict], list[dict]] | None:
+    entry = _RETRIEVAL_CACHE.get(cache_key)
+    if not entry:
+        return None
+    expires_at, cached_results, cached_debug_rows = entry
+    if expires_at <= time.time():
+        _RETRIEVAL_CACHE.pop(cache_key, None)
+        return None
+    return deepcopy(cached_results), deepcopy(cached_debug_rows)
+
+
+def _retrieval_cache_put(
+    cache_key: str,
+    *,
+    results: list[dict],
+    debug_rows: list[dict],
+) -> None:
+    if len(_RETRIEVAL_CACHE) >= _RETRIEVAL_CACHE_MAX_SIZE:
+        oldest_key = next(iter(_RETRIEVAL_CACHE))
+        _RETRIEVAL_CACHE.pop(oldest_key, None)
+    _RETRIEVAL_CACHE[cache_key] = (
+        time.time() + _RETRIEVAL_CACHE_TTL_SECONDS,
+        deepcopy(results),
+        deepcopy(debug_rows),
+    )
 
 
 def hybrid_retrieve(
@@ -245,44 +322,63 @@ def hybrid_retrieve_with_debug(
     if _is_small_talk(query):
         return [], []
 
+    query_text = _expand_query_for_agent(agent_key, query)
+    cache_key = _build_retrieval_cache_key(
+        query=query_text,
+        kb_ids=kb_ids,
+        document_ids=document_ids,
+        top_k=top_k,
+        score_threshold=score_threshold,
+        fusion_mode=fusion_mode,
+        alpha=alpha,
+        agent_key=agent_key,
+    )
+    cached_payload = _retrieval_cache_get(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
+    unique_kb_ids = list(dict.fromkeys(kb_ids or []))
+    if not unique_kb_ids:
+        return [], []
+
     local_top_k = int(top_k)
     local_threshold = float(score_threshold)
     if _is_student_growth_agent(agent_key):
-        local_top_k = min(local_top_k, 5)
-        local_threshold = max(local_threshold, 0.28)
-    max_candidates = max(120, int(local_top_k) * 60)
-    stmt = select(DocumentChunk).where(DocumentChunk.kb_id.in_(kb_ids))
+        local_top_k = min(local_top_k, 12)
+        local_threshold = max(local_threshold, 0.22)
+
+    max_candidates = min(420, max(64, int(local_top_k) * 28))
+    if document_ids:
+        max_candidates = min(420, max(max_candidates, 96))
+
+    stmt = select(DocumentChunk).where(DocumentChunk.kb_id.in_(unique_kb_ids))
     if document_ids:
         stmt = stmt.where(DocumentChunk.document_id.in_(document_ids))
     stmt = stmt.order_by(desc(DocumentChunk.created_at)).limit(max_candidates)
     chunk_rows = list(db.scalars(stmt).all())
-    chunk_rows = [
-        row for row in chunk_rows if not _looks_like_schema_chunk(row.content)
-    ]
-    if _is_summary_style_query(query):
-        chunk_rows = [
-            row for row in chunk_rows if not _looks_like_command_chunk(row.content)
-        ]
-    if _is_summary_style_query(query) or _is_guidance_query(query):
-        chunk_rows = [
-            row for row in chunk_rows if not _looks_like_noise_chunk(row.content)
-        ]
+
+    chunk_rows = [row for row in chunk_rows if not _looks_like_schema_chunk(row.content)]
+    if _is_summary_style_query(query_text):
+        chunk_rows = [row for row in chunk_rows if not _looks_like_command_chunk(row.content)]
+    if _is_summary_style_query(query_text) or _is_guidance_query(query_text):
+        chunk_rows = [row for row in chunk_rows if not _looks_like_noise_chunk(row.content)]
     chunk_rows = [row for row in chunk_rows if not _is_mojibake_text(row.content)]
 
-    if _is_guidance_query(query) or _is_academic_query(query):
-        q_tokens = set(_tokenize(query))
+    if _is_guidance_query(query_text) or _is_academic_query(query_text):
+        q_tokens = set(_tokenize(query_text))
         if q_tokens:
             chunk_rows = sorted(
                 chunk_rows,
                 key=lambda row: _token_overlap_score(q_tokens, row.content),
                 reverse=True,
-            )[: max(100, local_top_k * 20)]
+            )[: max(64, local_top_k * 16)]
+
     if not chunk_rows:
         return [], []
 
     corpus = [row.content for row in chunk_rows]
     corpus_tokens = [_tokenize(text) for text in corpus]
-    query_tokens = _tokenize(query)
+    query_tokens = _tokenize(query_text)
     bm25 = BM25Okapi(corpus_tokens)
     bm25_raw_scores = bm25.get_scores(query_tokens)
 
@@ -290,48 +386,50 @@ def hybrid_retrieve_with_debug(
     bm25_norm: dict[str, float] = {}
     bm25_ranked: list[str] = []
     for idx, row in enumerate(chunk_rows):
-        score = float(bm25_raw_scores[idx])
-        bm25_scores[row.id] = score
+        bm25_scores[row.id] = float(bm25_raw_scores[idx])
     bm25_ranked = [
         cid
-        for cid, _ in sorted(
-            bm25_scores.items(), key=lambda item: item[1], reverse=True
-        )[: local_top_k * 2]
-    ]
+        for cid, _ in sorted(bm25_scores.items(), key=lambda item: item[1], reverse=True)
+    ][: local_top_k * 2]
     bm25_norm = _normalize_scores(bm25_scores)
 
     dense_scores: dict[str, float] = {}
     dense_norm: dict[str, float] = {}
     dense_ranked: list[str] = []
     chunk_cache = {row.id: row for row in chunk_rows}
+
     kb_model_map = {
         item.id: item.embedding_model
         for item in db.scalars(
-            select(KnowledgeBase).where(KnowledgeBase.id.in_(kb_ids))
+            select(KnowledgeBase).where(KnowledgeBase.id.in_(unique_kb_ids))
         ).all()
     }
-    for kb_id in kb_ids:
+
+    dense_top_k = min(12, max(local_top_k * 2, local_top_k + 1))
+    query_embedding_cache: dict[str, list[float]] = {}
+    for kb_id in unique_kb_ids:
         model_name = normalize_embedding_model_name(
             kb_model_map.get(kb_id, settings.default_embedding_model)
         )
-        query_embedding = embed_query(query=query, model_name=model_name)
+        query_embedding = query_embedding_cache.get(model_name)
+        if query_embedding is None:
+            query_embedding = embed_query(query=query_text, model_name=model_name)
+            query_embedding_cache[model_name] = query_embedding
+
         for item in search_similar_chunks(
             kb_id=kb_id,
-            query=query,
-            top_k=local_top_k * 2,
+            query=query_text,
+            top_k=dense_top_k,
             query_embedding=query_embedding,
         ):
             chunk_id = item["chunk_id"]
             if chunk_id in chunk_cache:
-                dense_scores[chunk_id] = max(
-                    dense_scores.get(chunk_id, 0.0), item["score"]
-                )
+                dense_scores[chunk_id] = max(dense_scores.get(chunk_id, 0.0), float(item["score"]))
+
     dense_ranked = [
         cid
-        for cid, _ in sorted(
-            dense_scores.items(), key=lambda item: item[1], reverse=True
-        )[: local_top_k * 2]
-    ]
+        for cid, _ in sorted(dense_scores.items(), key=lambda item: item[1], reverse=True)
+    ][: local_top_k * 2]
     dense_norm = _normalize_scores(dense_scores)
 
     if fusion_mode == "rrf":
@@ -341,10 +439,8 @@ def hybrid_retrieve_with_debug(
 
     sorted_ids = [
         chunk_id
-        for chunk_id, score in sorted(
-            fused.items(), key=lambda item: item[1], reverse=True
-        )
-    ][: max(local_top_k * 3, local_top_k)]
+        for chunk_id, _ in sorted(fused.items(), key=lambda item: item[1], reverse=True)
+    ][: max(local_top_k * 2 + 2, local_top_k)]
 
     results: list[dict] = []
     for chunk_id in sorted_ids:
@@ -363,29 +459,26 @@ def hybrid_retrieve_with_debug(
                 "fused_score": float(fused.get(chunk_id, 0.0)),
                 "score_before_rerank": float(fused.get(chunk_id, 0.0)),
                 "score": float(fused.get(chunk_id, 0.0)),
-                "source_weight": _source_weight(
-                    agent_key, row.source_location or "", query
-                ),
+                "source_weight": _source_weight(agent_key, row.source_location or "", query_text),
             }
         )
 
     reranked = rerank_candidates(
-        query=query,
+        query=query_text,
         candidates=results,
         model_name=settings.reranker_model,
     )
 
     for item in reranked:
         base_score = float(item.get("score", 0.0)) + _keyword_bonus(
-            query=query,
+            query=query_text,
             source_location=str(item.get("source_location") or ""),
             content=str(item.get("content") or ""),
         )
         item["score"] = base_score * float(item.get("source_weight", 1.0))
 
-    reranked = sorted(
-        reranked, key=lambda it: float(it.get("score", 0.0)), reverse=True
-    )
+    reranked = sorted(reranked, key=lambda it: float(it.get("score", 0.0)), reverse=True)
+
     debug_rows = [
         {
             "chunk_id": item["chunk_id"],
@@ -403,7 +496,12 @@ def hybrid_retrieve_with_debug(
         }
         for item in reranked
     ]
-    filtered = [
-        item for item in reranked if float(item.get("score", 0.0)) >= local_threshold
-    ]
-    return filtered[:local_top_k], debug_rows
+
+    filtered = [item for item in reranked if float(item.get("score", 0.0)) >= local_threshold]
+    result_payload = filtered[:local_top_k]
+    _retrieval_cache_put(
+        cache_key,
+        results=result_payload,
+        debug_rows=debug_rows,
+    )
+    return result_payload, debug_rows

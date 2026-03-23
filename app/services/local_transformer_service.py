@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
@@ -48,7 +48,7 @@ def _resolve_transformer_model_reference(model_name: str | None) -> str:
     reference = resolve_model_reference(candidate)
     if not Path(reference).exists():
         raise BusinessError(
-            f"未找到本地Transformer模型: {candidate}，请先下载到本地模型目录。",
+            f"未找到本地 Transformer 模型: {candidate}，请先下载到本地模型目录。",
             status_code=500,
         )
     return reference
@@ -59,7 +59,7 @@ def _get_local_model(model_reference: str):
     torch_module, model_cls, tokenizer_cls = _load_runtime_modules()
     if tokenizer_cls is None or model_cls is None:
         raise BusinessError(
-            "未安装 transformers，无法加载本地Transformer模型。",
+            "未安装 transformers，无法加载本地 Transformer 模型。",
             status_code=500,
         )
 
@@ -80,7 +80,7 @@ def _get_local_model(model_reference: str):
             )
             model = model.to("cuda")
         except Exception:
-            # Fallback to CPU when CUDA is unavailable at runtime or VRAM is insufficient.
+            # Fallback to CPU when CUDA is unavailable or VRAM is insufficient.
             model = model_cls.from_pretrained(
                 model_reference,
                 trust_remote_code=True,
@@ -95,25 +95,62 @@ def _get_local_model(model_reference: str):
     return tokenizer, model
 
 
-def _build_prompt(question: str, contexts: list[str]) -> str:
+def _build_prompt(
+    question: str,
+    contexts: list[str],
+    system_instruction: str | None = None,
+    kb_hit: bool | None = None,
+) -> str:
     style = _detect_answer_style(question)
-    context_block = "\n\n".join(
-        item.strip()[:1200] for item in contexts[:4] if item.strip()
-    )
+    evidence_contexts: list[str] = []
+    background_contexts: list[str] = []
+    for item in contexts[:5]:
+        text = item.strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if "[证据" in text or "来源:" in text or "相关度:" in text:
+            evidence_contexts.append(text[:1200])
+            continue
+        if "[会话背景]" in text or "[用户画像]" in text or "背景" in lowered:
+            background_contexts.append(text[:600])
+            continue
+        if kb_hit is True:
+            evidence_contexts.append(text[:1200])
+        else:
+            background_contexts.append(text[:600])
+
+    evidence_block = "\n".join(f"- {item}" for item in evidence_contexts[:4])
+    background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
+
     style_hint = {
         "direct": "先直接回答，再补充必要依据。",
-        "analysis": "先给判断，再解释原因与影响。",
+        "analysis": "先给判断，再解释主要原因与影响。",
         "comparison": "按差异维度并列对比后给建议。",
         "guidance": "按步骤给出可执行方案。",
         "summary": "提炼 3-5 条重点信息。",
     }.get(style, "按问题自然组织回答。")
+
+    instruction_block = ""
+    if system_instruction and system_instruction.strip():
+        instruction_block = f"系统指令:\n{system_instruction.strip()}\n\n"
+
+    if kb_hit is True:
+        kb_hint = "知识库已命中：请先给结论，再给1-2条证据，不要泛聊。"
+    elif kb_hit is False:
+        kb_hint = "知识库未命中：请自然说明边界并给最小可执行建议，不要编造事实。"
+    else:
+        kb_hint = "优先基于知识库回答，证据不足时明确边界。"
+
     return (
+        f"{instruction_block}"
         "你是西交AI助手，请基于检索资料回答。"
-        "若资料不足请明确指出，不要编造。"
+        f"{kb_hint}"
         "不要机械套用固定模板。"
         f"{style_hint}\n\n"
-        f"问题：{question}\n\n"
-        f"资料：\n{context_block}"
+        f"问题: {question}\n\n"
+        f"知识库证据:\n{evidence_block or '（暂无高置信证据）'}\n\n"
+        f"背景补充:\n{background_block or '（无额外背景）'}"
     )
 
 
@@ -123,9 +160,11 @@ def generate_answer_with_local_transformer(
     model_name: str | None = None,
     temperature: float | None = None,
     max_new_tokens: int | None = None,
+    system_instruction: str | None = None,
+    kb_hit: bool | None = None,
 ) -> tuple[str, str, dict[str, int | str | bool]]:
     if not settings.local_transformer_enabled:
-        raise BusinessError("本地Transformer模型已禁用", status_code=400)
+        raise BusinessError("本地 Transformer 模型已禁用", status_code=400)
 
     model_reference = _resolve_transformer_model_reference(model_name)
     acquired = _GENERATION_SEMAPHORE.acquire(
@@ -145,7 +184,12 @@ def generate_answer_with_local_transformer(
 
     try:
         style = _detect_answer_style(question)
-        prompt = _build_prompt(question=question, contexts=contexts)
+        prompt = _build_prompt(
+            question=question,
+            contexts=contexts,
+            system_instruction=system_instruction,
+            kb_hit=kb_hit,
+        )
         model_inputs = tokenizer(prompt, return_tensors="pt")
         if hasattr(model, "device"):
             model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
