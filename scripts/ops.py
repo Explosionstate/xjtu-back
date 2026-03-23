@@ -164,6 +164,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if args.reload:
         cmd.append("--reload")
+        cmd.extend(["--reload-dir", "app"])
+        cmd.extend(["--reload-dir", "scripts"])
     if python_exe != sys.executable:
         print(f"[INFO] Using interpreter with uvicorn: {python_exe}")
     print("[INFO] Starting:", " ".join(cmd))

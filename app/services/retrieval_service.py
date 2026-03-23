@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from collections import defaultdict
@@ -90,6 +90,23 @@ def _is_guidance_query(query: str) -> bool:
     return any(flag in q for flag in flags)
 
 
+def _is_stress_conflict_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    flags = [
+        "期末",
+        "考试",
+        "焦虑",
+        "熬夜",
+        "效率",
+        "冲突",
+        "换届",
+        "选举",
+        "任务太多",
+        "看不进",
+    ]
+    return any(flag in q for flag in flags)
+
+
 def _is_student_growth_agent(agent_key: str | None) -> bool:
     key = normalize_agent_key(agent_key)
     return key == "student-growth"
@@ -142,6 +159,12 @@ def _source_weight(agent_key: str | None, source_location: str, query: str) -> f
     ):
         if any(token in src for token in ["policy", "条例", "制度", "规范", "办法"]):
             weight *= 1.22
+
+    if normalized_agent_key == "student-growth" and _is_stress_conflict_query(q):
+        if any(token in src for token in ["成长", "学情", "预警", "辅导员", "心理"]):
+            weight *= 1.15
+        if any(token in src for token in ["问答", "政策", "条例", "制度"]):
+            weight *= 0.72
 
     return max(0.2, min(1.5, weight))
 
@@ -220,7 +243,9 @@ def _fuse_weighted(
     }
 
 
-def _fuse_rrf(bm25_rank: list[str], dense_rank: list[str], k: int = 60) -> dict[str, float]:
+def _fuse_rrf(
+    bm25_rank: list[str], dense_rank: list[str], k: int = 60
+) -> dict[str, float]:
     score_map: dict[str, float] = defaultdict(float)
     for rank, chunk_id in enumerate(bm25_rank):
         score_map[chunk_id] += 1.0 / (k + rank + 1)
@@ -357,11 +382,17 @@ def hybrid_retrieve_with_debug(
     stmt = stmt.order_by(desc(DocumentChunk.created_at)).limit(max_candidates)
     chunk_rows = list(db.scalars(stmt).all())
 
-    chunk_rows = [row for row in chunk_rows if not _looks_like_schema_chunk(row.content)]
+    chunk_rows = [
+        row for row in chunk_rows if not _looks_like_schema_chunk(row.content)
+    ]
     if _is_summary_style_query(query_text):
-        chunk_rows = [row for row in chunk_rows if not _looks_like_command_chunk(row.content)]
+        chunk_rows = [
+            row for row in chunk_rows if not _looks_like_command_chunk(row.content)
+        ]
     if _is_summary_style_query(query_text) or _is_guidance_query(query_text):
-        chunk_rows = [row for row in chunk_rows if not _looks_like_noise_chunk(row.content)]
+        chunk_rows = [
+            row for row in chunk_rows if not _looks_like_noise_chunk(row.content)
+        ]
     chunk_rows = [row for row in chunk_rows if not _is_mojibake_text(row.content)]
 
     if _is_guidance_query(query_text) or _is_academic_query(query_text):
@@ -389,7 +420,9 @@ def hybrid_retrieve_with_debug(
         bm25_scores[row.id] = float(bm25_raw_scores[idx])
     bm25_ranked = [
         cid
-        for cid, _ in sorted(bm25_scores.items(), key=lambda item: item[1], reverse=True)
+        for cid, _ in sorted(
+            bm25_scores.items(), key=lambda item: item[1], reverse=True
+        )
     ][: local_top_k * 2]
     bm25_norm = _normalize_scores(bm25_scores)
 
@@ -424,11 +457,15 @@ def hybrid_retrieve_with_debug(
         ):
             chunk_id = item["chunk_id"]
             if chunk_id in chunk_cache:
-                dense_scores[chunk_id] = max(dense_scores.get(chunk_id, 0.0), float(item["score"]))
+                dense_scores[chunk_id] = max(
+                    dense_scores.get(chunk_id, 0.0), float(item["score"])
+                )
 
     dense_ranked = [
         cid
-        for cid, _ in sorted(dense_scores.items(), key=lambda item: item[1], reverse=True)
+        for cid, _ in sorted(
+            dense_scores.items(), key=lambda item: item[1], reverse=True
+        )
     ][: local_top_k * 2]
     dense_norm = _normalize_scores(dense_scores)
 
@@ -459,7 +496,9 @@ def hybrid_retrieve_with_debug(
                 "fused_score": float(fused.get(chunk_id, 0.0)),
                 "score_before_rerank": float(fused.get(chunk_id, 0.0)),
                 "score": float(fused.get(chunk_id, 0.0)),
-                "source_weight": _source_weight(agent_key, row.source_location or "", query_text),
+                "source_weight": _source_weight(
+                    agent_key, row.source_location or "", query_text
+                ),
             }
         )
 
@@ -477,7 +516,9 @@ def hybrid_retrieve_with_debug(
         )
         item["score"] = base_score * float(item.get("source_weight", 1.0))
 
-    reranked = sorted(reranked, key=lambda it: float(it.get("score", 0.0)), reverse=True)
+    reranked = sorted(
+        reranked, key=lambda it: float(it.get("score", 0.0)), reverse=True
+    )
 
     debug_rows = [
         {
@@ -497,7 +538,9 @@ def hybrid_retrieve_with_debug(
         for item in reranked
     ]
 
-    filtered = [item for item in reranked if float(item.get("score", 0.0)) >= local_threshold]
+    filtered = [
+        item for item in reranked if float(item.get("score", 0.0)) >= local_threshold
+    ]
     result_payload = filtered[:local_top_k]
     _retrieval_cache_put(
         cache_key,

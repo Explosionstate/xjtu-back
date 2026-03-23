@@ -39,6 +39,27 @@ _STAGE_TIMEOUT_SECONDS = {
 }
 
 
+def _find_cached_analysis_any_term(
+    login_name: str,
+    term_code: str | None,
+) -> AcademicAnalysisResponse | None:
+    now = perf_counter()
+    with _ANALYSIS_CACHE_LOCK:
+        exact = _ANALYSIS_CACHE.get((login_name, term_code))
+        if exact:
+            return exact[1]
+
+        latest: tuple[float, AcademicAnalysisResponse] | None = None
+        for (cached_login, _cached_term), cache_item in _ANALYSIS_CACHE.items():
+            if cached_login != login_name:
+                continue
+            if latest is None or cache_item[0] > latest[0]:
+                latest = cache_item
+        if latest and (now - latest[0]) <= 3600:
+            return latest[1]
+    return None
+
+
 def get_my_academic_analysis(
     login_name: str, term_code: str | None = None
 ) -> AcademicAnalysisResponse:
@@ -68,6 +89,7 @@ def get_my_academic_analysis(
                 stage="profile",
                 supplier=lambda: _query_academic_user_role(db, normalized_login_name),
                 default=None,
+                critical=True,
             )
             if actor_role and actor_role != "student":
                 raise BusinessError(
@@ -80,6 +102,7 @@ def get_my_academic_analysis(
                 stage="profile",
                 supplier=lambda: _query_student_profile(db, normalized_login_name),
                 default=None,
+                critical=True,
             )
             if student_row is None:
                 raise BusinessError(
@@ -92,6 +115,7 @@ def get_my_academic_analysis(
                 stage="profile",
                 supplier=lambda: _resolve_term(db, normalized_term_code),
                 default=None,
+                critical=True,
             )
             if term_row is None:
                 raise BusinessError("No term data available", status_code=404)
@@ -203,6 +227,18 @@ def get_my_academic_analysis(
     except BusinessError:
         raise
     except SQLAlchemyError as exc:
+        stale = _find_cached_analysis_any_term(
+            normalized_login_name,
+            normalized_term_code,
+        )
+        if stale is not None:
+            logger.warning(
+                "academic analysis degraded to cached result: login=%s term=%s err=%s",
+                normalized_login_name,
+                normalized_term_code,
+                exc.__class__.__name__,
+            )
+            return stale
         raise BusinessError("Academic database query failed", status_code=502) from exc
     except Exception as exc:  # pragma: no cover
         raise BusinessError(
@@ -214,23 +250,29 @@ def _apply_query_timeout(db: Session) -> None:
     if not settings.academic_db_url.startswith("mysql"):
         return
     timeout_ms = max(1, int(settings.academic_query_timeout_seconds * 1000))
-    db.execute(
-        text("SET SESSION MAX_EXECUTION_TIME = :timeout_ms"),
-        {"timeout_ms": timeout_ms},
-    )
+    try:
+        db.execute(
+            text("SET SESSION MAX_EXECUTION_TIME = :timeout_ms"),
+            {"timeout_ms": timeout_ms},
+        )
+    except SQLAlchemyError as exc:
+        logger.warning("academic apply timeout failed: %s", exc.__class__.__name__)
 
 
 def _set_session_timeout(db: Session, timeout_seconds: int) -> None:
     if not settings.academic_db_url.startswith("mysql"):
         return
     timeout_ms = max(1, int(timeout_seconds * 1000))
-    db.execute(
-        text("SET SESSION MAX_EXECUTION_TIME = :timeout_ms"),
-        {"timeout_ms": timeout_ms},
-    )
+    try:
+        db.execute(
+            text("SET SESSION MAX_EXECUTION_TIME = :timeout_ms"),
+            {"timeout_ms": timeout_ms},
+        )
+    except SQLAlchemyError as exc:
+        logger.warning("academic set timeout failed: %s", exc.__class__.__name__)
 
 
-def _run_stage(db: Session, stage: str, supplier, default):
+def _run_stage(db: Session, stage: str, supplier, default, critical: bool = False):
     timeout_seconds = _STAGE_TIMEOUT_SECONDS.get(
         stage,
         max(1, int(settings.academic_query_timeout_seconds)),
@@ -245,10 +287,14 @@ def _run_stage(db: Session, stage: str, supplier, default):
     except SQLAlchemyError as exc:
         elapsed_ms = int((perf_counter() - stage_start) * 1000)
         logger.warning("academic stage %s failed in %sms: %s", stage, elapsed_ms, exc)
+        if critical:
+            raise
         return default
     except Exception as exc:
         elapsed_ms = int((perf_counter() - stage_start) * 1000)
         logger.warning("academic stage %s error in %sms: %s", stage, elapsed_ms, exc)
+        if critical:
+            raise
         return default
     finally:
         _apply_query_timeout(db)

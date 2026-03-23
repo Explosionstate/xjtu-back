@@ -76,11 +76,11 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
     ),
     "guidance": AnswerStyleProfile(
         style="guidance",
-        context_limit=4,
-        context_chars=720,
-        max_tokens=320,
-        temperature_floor=0.22,
-        top_p=0.9,
+        context_limit=3,
+        context_chars=560,
+        max_tokens=300,
+        temperature_floor=0.2,
+        top_p=0.86,
         frequency_penalty=0.3,
         presence_penalty=0.12,
         organization_hint="按可执行步骤输出，每步写清目标与动作。",
@@ -180,19 +180,31 @@ def answer_with_llm(
             "4) 下周行动计划（3条，可执行）\n"
         )
 
-    prompt = _build_structured_prompt(
-        question=question,
-        system_instruction=system_instruction,
-        academic_prompt=academic_prompt,
-        style_profile=profile,
-        retrieval_contexts=compact_retrieval_contexts,
-        background_contexts=compact_background_contexts,
-        kb_hit=bool(kb_hit),
-        allow_general_knowledge=allow_general_knowledge,
-        agent_key=agent_key,
+    open_answer_mode = allow_general_knowledge and not _is_academic_analysis_query(
+        question
     )
+    if open_answer_mode:
+        prompt = _build_open_answer_prompt(
+            question=question,
+            style_profile=profile,
+            background_contexts=compact_background_contexts,
+            retrieval_contexts=compact_retrieval_contexts,
+            system_instruction=system_instruction,
+        )
+    else:
+        prompt = _build_structured_prompt(
+            question=question,
+            system_instruction=system_instruction,
+            academic_prompt=academic_prompt,
+            style_profile=profile,
+            retrieval_contexts=compact_retrieval_contexts,
+            background_contexts=compact_background_contexts,
+            kb_hit=bool(kb_hit),
+            allow_general_knowledge=allow_general_knowledge,
+            agent_key=agent_key,
+        )
 
-    if allow_general_knowledge and not kb_hit:
+    if allow_general_knowledge and not kb_hit and not open_answer_mode:
         prompt = _build_cloud_direct_prompt(
             question=question,
             compact_contexts=compact_background_contexts,
@@ -210,13 +222,17 @@ def answer_with_llm(
             else settings.llm_timeout_seconds
         ),
     )
-    if allow_general_knowledge and not kb_hit:
+    if open_answer_mode:
+        effective_timeout = min(effective_timeout, 18)
+    elif allow_general_knowledge and not kb_hit:
         # Keep cloud direct-chat mode under the frontend request budget.
         timeout_cap = 30 if not compact_retrieval_contexts else 26
         effective_timeout = min(effective_timeout, timeout_cap)
 
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
     effective_tokens = max(120, min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens))
+    if open_answer_mode:
+        effective_tokens = min(effective_tokens, 220)
     if allow_general_knowledge and not kb_hit:
         effective_tokens = min(effective_tokens, 180)
     if allow_general_knowledge and not compact_retrieval_contexts:
@@ -226,6 +242,32 @@ def answer_with_llm(
     call_plan: list[tuple[str, str, int, int]] = [
         ("primary", prompt, base_timeout, effective_tokens)
     ]
+    if open_answer_mode and retry_on_failure:
+        open_retry_prompt = _build_compact_retry_prompt(
+            question=question,
+            compact_contexts=compact_background_contexts,
+            system_instruction=system_instruction,
+            no_answer_rules=get_agent_no_answer_strategy(agent_key),
+        )
+        if agent_hint:
+            open_retry_prompt = f"{agent_hint}\n{open_retry_prompt}"
+        call_plan.append(
+            (
+                "open_retry",
+                open_retry_prompt,
+                6,
+                max(120, min(180, effective_tokens)),
+            )
+        )
+        open_final_prompt = _build_cloud_direct_prompt(
+            question=question,
+            compact_contexts=compact_background_contexts[:1],
+            system_instruction=system_instruction,
+            no_answer_rules=get_agent_no_answer_strategy(agent_key),
+        )
+        if agent_hint:
+            open_final_prompt = f"{agent_hint}\n{open_final_prompt}"
+        call_plan.append(("open_final", open_final_prompt, 6, 140))
     if allow_general_knowledge and retry_on_failure and not kb_hit:
         retry_prompt = _build_compact_retry_prompt(
             question=question,
@@ -289,6 +331,8 @@ def answer_with_llm(
             )
             if timeout_like:
                 # Timeout often indicates upstream congestion; avoid stacking waits.
+                if attempt_name == "primary" and len(call_plan) > 1:
+                    continue
                 break
             continue
 
@@ -299,10 +343,15 @@ def answer_with_llm(
         )
 
     fallback_mode = "timeout_fallback" if timeout_detected else "error_fallback"
+    fallback_contexts: list[str] = []
+    if compact_background_contexts:
+        fallback_contexts.extend(compact_background_contexts[:2])
+    if compact_retrieval_contexts and not allow_general_knowledge:
+        fallback_contexts.extend(compact_retrieval_contexts[:1])
     return LLMAnswerResult(
         answer=_fallback_natural_answer(
             question,
-            compact_retrieval_contexts,
+            fallback_contexts,
             allow_general_knowledge=allow_general_knowledge,
             agent_key=agent_key,
         ),
@@ -325,21 +374,19 @@ def _build_structured_prompt(
     evidence_block = "\n".join(f"- {item}" for item in retrieval_contexts[:4])
     background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
     no_answer_rules = get_agent_no_answer_strategy(agent_key)
-    no_answer_hint = "；".join(no_answer_rules[:2]) if no_answer_rules else "明确边界并给下一步。"
+    no_answer_hint = (
+        "；".join(no_answer_rules[:2]) if no_answer_rules else "明确边界并给下一步。"
+    )
 
     if kb_hit:
         evidence_policy = (
-            "知识库已命中：先给结论，再给1-2条关键证据；"
-            "证据不足处明确写“暂无法确认”。"
+            "知识库已命中：先独立给出判断，再用1条证据做校验；不要复读证据原文。"
         )
     elif allow_general_knowledge:
-        evidence_policy = (
-            "知识库未命中：可结合通用知识回答，但需要明确哪些是通用判断。"
-        )
+        evidence_policy = "知识库未命中：可结合通用知识回答，但需要明确哪些是通用判断。"
     else:
         evidence_policy = (
-            "知识库未命中：不编造事实；"
-            f"按该智能体无答案策略执行：{no_answer_hint}"
+            f"知识库未命中：不编造事实；按该智能体无答案策略执行：{no_answer_hint}"
         )
 
     return (
@@ -351,11 +398,43 @@ def _build_structured_prompt(
         f"组织建议：{style_profile.organization_hint}\n"
         "写作要求：\n"
         "1) 第一段直接回答用户问题，不写寒暄。\n"
-        "2) 有证据时尽量贴合证据原意，不要泛化改写成空话。\n"
-        "3) 无证据时自然说明不足，并给最小可执行建议。\n"
+        "2) 优先给你的推理与建议，不要把回答写成知识库摘录。\n"
+        "3) 有证据时只用一句“可参考线索”点到为止。\n"
+        "4) 无证据时自然说明不足，并给最小可执行建议。\n"
         f"问题：{question}\n\n"
         f"知识库证据：\n{evidence_block or '（未命中高置信知识库证据）'}\n\n"
         f"背景补充（可选）：\n{background_block or '（无额外背景）'}"
+    )
+
+
+def _build_open_answer_prompt(
+    *,
+    question: str,
+    style_profile: AnswerStyleProfile,
+    background_contexts: list[str],
+    retrieval_contexts: list[str],
+    system_instruction: str | None,
+) -> str:
+    background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
+    evidence_hint = retrieval_contexts[0] if retrieval_contexts else ""
+    evidence_block = (
+        f"\n可参考线索（只在最后一句提及）：\n- {evidence_hint}"
+        if evidence_hint
+        else ""
+    )
+    return (
+        f"{(system_instruction or '').strip()}\n"
+        "你是对话助手，请先独立回答用户真正想解决的问题。\n"
+        f"回答类型：{style_profile.style}\n"
+        f"组织建议：{style_profile.organization_hint}\n"
+        "写作要求：\n"
+        "1) 第一段必须直接回答，不要先复述背景。\n"
+        "2) 以你的判断、分析和建议为主，不要把回答写成资料摘要。\n"
+        "3) 如果有参考线索，只能在最后用一句“可参考线索”轻量提及。\n"
+        "4) 不要逐条照抄知识库原文，不要输出“本轮可提炼重点如下”。\n"
+        f"问题：{question}\n\n"
+        f"背景补充：\n{background_block or '（无额外背景）'}"
+        f"{evidence_block}"
     )
 
 
@@ -368,7 +447,11 @@ def _build_compact_retry_prompt(
     context_block = ""
     if compact_contexts:
         context_block = "\n".join(f"- {item}" for item in compact_contexts[:2])
-    fallback_line = "；".join(no_answer_rules[:2]) if no_answer_rules else "明确边界并给可执行下一步"
+    fallback_line = (
+        "；".join(no_answer_rules[:2])
+        if no_answer_rules
+        else "明确边界并给可执行下一步"
+    )
     return (
         f"{(system_instruction or '').strip()}\n"
         "你是对话助手，请直接回答用户问题，优先给出可执行结论。"
@@ -387,7 +470,11 @@ def _build_cloud_direct_prompt(
     context_block = ""
     if compact_contexts:
         context_block = "\n".join(f"- {item}" for item in compact_contexts[:2])
-    fallback_line = "；".join(no_answer_rules[:2]) if no_answer_rules else "自然说明信息不足并给补充建议"
+    fallback_line = (
+        "；".join(no_answer_rules[:2])
+        if no_answer_rules
+        else "自然说明信息不足并给补充建议"
+    )
     return (
         f"{(system_instruction or '').strip()}\n"
         "你是对话助手，请像常规聊天模型一样直接回答用户问题，先给结论，再给简要依据。\n"
@@ -421,12 +508,19 @@ def _fallback_natural_answer(
     q = (question or "").strip().lower()
     question_focus = (question or "").strip()[:80] or "当前问题"
     no_answer_rules = get_agent_no_answer_strategy(agent_key)
-    no_answer_text = "；".join(no_answer_rules[:2]) if no_answer_rules else "补充关键事实后继续"
+    no_answer_text = (
+        "；".join(no_answer_rules[:2]) if no_answer_rules else "补充关键事实后继续"
+    )
 
     if not contexts:
         if allow_general_knowledge:
             return _render_general_knowledge_fallback(style, question_focus)
-        return _render_no_context_fallback(style, question_focus, no_answer_text)
+        return _render_no_context_fallback(
+            style,
+            question_focus,
+            no_answer_text,
+            q,
+        )
 
     merged = "\n".join(contexts)
 
@@ -466,7 +560,12 @@ def _fallback_natural_answer(
     if not cleaned:
         if allow_general_knowledge:
             return _render_general_knowledge_fallback(style, question_focus)
-        return _render_no_context_fallback(style, question_focus, no_answer_text)
+        return _render_no_context_fallback(
+            style,
+            question_focus,
+            no_answer_text,
+            q,
+        )
 
     evidence_lines = cleaned[:4]
     return _render_context_fallback(style, question_focus, evidence_lines, q)
@@ -482,15 +581,78 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
-    if any(token in q for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]):
+    if _looks_like_decision_guidance_query(q):
+        return "guidance"
+    if any(
+        token in q
+        for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]
+    ):
         return "comparison"
+    if any(
+        token in q
+        for token in [
+            "怎么",
+            "如何",
+            "步骤",
+            "方案",
+            "计划",
+            "建议",
+            "修复",
+            "排查",
+            "优化",
+        ]
+    ):
+        return "guidance"
     if any(token in q for token in ["总结", "概述", "重点", "梳理", "归纳", "总览"]):
         return "summary"
-    if any(token in q for token in ["怎么", "如何", "步骤", "方案", "计划", "建议", "修复", "排查", "优化"]):
-        return "guidance"
-    if any(token in q for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]):
+    if any(
+        token in q
+        for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]
+    ):
         return "analysis"
     return "direct"
+
+
+def _looks_like_decision_guidance_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    decision_markers = ["还是", "要不要", "选择", "纠结", "不知道"]
+    path_markers = ["跨考", "考研", "读研", "实习", "就业", "方向", "大厂"]
+    return any(marker in q for marker in decision_markers) and any(
+        marker in q for marker in path_markers
+    )
+
+
+def _looks_like_stress_conflict_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    stress_markers = ["焦虑", "熬夜", "效率低", "看不进", "崩溃", "很累"]
+    conflict_markers = ["期末", "考试", "换届", "社团", "撞在一起", "冲突"]
+    return any(marker in q for marker in stress_markers) and any(
+        marker in q for marker in conflict_markers
+    )
+
+
+def _render_decision_guidance_fallback(question_focus: str) -> str:
+    return (
+        f"先直接回答：对于“{question_focus}”，先不要急着做一次性押注，建议用 2-4 周做双轨验证。\n"
+        "1) 路线A：拿出固定时间验证更长期的方向，例如跨考或转向新领域；\n"
+        "2) 路线B：同步投递能尽快得到市场反馈的实习/项目；\n"
+        "3) 每周记录投入时长、完成度、反馈强弱；\n"
+        "4) 第4周按真实反馈做决定：哪条路更可持续、反馈更正向，就先押哪条。"
+    )
+
+
+def _render_stress_conflict_fallback(question_focus: str) -> str:
+    return (
+        f"先直接回答：像“{question_focus}”这种期末和社团事务撞车的情况，你现在最需要的不是继续硬扛，而是先止损，把睡眠和任务优先级拉回可控。\n"
+        "1) 今晚先做止损：不要再熬到很晚，只保留1个最关键学习任务，剩下的全部顺延；\n"
+        "2) 明天先拆任务：把事情分成“必须亲自做、可以委托、可以延后”三类，社团换届里能交接的立刻交接；\n"
+        "3) 复习只保主线：每次只学45分钟，先抓最可能影响期末结果的课程和题型，不追求全做完；\n"
+        "4) 给自己一个硬标准：连续两天睡眠不足或效率继续下滑，就必须减少社团投入，优先保考试。"
+    )
 
 
 def _compact_contexts(contexts: list[str], limit: int, max_chars: int) -> list[str]:
@@ -532,6 +694,7 @@ def _render_no_context_fallback(
     style: str,
     question_focus: str,
     no_answer_text: str,
+    normalized_question: str,
 ) -> str:
     if style == "comparison":
         return (
@@ -544,9 +707,17 @@ def _render_no_context_fallback(
             f"建议：{no_answer_text}。"
         )
     if style == "guidance":
+        if _looks_like_stress_conflict_query(normalized_question):
+            return _render_stress_conflict_fallback(question_focus)
+        if _looks_like_decision_guidance_query(normalized_question):
+            return _render_decision_guidance_fallback(question_focus)
         return (
-            f"关于“{question_focus}”，当前依据不足，但可以先按这三步推进：\n"
-            "1) 明确目标与约束；2) 给出已知事实；3) 我据此输出可执行步骤和风险检查点。"
+            f"关于“{question_focus}”，当前可引用资料不足，先给你一个可执行起步方案：\n"
+            "1) 先确定本周唯一主目标（例如通过期末或完成关键项目）；\n"
+            "2) 把目标拆成每天可完成的最小任务，并设置截止时间；\n"
+            "3) 每天结束前复盘一次完成率，次日优先处理未完成项；\n"
+            f"4) 同步补充事实信息（如时间冲突、资源约束），我再给你精确方案。\n"
+            f"建议：{no_answer_text}。"
         )
     if style == "analysis":
         return (
@@ -554,8 +725,7 @@ def _render_no_context_fallback(
             f"建议：{no_answer_text}。"
         )
     return (
-        f"当前资料不足，暂时无法直接回答“{question_focus}”。\n"
-        f"建议：{no_answer_text}。"
+        f"当前资料不足，暂时无法直接回答“{question_focus}”。\n建议：{no_answer_text}。"
     )
 
 
@@ -571,9 +741,15 @@ def _render_general_knowledge_fallback(style: str, question_focus: str) -> str:
             "背景、核心要点、风险提示、下一步行动。"
         )
     if style == "guidance":
+        if _looks_like_stress_conflict_query(question_focus):
+            return _render_stress_conflict_fallback(question_focus)
+        if _looks_like_decision_guidance_query(question_focus):
+            return _render_decision_guidance_fallback(question_focus)
         return (
-            f"关于“{question_focus}”，可先按这条通用路径执行：\n"
-            "1) 明确目标与约束；2) 拆分可执行步骤；3) 每步设置检查点并滚动调整。"
+            f"关于“{question_focus}”，可先按“目标-执行-校正”三阶段推进：\n"
+            "第一阶段（今天）：明确核心目标与不可妥协约束；\n"
+            "第二阶段（本周）：将任务拆成每日动作并安排固定执行时段；\n"
+            "第三阶段（每2天）：检查结果与偏差，必要时压缩低优先级事项。"
         )
     if style == "analysis":
         return (
@@ -592,32 +768,46 @@ def _render_context_fallback(
     evidence_lines: list[str],
     normalized_question: str,
 ) -> str:
-    summary = "；".join(evidence_lines[:4])
+    evidence_hint = (evidence_lines[0] or "").strip()[:52] if evidence_lines else ""
     if style == "comparison":
         return (
             f"基于当前命中内容，可先对“{question_focus}”做初步对比：\n"
-            f"- 关键依据：{summary}\n"
+            f"- 可参考线索：{evidence_hint or '当前命中资料'}\n"
             "- 若需最终结论，请补充明确的比较对象和决策优先级。"
         )
     if style == "summary":
         bullets = "\n".join(f"- {item}" for item in evidence_lines[:4])
         return f"本轮可提炼的重点如下：\n{bullets}"
     if style == "guidance":
+        if _looks_like_stress_conflict_query(normalized_question):
+            answer = _render_stress_conflict_fallback(question_focus)
+            if evidence_hint:
+                answer += f"\n可参考线索：{evidence_hint}。"
+            return answer
+        if _looks_like_decision_guidance_query(normalized_question):
+            answer = _render_decision_guidance_fallback(question_focus)
+            if evidence_hint:
+                answer += f"\n可参考线索：{evidence_hint}。"
+            return answer
         return (
-            f"结合现有资料，建议你围绕“{question_focus}”先执行：\n"
-            f"1) 锁定当前优先问题（依据：{evidence_lines[0]}）；\n"
-            "2) 制定本周可落地动作并设置检查点；\n"
-            "3) 下一轮补充执行结果，我再帮你迭代方案。"
+            f"结合现有资料，围绕“{question_focus}”建议执行以下计划：\n"
+            "1) 先锁定本周唯一主目标；\n"
+            "2) 将本周任务拆成“每日必做 + 可选优化”两层，先保必做；\n"
+            "3) 每天设置一个固定复盘点，记录完成率与阻塞原因；\n"
+            "4) 按复盘结果滚动调整计划，并优先处理高收益低成本事项。\n"
+            f"可参考线索：{evidence_hint or '当前命中资料'}。"
         )
-    if style == "analysis" or any(token in normalized_question for token in ["原因", "分析", "风险"]):
+    if style == "analysis" or any(
+        token in normalized_question for token in ["原因", "分析", "风险"]
+    ):
         return (
             f"初步判断：该问题可以从已有资料中部分解释。\n"
-            f"主要依据：{summary}。\n"
+            f"可参考线索：{evidence_hint or '当前命中资料'}。\n"
             "如果你希望更深入，我可以继续拆解成“成因-影响-优先级”三层分析。"
         )
     return (
-        f"目前能确认的是：{evidence_lines[0]}。\n"
-        f"补充依据：{summary}。\n"
+        f"目前可以先给你一个方向性答复：围绕“{question_focus}”，建议先做短周期验证，再做长期承诺。\n"
+        f"可参考线索：{evidence_hint or '当前命中资料'}。\n"
         "若需要更精确结论，请补充具体场景或约束条件。"
     )
 

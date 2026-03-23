@@ -18,6 +18,7 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
 from app.schemas.chat import ChatCompletionRequest, ChatThinking, SourceItem
 from app.services.agent_profile_service import (
+    build_agent_system_instruction,
     get_agent_no_answer_strategy,
     needs_profile_context,
     normalize_agent_key,
@@ -47,11 +48,11 @@ from app.services.system_config_service import (
 CHAT_TOTAL_TIMEOUT_SECONDS = 60
 WORKFLOW_TIMEOUT_SECONDS = 52
 GENERATION_STAGE_TIMEOUT_SECONDS = 28
-LOCAL_GENERATION_TIMEOUT_SECONDS = 12
+LOCAL_GENERATION_TIMEOUT_SECONDS = 20
 WORKFLOW_POLL_INTERVAL_SECONDS = 0.35
 NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS = 58
-NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS = 52
-NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS = 30
+NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS = 56
+NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS = 50
 ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 120
 ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 112
 ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
@@ -80,6 +81,11 @@ MODEL_ROUTE_HYBRID = "hybrid"
 MODEL_ROUTE_LOCAL_ONLY = "local_only"
 MODEL_ROUTE_RETRIEVAL_ONLY = "retrieval_only"
 
+QUESTION_MODE_OPEN = "open_question"
+QUESTION_MODE_FACT = "fact_lookup"
+QUESTION_MODE_ACADEMIC = "academic_analysis"
+QUESTION_MODE_CRISIS = "crisis"
+
 
 def _resolve_model_route_mode(
     payload: ChatCompletionRequest,
@@ -102,9 +108,9 @@ def _resolve_model_route_mode(
 
 def _model_route_desc(route_mode: str) -> str:
     return {
-        MODEL_ROUTE_CLOUD_ONLY: "云端模型直答（知识库可选增强）",
-        MODEL_ROUTE_HYBRID: "云端+本地协同（知识库增强）",
-        MODEL_ROUTE_LOCAL_ONLY: "仅本地模型（知识库约束）",
+        MODEL_ROUTE_CLOUD_ONLY: "云端模型直答（Qwen 主答，知识库按需校验）",
+        MODEL_ROUTE_HYBRID: "云端+本地协同（Qwen 主答，知识库轻量补充）",
+        MODEL_ROUTE_LOCAL_ONLY: "仅本地模型（Qwen 主答）",
         MODEL_ROUTE_RETRIEVAL_ONLY: "检索整理模式（未启用模型）",
     }.get(route_mode, route_mode)
 
@@ -126,10 +132,9 @@ def _compact_text(text: str, max_chars: int) -> str:
 
 
 def _is_long_term_memory_message(message: Message) -> bool:
-    return (
-        (message.role or "").strip().lower() == LONG_TERM_MEMORY_ROLE
-        and (message.content or "").startswith(LONG_TERM_MEMORY_PREFIX)
-    )
+    return (message.role or "").strip().lower() == LONG_TERM_MEMORY_ROLE and (
+        message.content or ""
+    ).startswith(LONG_TERM_MEMORY_PREFIX)
 
 
 def _extract_long_term_memory(history: list[Message]) -> str:
@@ -174,7 +179,9 @@ def _looks_like_key_user_context(text: str) -> bool:
 
 def _merge_memory_lines(existing_memory: str, new_lines: list[str]) -> str:
     merged_lines: list[str] = []
-    for raw in ([line for line in existing_memory.split("\n") if line.strip()] + new_lines):
+    for raw in [
+        line for line in existing_memory.split("\n") if line.strip()
+    ] + new_lines:
         line = raw.strip()
         if not line or line in merged_lines:
             continue
@@ -234,7 +241,8 @@ def _build_history_context_brief(
         sections.append(f"长期记忆:\n- {memory_block}")
     if user_lines:
         sections.append(
-            "近期用户问题:\n" + "\n".join(f"- {line}" for line in user_lines[-6:] if line)
+            "近期用户问题:\n"
+            + "\n".join(f"- {line}" for line in user_lines[-6:] if line)
         )
     if assistant_lines:
         sections.append(
@@ -272,7 +280,9 @@ def _build_retrieval_shortfall_answer(
         for item in trimmed_history
         if item.role == "user" and item.content.strip()
     ]
-    history_hint = "；".join(item for item in user_history[-2:] if item) or "暂无稳定历史事实"
+    history_hint = (
+        "；".join(item for item in user_history[-2:] if item) or "暂无稳定历史事实"
+    )
     if style == "comparison":
         return (
             f"当前资料不足，暂时无法对“{short_question}”给出可靠对比结论。\n"
@@ -330,25 +340,6 @@ def _build_kb_bounded_shortfall_answer(
     return base
 
 
-def _build_local_generation_degraded_answer(question: str, retrieved: list[dict]) -> str:
-    short_question = _compact_text(question, 80) or "当前问题"
-    snippets: list[str] = []
-    for item in retrieved[:3]:
-        text = _compact_text(str(item.get("content") or ""), 70)
-        if text:
-            snippets.append(text)
-    if not snippets:
-        return (
-            "当前为“仅本地 Qwen + 本地知识库”模式，本地模型暂不可用，且缺少可复用知识库片段。\n"
-            f"请稍后重试，或先补充可支撑“{short_question}”的本地知识库资料。"
-        )
-    return (
-        "当前为“仅本地 Qwen + 本地知识库”模式，本地模型暂不可用，已返回检索到的可用片段。\n"
-        f"问题：{short_question}\n"
-        + "\n".join(f"- {snippet}" for snippet in snippets)
-    )
-
-
 def _build_cloud_timeout_degraded_answer(
     question: str,
     trimmed_history: list[Message],
@@ -371,13 +362,41 @@ def _build_cloud_timeout_degraded_answer(
         if memory:
             hints.append(memory)
 
-    guidance = "\n".join(f"- {item}" for item in hints) if hints else "- 明确你的目标、约束和预期输出格式"
+    guidance = (
+        "\n".join(f"- {item}" for item in hints)
+        if hints
+        else "- 明确你的目标、约束和预期输出格式"
+    )
     return (
         "云端模型本轮响应超时，已返回快速可执行回答（不依赖知识库命中）。\n"
         f"问题：{focus}\n"
         "建议你按以下结构继续提问，以便下轮更快得到完整答案：\n"
         f"{guidance}\n"
         "- 将问题拆成 1~2 个子问题后再次提问"
+    )
+
+
+def _build_cloud_timeout_answer(
+    question: str,
+    retrieved: list[dict],
+    trimmed_history: list[Message],
+    long_term_memory: str,
+    agent_key: str | None,
+) -> str:
+    if retrieved:
+        retrieval_based = _fast_retrieval_answer(
+            question,
+            retrieved,
+            agent_key=agent_key,
+        )
+        return (
+            f"{retrieval_based}\n"
+            "（说明：云端模型本轮响应超时，以上为基于已命中知识库证据的快速回答。）"
+        )
+    return _build_cloud_timeout_degraded_answer(
+        question=question,
+        trimmed_history=trimmed_history,
+        long_term_memory=long_term_memory,
     )
 
 
@@ -395,14 +414,7 @@ def _format_retrieval_contexts_for_generation(
         if key in seen:
             continue
         seen.add(key)
-        source = _compact_text(str(item.get("source_location") or "未知来源"), 48) or "未知来源"
-        score = item.get("score")
-        score_text = ""
-        if isinstance(score, (int, float)):
-            score_text = f" | 相关度:{float(score):.3f}"
-        formatted.append(
-            f"[证据{len(formatted) + 1} | 来源:{source}{score_text}] {content}"
-        )
+        formatted.append(content)
         if len(formatted) >= limit:
             break
     return formatted
@@ -417,9 +429,7 @@ def _fast_retrieval_answer(
     lowered = (question or "").lower()
     no_answer_rules = get_agent_no_answer_strategy(agent_key)
     no_answer_hint = (
-        "；".join(no_answer_rules[:2])
-        if no_answer_rules
-        else "补充关键事实后继续"
+        "；".join(no_answer_rules[:2]) if no_answer_rules else "补充关键事实后继续"
     )
     agent_focus = {
         "student-growth": "学习成长",
@@ -460,10 +470,7 @@ def _fast_retrieval_answer(
                 f"当前资料不足，暂时无法给出稳妥执行方案（{agent_focus}）。\n"
                 f"建议：{no_answer_hint}。"
             )
-        return (
-            f"当前未检索到足够依据（{agent_focus}）。\n"
-            f"建议：{no_answer_hint}。"
-        )
+        return f"当前未检索到足够依据（{agent_focus}）。\n建议：{no_answer_hint}。"
 
     summarize_keywords = ["总结", "重点", "概述", "本周", "新增文档"]
     if any(token in question for token in summarize_keywords):
@@ -498,79 +505,31 @@ def _fast_retrieval_answer(
             snippets.append(content[:140])
     if not snippets:
         snippets = ["已检索到相关片段，但可直接引用的文本较少。"]
-    evidence = "；".join(snippets[:3])
+    evidence_hint = _compact_text(snippets[0], 42)
     if style == "comparison":
         return (
-            f"基于当前命中资料（{agent_focus}），可先对“{question[:30]}”做初步对比。\n"
-            f"关键依据：{evidence}\n"
-            "如需明确推荐，请补充比较对象与优先级。"
+            f"先给结论：围绕“{question[:26]}”，建议先按“投入产出、可持续性、机会成本”三维比较（{agent_focus}）。\n"
+            "1) 给两条路径分别打分（1-5分）；2) 用你最在意的维度做加权；3) 先执行高分路径2周试运行。\n"
+            f"可参考线索：{evidence_hint or '当前命中资料'}。"
         )
     if style == "analysis":
         return (
-            f"针对“{question[:30]}”（{agent_focus}），可以先给出初步分析判断。\n"
-            f"主要依据：{evidence}\n"
-            "你也可以继续追问具体原因链路或风险优先级。"
+            f"先给判断：关于“{question[:26]}”，当前核心矛盾通常不是“选错路”，而是“没有验证闭环”（{agent_focus}）。\n"
+            "建议按“目标-行动-反馈”三步推进：先定4周目标，再做每周动作，最后按结果调整方向。\n"
+            f"可参考线索：{evidence_hint or '当前命中资料'}。"
         )
     if style == "guidance":
         return (
-            f"围绕“{question[:30]}”（{agent_focus}），建议先按步骤执行：\n"
-            f"1) 优先处理最关键环节（依据：{snippets[0]}）；\n"
-            "2) 设置短周期检查点；\n"
-            "3) 根据执行结果再迭代细节。"
+            f"先给结论：对“{question[:26]}”，先别急着二选一，先做 4 周验证更稳妥（{agent_focus}）。\n"
+            "1) 每周固定两个时间块分别验证两条路线；\n"
+            "2) 每周末记录投入时长、完成度和反馈结果；\n"
+            "3) 第4周按真实反馈决策，而不是按情绪决策。\n"
+            f"可参考线索：{evidence_hint or '当前命中资料'}。"
         )
     return (
-        f"已基于检索结果回答“{question[:32]}”（{agent_focus}）。\n"
-        f"关键依据：{evidence}\n"
-        "如需更精确结论，可补充目标对象、时间范围或约束条件。"
-    )
-
-
-def _enhance_student_balance_answer(
-    question: str, answer: str, retrieved: list[dict]
-) -> str:
-    q = (question or "").strip()
-    q_lower = q.lower()
-    is_balance_topic = (
-        ("学习" in q and "生活" in q)
-        or any(token in q_lower for token in ["平衡", "作息", "精力", "疲劳"])
-    )
-    if not is_balance_topic:
-        return answer
-    if len((answer or "").strip()) >= 320:
-        return answer
-
-    points: list[str] = []
-    for item in retrieved:
-        content = str(item.get("content") or "").replace("\n", " ").strip()
-        content = re.sub(r"\s+", " ", content)
-        if not content:
-            continue
-        if any(
-            k in content
-            for k in ["登录名", "角色:", "学院/部门", "pip install", "requirements.txt"]
-        ):
-            continue
-        points.append(content[:60])
-        if len(points) >= 3:
-            break
-    evidence = (
-        "；".join(points)
-        if points
-        else "检索结果显示应同时兼顾学习推进与身心状态维护。"
-    )
-
-    return (
-        "结论：建议本周采用“学习主线 + 生活底线 + 周末复盘”三段式节奏，"
-        "确保成绩提升同时避免持续疲劳。\n"
-        f"依据：{evidence}\n"
-        "建议：1）周一到周五每天完成2个45分钟深度学习块（1个复习、1个作业/预习）；"
-        "2）每天固定30分钟运动并保证7小时以上睡眠；"
-        "3）每晚睡前15分钟整理次日三件最重要任务；"
-        "4）周三晚做一次中期检查，未完成任务及时降优先级；"
-        "5）周六上午集中补弱课程，下午安排社交或兴趣活动；"
-        "6）周日晚上20分钟复盘，记录有效方法与低效原因；"
-        "7）与同学结成互督小组，每周至少一次互测互评；"
-        "8）若连续两天低效，先保核心课程与作息，再逐步恢复其他安排。"
+        f"先给答复：围绕“{question[:28]}”，建议先做短周期验证再做长期承诺（{agent_focus}）。\n"
+        "你可以先跑 2-4 周小步试错，再根据结果决定下一阶段主路径。\n"
+        f"可参考线索：{evidence_hint or '当前命中资料'}。"
     )
 
 
@@ -578,15 +537,47 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
-    if any(token in q for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]):
+    if _looks_like_decision_guidance_query(q):
+        return "guidance"
+    if any(
+        token in q
+        for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]
+    ):
         return "comparison"
+    if any(
+        token in q
+        for token in [
+            "怎么",
+            "如何",
+            "步骤",
+            "方案",
+            "计划",
+            "建议",
+            "修复",
+            "排查",
+            "优化",
+        ]
+    ):
+        return "guidance"
     if any(token in q for token in ["总结", "概述", "重点", "梳理", "归纳", "总览"]):
         return "summary"
-    if any(token in q for token in ["怎么", "如何", "步骤", "方案", "计划", "建议", "修复", "排查", "优化"]):
-        return "guidance"
-    if any(token in q for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]):
+    if any(
+        token in q
+        for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]
+    ):
         return "analysis"
     return "direct"
+
+
+def _looks_like_decision_guidance_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    decision_markers = ["还是", "要不要", "选择", "纠结", "不知道"]
+    path_markers = ["跨考", "考研", "读研", "实习", "就业", "方向", "大厂"]
+    return any(marker in q for marker in decision_markers) and any(
+        marker in q for marker in path_markers
+    )
 
 
 def _get_latest_user_question(messages: list[dict]) -> str:
@@ -623,6 +614,14 @@ def _is_simple_greeting(question: str) -> bool:
 
 def _format_rule_answer(question: str) -> str | None:
     lowered = question.lower()
+    if _looks_like_crisis_query(question):
+        return (
+            "我听到你现在非常痛苦，这很重要：你不需要一个人扛。\n"
+            "先做两件事：\n"
+            "1) 立刻联系你信任的人（室友/同学/辅导员/家人），明确告诉对方“我现在状态很危险，需要你陪我”；\n"
+            "2) 如果你有伤害自己或结束生命的冲动，请马上拨打 120 或当地24小时心理危机热线，优先保证人身安全。\n"
+            "如果你愿意，我可以继续陪你，把今晚到明早的安全计划一步步写出来。"
+        )
     if _is_simple_greeting(question):
         return (
             "结论：你好，我是西交 AI 智能体。\n"
@@ -651,6 +650,22 @@ def _format_rule_answer(question: str) -> str | None:
             "`python scripts/ops.py check --probe`；如需重启用 `python scripts/ops.py restart --reload`。"
         )
     return None
+
+
+def _looks_like_crisis_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    markers = [
+        "离开这个世界",
+        "不想活",
+        "活着好累",
+        "想死",
+        "自杀",
+        "结束生命",
+        "轻生",
+    ]
+    return any(marker in q for marker in markers)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -700,14 +715,7 @@ def _build_retrieval_query(
         for item in history
         if item.role == "user" and item.content.strip()
     ]
-    assistant_snippets = [
-        _compact_text(item.content, 90)
-        for item in history
-        if item.role == "assistant" and item.content.strip()
-    ]
     snippets = [item for item in user_snippets[-3:] if item]
-    if assistant_snippets:
-        snippets.append(assistant_snippets[-1])
     memory = _compact_text(long_term_memory, 220)
     if memory:
         snippets.insert(0, f"长期记忆: {memory}")
@@ -727,6 +735,34 @@ def _expand_academic_query(agent_key: str | None, question: str) -> str:
         return (
             f"{q}\n"
             "请重点检索：学习成绩、课堂互动、学习时长、课程完成度、薄弱课程、改进建议。"
+        )
+    return q
+
+
+def _expand_student_growth_query(agent_key: str | None, question: str) -> str:
+    if not _is_student_growth_agent(agent_key):
+        return question
+    q = (question or "").strip()
+    if not q:
+        return q
+
+    stress_tokens = [
+        "期末",
+        "考试",
+        "焦虑",
+        "熬夜",
+        "效率",
+        "换届",
+        "选举",
+        "冲突",
+        "任务太多",
+        "看不进",
+    ]
+    if any(token in q for token in stress_tokens):
+        return (
+            f"{q}\n"
+            "请重点检索：期末复习、时间冲突、任务优先级、社团事务协调、焦虑缓解、"
+            "睡眠恢复、短周期执行计划、每日复盘。"
         )
     return q
 
@@ -787,6 +823,117 @@ def _is_guidance_query(question: str) -> bool:
     return any(flag in q for flag in flags)
 
 
+def _looks_like_fact_lookup_query(agent_key: str | None, question: str) -> bool:
+    normalized_agent = normalize_agent_key(agent_key)
+    if normalized_agent in {"policy-qa", "teacher-assistant", "risk-warning"}:
+        return True
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    fact_tokens = [
+        "政策",
+        "规定",
+        "流程",
+        "材料",
+        "申请",
+        "办理",
+        "时间",
+        "地点",
+        "要求",
+        "学分",
+        "绩点",
+        "选课",
+        "课程规则",
+        "怎么办理",
+        "是什么",
+        "在哪里",
+    ]
+    open_tokens = [
+        "焦虑",
+        "纠结",
+        "迷茫",
+        "痛苦",
+        "职业",
+        "方向",
+        "跨考",
+        "实习",
+        "怎么办",
+        "思路",
+    ]
+    return any(token in q for token in fact_tokens) and not any(
+        token in q for token in open_tokens
+    )
+
+
+def _resolve_question_mode(agent_key: str | None, question: str) -> str:
+    if _looks_like_crisis_query(question):
+        return QUESTION_MODE_CRISIS
+    if _is_academic_analysis_query(agent_key, question):
+        return QUESTION_MODE_ACADEMIC
+    if _looks_like_fact_lookup_query(agent_key, question):
+        return QUESTION_MODE_FACT
+    if _is_student_growth_agent(agent_key) or _is_guidance_query(question):
+        return QUESTION_MODE_OPEN
+    return QUESTION_MODE_FACT if "什么" in (question or "") else QUESTION_MODE_OPEN
+
+
+def _build_open_question_fallback(
+    question: str,
+    trimmed_history: list[Message],
+    long_term_memory: str = "",
+    profile_context: str = "",
+) -> str:
+    focus = _compact_text(question, 60) or "当前问题"
+    if _looks_like_stress_conflict_query(question):
+        return (
+            f"先直接回答：像“{focus}”这种考试和社团事务撞车的情况，你现在最需要的是先止损，而不是继续硬扛。\n"
+            "1) 今晚只保留一个最关键学习任务，其他任务全部顺延，不再继续熬夜；\n"
+            "2) 明天把社团事务分成“必须亲自做、可以委托、可以延后”三类，能交接的立刻交接；\n"
+            "3) 复习时只抓最影响期末结果的课程和题型，每次 45 分钟，中间强制休息；\n"
+            "4) 如果连续两天效率仍然很差，就先压缩社团投入，优先保考试和睡眠。"
+        )
+    if _looks_like_decision_guidance_query(question):
+        return (
+            f"先直接回答：对于“{focus}”，先不要急着二选一，建议用 2-4 周做双轨验证。\n"
+            "1) 给长期路线和短期路线各留一个固定时间块；\n"
+            "2) 一条路线看你能不能持续投入，另一条路线看外部反馈是否更好；\n"
+            "3) 每周末只看三个指标：投入时长、完成度、反馈强弱；\n"
+            "4) 第4周再决定把主要精力压到哪一条路。"
+        )
+    hints: list[str] = []
+    recent_user_questions = [
+        _compact_text(item.content, 44)
+        for item in trimmed_history
+        if item.role == "user" and item.content.strip()
+    ]
+    if recent_user_questions:
+        hints.append(f"你最近最关心的是：{recent_user_questions[-1]}")
+    if long_term_memory:
+        hints.append(f"长期约束：{_compact_text(long_term_memory, 60)}")
+    if profile_context:
+        hints.append(f"可用背景：{_compact_text(profile_context, 60)}")
+    hint_line = f"\n可用背景：{'；'.join(hints[:2])}。" if hints else ""
+    return (
+        f"先直接回答你这个问题：围绕“{focus}”，现在更重要的不是立刻找到唯一正确答案，而是先确定接下来 7 天最值得验证的一步。\n"
+        "建议你按这个顺序行动：\n"
+        "1) 先写下你最在意的 2 个决策标准；\n"
+        "2) 本周只验证 1 个最关键假设，不同时摊开太多选择；\n"
+        "3) 用真实反馈而不是当下情绪做下一轮决定。"
+        f"{hint_line}"
+    )
+
+
+def _looks_like_stress_conflict_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    stress_markers = ["焦虑", "熬夜", "效率低", "看不进", "很累", "崩溃"]
+    conflict_markers = ["期末", "考试", "换届", "社团", "撞在一起", "冲突"]
+    return any(marker in q for marker in stress_markers) and any(
+        marker in q for marker in conflict_markers
+    )
+
+
 def _build_scope_text(kb_ids: list[str], document_ids: list[str] | None) -> str:
     if document_ids:
         return f"当前勾选的 {len(document_ids)} 份文档"
@@ -800,6 +947,7 @@ def _build_summary_thinking(
     kb_ids: list[str],
     document_ids: list[str] | None,
     route_mode: str,
+    question_mode: str,
     retrieved_count: int,
     top_k: int,
     score_threshold: float,
@@ -836,7 +984,9 @@ def _build_summary_thinking(
         if llm_result is None:
             steps.append("本次回答直接基于检索结果整理。")
         elif llm_result.mode in {"llm", "llm_retry"}:
-            if route_mode == MODEL_ROUTE_CLOUD_ONLY and retrieved_count == 0:
+            if question_mode == QUESTION_MODE_OPEN:
+                steps.append("已先由模型独立回答，再补充知识库线索做轻量校验。")
+            elif route_mode == MODEL_ROUTE_CLOUD_ONLY and retrieved_count == 0:
                 steps.append("已基于云端模型直接生成最终回答。")
             else:
                 steps.append("已基于检索结果组织最终回答。")
@@ -873,6 +1023,7 @@ def _build_thinking_payload(
     kb_ids: list[str],
     document_ids: list[str] | None,
     route_mode: str,
+    question_mode: str,
     retrieved_count: int,
     top_k: int,
     score_threshold: float,
@@ -898,6 +1049,7 @@ def _build_thinking_payload(
         kb_ids=kb_ids,
         document_ids=document_ids,
         route_mode=route_mode,
+        question_mode=question_mode,
         retrieved_count=retrieved_count,
         top_k=top_k,
         score_threshold=score_threshold,
@@ -1012,6 +1164,7 @@ def chat_completion(
             payload.agent_key,
             _build_retrieval_query(trimmed_history, key, long_term_memory),
         )
+        built_query = _expand_student_growth_query(payload.agent_key, built_query)
         retrieval_query_cache[key] = built_query
         return built_query
 
@@ -1042,7 +1195,11 @@ def chat_completion(
         retrieval_result_cache[cache_key] = list(output)
         return output
 
-    is_academic_analysis = _is_academic_analysis_query(payload.agent_key, question)
+    question_mode = _resolve_question_mode(payload.agent_key, question)
+    is_academic_analysis = question_mode == QUESTION_MODE_ACADEMIC
+    generation_first_mode = (
+        question_mode == QUESTION_MODE_OPEN and route_mode != MODEL_ROUTE_RETRIEVAL_ONLY
+    )
     chat_total_timeout = (
         ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS
         if is_academic_analysis
@@ -1070,7 +1227,9 @@ def chat_completion(
             generation_timeout = max(generation_timeout, 70)
         else:
             # Keep cloud-only non-academic responses under frontend timeout budget.
-            chat_total_timeout = min(chat_total_timeout, NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS)
+            chat_total_timeout = min(
+                chat_total_timeout, NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS
+            )
             workflow_timeout_cap = min(
                 workflow_timeout_cap,
                 NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS,
@@ -1079,6 +1238,21 @@ def chat_completion(
                 generation_timeout,
                 NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS,
             )
+    elif (
+        route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not is_academic_analysis
+    ):
+        workflow_timeout_cap = min(
+            max(workflow_timeout_cap, 52),
+            NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS,
+        )
+        generation_timeout = max(
+            generation_timeout,
+            max(36, NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS - 2),
+        )
+    if question_mode == QUESTION_MODE_OPEN and route_mode != MODEL_ROUTE_RETRIEVAL_ONLY:
+        chat_total_timeout = max(chat_total_timeout, 120)
+        workflow_timeout_cap = max(workflow_timeout_cap, 112)
+        generation_timeout = max(generation_timeout, 90)
 
     logger.info(
         "chat time budget: conversation=%s agent=%s route=%s cloud=%s local=%s total=%ss workflow_cap=%ss generation=%ss",
@@ -1121,7 +1295,9 @@ def chat_completion(
             if current_user is None:
                 profile_context_text = ""
                 return ""
-            if not is_academic_analysis and not needs_profile_context(payload.agent_key):
+            if not is_academic_analysis and not needs_profile_context(
+                payload.agent_key
+            ):
                 profile_context_text = ""
                 return ""
             stage_start = perf_counter()
@@ -1149,7 +1325,9 @@ def chat_completion(
                     )
                 )
                 try:
-                    profile_context_text = profile_future.result(timeout=profile_timeout_seconds)
+                    profile_context_text = profile_future.result(
+                        timeout=profile_timeout_seconds
+                    )
                     return profile_context_text
                 except FuturesTimeoutError:
                     logger.warning(
@@ -1191,34 +1369,44 @@ def chat_completion(
                     stage_ms=stage_ms,
                 )
 
-        def _retrieve(runtime_question: str) -> tuple[list[str], list[dict]]:
+        def _retrieve(
+            runtime_question: str,
+            *,
+            runtime_top_k: int | None = None,
+            runtime_threshold: float | None = None,
+            detail: str = "正在检索知识库资料...",
+        ) -> tuple[list[str], list[dict]]:
             nonlocal retrieved, retrieval_ms, workflow_stage
             workflow_stage = "retrieval"
             stage_start = perf_counter()
             retrieval_skipped = False
+            effective_top_k = runtime_top_k or top_k
+            effective_threshold = (
+                runtime_threshold if runtime_threshold is not None else score_threshold
+            )
             _emit_progress(
                 progress_callback,
                 type="stage",
                 stage="retrieval",
                 status="start",
-                detail="正在检索知识库资料...",
+                detail=detail,
             )
             query = _resolve_retrieval_query(runtime_question)
             try:
-                if route_mode == MODEL_ROUTE_CLOUD_ONLY:
-                    retrieval_skipped = True
-                    retrieved = []
-                    return [], []
-                retrieved = _run_retrieval_query(query, top_k, score_threshold)
+                retrieved = _run_retrieval_query(
+                    query,
+                    effective_top_k,
+                    effective_threshold,
+                )
                 if not retrieved:
-                    relaxed_top_k = min(8, max(top_k + 2, 3))
+                    relaxed_top_k = min(8, max(effective_top_k + 2, 3))
                     relaxed_threshold = max(
                         MIN_RELAXED_THRESHOLD,
-                        min(0.24, score_threshold - 0.06),
+                        min(0.24, effective_threshold - 0.06),
                     )
                     if (
-                        relaxed_top_k > top_k
-                        or relaxed_threshold < score_threshold
+                        relaxed_top_k > effective_top_k
+                        or relaxed_threshold < effective_threshold
                     ):
                         retrieved = _run_retrieval_query(
                             query,
@@ -1237,10 +1425,11 @@ def chat_completion(
                 retrieval_ms += stage_ms
                 preview = ""
                 if retrieved:
-                    first_hit = _compact_text(str(retrieved[0].get("content") or ""), 80)
-                    preview = (
-                        f"已命中 {len(retrieved)} 条相关资料，正在组织答案。"
-                        + (f"\n参考片段：{first_hit}" if first_hit else "")
+                    first_hit = _compact_text(
+                        str(retrieved[0].get("content") or ""), 80
+                    )
+                    preview = f"已命中 {len(retrieved)} 条相关资料，正在组织答案。" + (
+                        f"\n参考片段：{first_hit}" if first_hit else ""
                     )
                 else:
                     if retrieval_skipped:
@@ -1297,13 +1486,65 @@ def chat_completion(
                     compact = _compact_text(item, 280)
                     if compact:
                         background_contexts.append(compact)
-            generation_contexts = (
-                (retrieval_contexts + background_contexts)[:4]
-                if (retrieval_contexts or background_contexts)
-                else []
-            )
+            prefer_model_answer = generation_first_mode and not is_academic_analysis
+            if prefer_model_answer:
+                generation_contexts = background_contexts[:3]
+                llm_retrieval_contexts: list[str] = []
+            elif (
+                route_mode in {MODEL_ROUTE_CLOUD_ONLY, MODEL_ROUTE_HYBRID}
+                and cloud_enabled
+            ):
+                generation_contexts = (background_contexts + retrieval_contexts[:1])[:3]
+                llm_retrieval_contexts = retrieval_contexts[:1]
+            else:
+                generation_contexts = (
+                    (retrieval_contexts + background_contexts)[:4]
+                    if (retrieval_contexts or background_contexts)
+                    else []
+                )
+                llm_retrieval_contexts = retrieval_contexts
+
+            def _attempt_local_open_backup() -> LLMAnswerResult | None:
+                if not settings.local_transformer_enabled:
+                    return None
+                local_timeout = min(18, max(8, generation_timeout // 3))
+                local_executor = ThreadPoolExecutor(max_workers=1)
+                local_future = local_executor.submit(
+                    generate_answer_with_local_transformer,
+                    runtime_question,
+                    background_contexts[:2],
+                    settings.local_transformer_model,
+                    None,
+                    220,
+                    system_instruction,
+                    False,
+                )
+                try:
+                    answer, model_reference, _metrics = local_future.result(
+                        timeout=local_timeout
+                    )
+                    return LLMAnswerResult(
+                        answer=answer,
+                        mode=f"open_cloud_timeout_local_backup:{model_reference}",
+                    )
+                except Exception:
+                    logger.warning(
+                        "open local backup failed: conversation=%s agent=%s",
+                        conversation_id,
+                        payload.agent_key,
+                        exc_info=True,
+                    )
+                    return None
+                finally:
+                    local_future.cancel()
+                    local_executor.shutdown(wait=False, cancel_futures=True)
+
             try:
-                if route_mode == MODEL_ROUTE_LOCAL_ONLY and not retrieved:
+                if (
+                    route_mode == MODEL_ROUTE_LOCAL_ONLY
+                    and not retrieved
+                    and not prefer_model_answer
+                ):
                     llm_result = LLMAnswerResult(
                         answer=_build_kb_bounded_shortfall_answer(
                             runtime_question,
@@ -1313,7 +1554,12 @@ def chat_completion(
                         ),
                         mode=f"{route_mode}:kb_shortfall",
                     )
-                elif route_mode == MODEL_ROUTE_HYBRID and not retrieved and cloud_enabled:
+                elif (
+                    route_mode == MODEL_ROUTE_HYBRID
+                    and not retrieved
+                    and cloud_enabled
+                    and not prefer_model_answer
+                ):
                     # Hybrid mode fallback: no KB hit -> let cloud model answer naturally.
                     llm_result = answer_with_llm(
                         question=runtime_question,
@@ -1327,7 +1573,11 @@ def chat_completion(
                         retrieval_contexts=[],
                         background_contexts=background_contexts,
                     )
-                elif route_mode == MODEL_ROUTE_HYBRID and not retrieved:
+                elif (
+                    route_mode == MODEL_ROUTE_HYBRID
+                    and not retrieved
+                    and not prefer_model_answer
+                ):
                     # Defensive branch (normally hybrid always has cloud enabled).
                     llm_result = LLMAnswerResult(
                         answer=_build_kb_bounded_shortfall_answer(
@@ -1338,9 +1588,29 @@ def chat_completion(
                         ),
                         mode=f"{route_mode}:kb_shortfall",
                     )
+                elif route_mode == MODEL_ROUTE_HYBRID and cloud_enabled:
+                    llm_result = answer_with_llm(
+                        question=runtime_question,
+                        contexts=generation_contexts,
+                        llm_enabled=True,
+                        system_instruction=system_instruction,
+                        agent_key=payload.agent_key,
+                        timeout_seconds=generation_timeout,
+                        allow_general_knowledge=prefer_model_answer,
+                        kb_hit=False if prefer_model_answer else bool(retrieved),
+                        retrieval_contexts=llm_retrieval_contexts,
+                        background_contexts=background_contexts,
+                    )
+                    if prefer_model_answer and llm_result.mode in {
+                        "timeout_fallback",
+                        "error_fallback",
+                    }:
+                        backup_result = _attempt_local_open_backup()
+                        if backup_result is not None:
+                            llm_result = backup_result
                 elif local_enabled:
                     local_timeout = max(
-                        4,
+                        6,
                         min(LOCAL_GENERATION_TIMEOUT_SECONDS, generation_timeout - 2),
                     )
                     local_executor = ThreadPoolExecutor(max_workers=1)
@@ -1350,9 +1620,9 @@ def chat_completion(
                         generation_contexts[:4],
                         settings.local_transformer_model,
                         None,
-                        520,
+                        320 if prefer_model_answer else 520,
                         system_instruction,
-                        bool(retrieved),
+                        False if prefer_model_answer else bool(retrieved),
                     )
                     try:
                         answer, model_reference, _metrics = local_future.result(
@@ -1370,20 +1640,27 @@ def chat_completion(
                         )
                         if route_mode == MODEL_ROUTE_LOCAL_ONLY:
                             llm_result = LLMAnswerResult(
-                                answer=_build_local_generation_degraded_answer(
-                                    runtime_question,
-                                    retrieved,
+                                answer=(
+                                    _build_open_question_fallback(
+                                        runtime_question,
+                                        trimmed_history,
+                                        long_term_memory=long_term_memory,
+                                        profile_context=profile_context_text,
+                                    )
+                                    if prefer_model_answer
+                                    else _fast_retrieval_answer(
+                                        runtime_question,
+                                        retrieved,
+                                        agent_key=payload.agent_key,
+                                    )
                                 ),
-                                mode="local_transformer:timeout_degraded",
+                                mode=(
+                                    "local_transformer:open_timeout_fallback"
+                                    if prefer_model_answer
+                                    else "local_transformer:timeout_degraded"
+                                ),
                             )
                         else:
-                            _emit_progress(
-                                progress_callback,
-                                type="stage",
-                                stage="generation",
-                                status="fallback",
-                                detail="本地模型响应超时，已切换云端模型继续生成。",
-                            )
                             llm_result = answer_with_llm(
                                 question=runtime_question,
                                 contexts=generation_contexts,
@@ -1391,9 +1668,11 @@ def chat_completion(
                                 system_instruction=system_instruction,
                                 agent_key=payload.agent_key,
                                 timeout_seconds=generation_timeout,
-                                allow_general_knowledge=False,
-                                kb_hit=bool(retrieved),
-                                retrieval_contexts=retrieval_contexts,
+                                allow_general_knowledge=prefer_model_answer,
+                                kb_hit=False
+                                if prefer_model_answer
+                                else bool(retrieved),
+                                retrieval_contexts=llm_retrieval_contexts,
                                 background_contexts=background_contexts,
                             )
                     except Exception:
@@ -1404,20 +1683,27 @@ def chat_completion(
                         )
                         if route_mode == MODEL_ROUTE_LOCAL_ONLY:
                             llm_result = LLMAnswerResult(
-                                answer=_build_local_generation_degraded_answer(
-                                    runtime_question,
-                                    retrieved,
+                                answer=(
+                                    _build_open_question_fallback(
+                                        runtime_question,
+                                        trimmed_history,
+                                        long_term_memory=long_term_memory,
+                                        profile_context=profile_context_text,
+                                    )
+                                    if prefer_model_answer
+                                    else _fast_retrieval_answer(
+                                        runtime_question,
+                                        retrieved,
+                                        agent_key=payload.agent_key,
+                                    )
                                 ),
-                                mode="local_transformer:error_degraded",
+                                mode=(
+                                    "local_transformer:open_error_fallback"
+                                    if prefer_model_answer
+                                    else "local_transformer:error_degraded"
+                                ),
                             )
                         else:
-                            _emit_progress(
-                                progress_callback,
-                                type="stage",
-                                stage="generation",
-                                status="fallback",
-                                detail="本地模型调用失败，已切换云端模型继续生成。",
-                            )
                             llm_result = answer_with_llm(
                                 question=runtime_question,
                                 contexts=generation_contexts,
@@ -1425,30 +1711,46 @@ def chat_completion(
                                 system_instruction=system_instruction,
                                 agent_key=payload.agent_key,
                                 timeout_seconds=generation_timeout,
-                                allow_general_knowledge=False,
-                                kb_hit=bool(retrieved),
-                                retrieval_contexts=retrieval_contexts,
+                                allow_general_knowledge=prefer_model_answer,
+                                kb_hit=False
+                                if prefer_model_answer
+                                else bool(retrieved),
+                                retrieval_contexts=llm_retrieval_contexts,
                                 background_contexts=background_contexts,
                             )
                     finally:
                         local_future.cancel()
                         local_executor.shutdown(wait=False, cancel_futures=True)
                 elif cloud_enabled:
-                    allow_general_mode = route_mode == MODEL_ROUTE_CLOUD_ONLY
+                    allow_general_mode = (
+                        route_mode == MODEL_ROUTE_CLOUD_ONLY or prefer_model_answer
+                    )
+                    kb_hit_flag = False if prefer_model_answer else bool(retrieved)
                     llm_result = answer_with_llm(
                         question=runtime_question,
                         contexts=generation_contexts,
                         llm_enabled=cloud_enabled,
                         system_instruction=""
-                        if (allow_general_mode and not retrieved)
+                        if (
+                            allow_general_mode
+                            and not kb_hit_flag
+                            and not prefer_model_answer
+                        )
                         else system_instruction,
                         agent_key=payload.agent_key,
                         timeout_seconds=generation_timeout,
                         allow_general_knowledge=allow_general_mode,
-                        kb_hit=False if allow_general_mode else bool(retrieved),
-                        retrieval_contexts=retrieval_contexts,
+                        kb_hit=kb_hit_flag,
+                        retrieval_contexts=llm_retrieval_contexts,
                         background_contexts=background_contexts,
                     )
+                    if prefer_model_answer and llm_result.mode in {
+                        "timeout_fallback",
+                        "error_fallback",
+                    }:
+                        backup_result = _attempt_local_open_backup()
+                        if backup_result is not None:
+                            llm_result = backup_result
                 else:
                     llm_result = LLMAnswerResult(
                         answer=(
@@ -1498,138 +1800,182 @@ def chat_completion(
             )
             return llm_result.answer
 
-        workflow_timeout = max(
-            8,
-            min(workflow_timeout_cap, chat_total_timeout - 6),
-        )
+        if generation_first_mode:
+            system_instruction = build_agent_system_instruction(
+                (payload.agent_key or "").strip().lower()
+            )
+            _load_profile(question)
+            answer = _generate(question, [], system_instruction)
+            graph_result = {
+                "error": "",
+                "system_instruction": system_instruction,
+                "answer": answer,
+                "blocked_stage": "",
+                "blocked_word": "",
+            }
+            try:
+                _retrieve(
+                    question,
+                    runtime_top_k=min(4, max(top_k, 2)),
+                    runtime_threshold=max(score_threshold, 0.18),
+                    detail="正在补充可参考线索...",
+                )
+            except Exception:
+                logger.debug("post-answer retrieval skipped", exc_info=True)
+            workflow_stage = "done"
+        else:
+            workflow_timeout = max(
+                8,
+                min(workflow_timeout_cap, chat_total_timeout - 6),
+            )
 
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(
-            run_chat_workflow_graph,
-            question=question,
-            agent_key=payload.agent_key,
-            sensitive_words=sensitive_words,
-            detect_fn=detect_sensitive_text,
-            load_profile_fn=_load_profile,
-            retrieve_fn=_retrieve,
-            generate_fn=_generate,
-        )
-        wait_start = perf_counter()
-        graph_result: dict[str, Any] = {}
-        timed_out = False
-        generation_guard_timeout = (
-            max(
-                16,
-                min(
-                    generation_timeout + 6,
-                    72 if is_academic_analysis else (90 if route_mode == MODEL_ROUTE_CLOUD_ONLY else 34),
-                ),
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(
+                run_chat_workflow_graph,
+                question=question,
+                agent_key=payload.agent_key,
+                sensitive_words=sensitive_words,
+                detect_fn=detect_sensitive_text,
+                load_profile_fn=_load_profile,
+                retrieve_fn=_retrieve,
+                generate_fn=_generate,
             )
-            if not local_enabled
-            else max(
-                10,
-                min(generation_timeout - 8, 22 if is_academic_analysis else 16),
-            )
-        )
-        try:
-            while True:
-                elapsed_wait = perf_counter() - wait_start
-                remaining_wait = workflow_timeout - elapsed_wait
-                if remaining_wait <= 0:
-                    timed_out = True
-                    break
-                try:
-                    graph_result = future.result(
-                        timeout=min(WORKFLOW_POLL_INTERVAL_SECONDS, remaining_wait)
-                    )
-                    workflow_stage = "done"
-                    break
-                except FuturesTimeoutError:
-                    if (
-                        workflow_stage == "generation"
-                        and elapsed_wait >= generation_guard_timeout
-                    ):
+            wait_start = perf_counter()
+            graph_result: dict[str, Any] = {}
+            timed_out = False
+            if (
+                route_mode == MODEL_ROUTE_LOCAL_ONLY
+                and local_enabled
+                and not cloud_enabled
+            ):
+                generation_guard_timeout = max(
+                    12,
+                    min(generation_timeout - 4, 26 if is_academic_analysis else 20),
+                )
+            else:
+                generation_guard_timeout = max(
+                    16,
+                    min(
+                        generation_timeout + 10,
+                        78
+                        if is_academic_analysis
+                        else (92 if route_mode == MODEL_ROUTE_CLOUD_ONLY else 42),
+                    ),
+                )
+            try:
+                while True:
+                    elapsed_wait = perf_counter() - wait_start
+                    remaining_wait = workflow_timeout - elapsed_wait
+                    if remaining_wait <= 0:
                         timed_out = True
                         break
-                    continue
-            workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
-            if timed_out:
-                logger.warning(
-                    "workflow timeout: conversation=%s agent=%s stage=%s elapsed_ms=%s",
-                    conversation_id,
-                    payload.agent_key,
-                    workflow_stage,
-                    workflow_wait_ms,
-                )
-                _emit_progress(
-                    progress_callback,
-                    type="stage",
-                    stage=workflow_stage,
-                    status="timeout",
-                    detail="生成阶段等待过长，已切换快速兜底策略。",
-                    elapsed_ms=workflow_wait_ms,
-                )
-                if route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
-                    timeout_answer = _build_cloud_timeout_degraded_answer(
-                        question=question,
-                        trimmed_history=trimmed_history,
-                        long_term_memory=long_term_memory,
-                    )
-                    llm_result = LLMAnswerResult(
-                        answer=timeout_answer,
-                        mode="cloud_timeout_fast_fallback",
-                    )
-                elif route_mode == MODEL_ROUTE_HYBRID and cloud_enabled:
-                    timeout_answer = _build_cloud_timeout_degraded_answer(
-                        question=question,
-                        trimmed_history=trimmed_history,
-                        long_term_memory=long_term_memory,
-                    )
-                    llm_result = LLMAnswerResult(
-                        answer=timeout_answer,
-                        mode="hybrid_cloud_timeout_fast_fallback",
-                    )
-                else:
                     try:
-                        stage_start = perf_counter()
-                        fallback_top_k = min(8, max(top_k + 1, 3))
-                        fallback_threshold = max(
-                            MIN_RELAXED_THRESHOLD,
-                            min(0.24, score_threshold - 0.08),
+                        graph_result = future.result(
+                            timeout=min(WORKFLOW_POLL_INTERVAL_SECONDS, remaining_wait)
                         )
-                        fallback_query = _resolve_retrieval_query(question)
-                        retrieved = _run_retrieval_query(
-                            fallback_query,
-                            fallback_top_k,
-                            fallback_threshold,
-                        )
-                        retrieval_ms += int((perf_counter() - stage_start) * 1000)
-                    except Exception:
-                        retrieved = []
-                    timeout_answer = (
-                        _fast_retrieval_answer(
-                            question,
-                            retrieved,
-                            agent_key=payload.agent_key,
-                        )
-                        if retrieved
-                        else _build_kb_bounded_shortfall_answer(
+                        workflow_stage = "done"
+                        break
+                    except FuturesTimeoutError:
+                        if (
+                            workflow_stage == "generation"
+                            and elapsed_wait >= generation_guard_timeout
+                        ):
+                            timed_out = True
+                            break
+                        continue
+                workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
+                if timed_out:
+                    logger.warning(
+                        "workflow timeout: conversation=%s agent=%s stage=%s elapsed_ms=%s",
+                        conversation_id,
+                        payload.agent_key,
+                        workflow_stage,
+                        workflow_wait_ms,
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        type="stage",
+                        stage=workflow_stage,
+                        status="timeout",
+                        detail="生成阶段等待过长，已切换快速兜底策略。",
+                        elapsed_ms=workflow_wait_ms,
+                    )
+                    if generation_first_mode:
+                        timeout_answer = _build_open_question_fallback(
                             question,
                             trimmed_history,
-                            route_mode=route_mode,
+                            long_term_memory=long_term_memory,
+                            profile_context=profile_context_text,
+                        )
+                        llm_result = LLMAnswerResult(
+                            answer=timeout_answer,
+                            mode="open_question_timeout_fallback",
+                        )
+                    elif route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
+                        timeout_answer = _build_cloud_timeout_answer(
+                            question=question,
+                            retrieved=retrieved,
+                            trimmed_history=trimmed_history,
+                            long_term_memory=long_term_memory,
                             agent_key=payload.agent_key,
                         )
-                    )
-                graph_result = {
-                    "error": "WORKFLOW_TIMEOUT",
-                    "system_instruction": "",
-                    "answer": timeout_answer,
-                    "blocked_stage": "",
-                    "blocked_word": "",
-                }
-        finally:
-            future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+                        llm_result = LLMAnswerResult(
+                            answer=timeout_answer,
+                            mode="cloud_timeout_fast_fallback",
+                        )
+                    elif route_mode == MODEL_ROUTE_HYBRID and cloud_enabled:
+                        timeout_answer = _build_cloud_timeout_answer(
+                            question=question,
+                            retrieved=retrieved,
+                            trimmed_history=trimmed_history,
+                            long_term_memory=long_term_memory,
+                            agent_key=payload.agent_key,
+                        )
+                        llm_result = LLMAnswerResult(
+                            answer=timeout_answer,
+                            mode="hybrid_cloud_timeout_fast_fallback",
+                        )
+                    else:
+                        try:
+                            stage_start = perf_counter()
+                            fallback_top_k = min(8, max(top_k + 1, 3))
+                            fallback_threshold = max(
+                                MIN_RELAXED_THRESHOLD,
+                                min(0.24, score_threshold - 0.08),
+                            )
+                            fallback_query = _resolve_retrieval_query(question)
+                            retrieved = _run_retrieval_query(
+                                fallback_query,
+                                fallback_top_k,
+                                fallback_threshold,
+                            )
+                            retrieval_ms += int((perf_counter() - stage_start) * 1000)
+                        except Exception:
+                            retrieved = []
+                        timeout_answer = (
+                            _fast_retrieval_answer(
+                                question,
+                                retrieved,
+                                agent_key=payload.agent_key,
+                            )
+                            if retrieved
+                            else _build_kb_bounded_shortfall_answer(
+                                question,
+                                trimmed_history,
+                                route_mode=route_mode,
+                                agent_key=payload.agent_key,
+                            )
+                        )
+                    graph_result = {
+                        "error": "WORKFLOW_TIMEOUT",
+                        "system_instruction": "",
+                        "answer": timeout_answer,
+                        "blocked_stage": "",
+                        "blocked_word": "",
+                    }
+            finally:
+                future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
 
         blocked_stage = str(graph_result.get("blocked_stage") or "")
         blocked_word = str(graph_result.get("blocked_word") or "")
@@ -1656,9 +2002,15 @@ def chat_completion(
         system_instruction = str(graph_result.get("system_instruction") or "")
         answer = str(graph_result.get("answer") or "").strip()
         if not answer:
-            if (
-                (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled)
-                or (route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not retrieved)
+            if generation_first_mode:
+                answer = _build_open_question_fallback(
+                    question,
+                    trimmed_history,
+                    long_term_memory=long_term_memory,
+                    profile_context=profile_context_text,
+                )
+            elif (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled) or (
+                route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not retrieved
             ):
                 fallback_history = _build_history_context_brief(
                     trimmed_history,
@@ -1702,42 +2054,69 @@ def chat_completion(
                         agent_key=payload.agent_key,
                     )
                 )
-        if (
-            not answer
-            and (
-                (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled)
-                or (route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not retrieved)
-            )
+        if not answer and (
+            (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled)
+            or (route_mode == MODEL_ROUTE_HYBRID and cloud_enabled)
         ):
-            answer = _build_cloud_timeout_degraded_answer(
-                question=question,
-                trimmed_history=trimmed_history,
-                long_term_memory=long_term_memory,
+            answer = (
+                _build_open_question_fallback(
+                    question,
+                    trimmed_history,
+                    long_term_memory=long_term_memory,
+                    profile_context=profile_context_text,
+                )
+                if generation_first_mode
+                else _build_cloud_timeout_answer(
+                    question=question,
+                    retrieved=retrieved,
+                    trimmed_history=trimmed_history,
+                    long_term_memory=long_term_memory,
+                    agent_key=payload.agent_key,
+                )
             )
 
         if perf_counter() - start > chat_total_timeout and not answer:
-            if (
-                (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled)
-                or (route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not retrieved)
+            if (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled) or (
+                route_mode == MODEL_ROUTE_HYBRID and cloud_enabled
             ):
-                answer = _build_cloud_timeout_degraded_answer(
-                    question=question,
-                    trimmed_history=trimmed_history,
-                    long_term_memory=long_term_memory,
+                answer = (
+                    _build_open_question_fallback(
+                        question,
+                        trimmed_history,
+                        long_term_memory=long_term_memory,
+                        profile_context=profile_context_text,
+                    )
+                    if generation_first_mode
+                    else _build_cloud_timeout_answer(
+                        question=question,
+                        retrieved=retrieved,
+                        trimmed_history=trimmed_history,
+                        long_term_memory=long_term_memory,
+                        agent_key=payload.agent_key,
+                    )
                 )
             else:
                 answer = (
-                    _fast_retrieval_answer(
-                        question,
-                        retrieved,
-                        agent_key=payload.agent_key,
-                    )
-                    if retrieved
-                    else _build_kb_bounded_shortfall_answer(
+                    _build_open_question_fallback(
                         question,
                         trimmed_history,
-                        route_mode=route_mode,
-                        agent_key=payload.agent_key,
+                        long_term_memory=long_term_memory,
+                        profile_context=profile_context_text,
+                    )
+                    if generation_first_mode
+                    else (
+                        _fast_retrieval_answer(
+                            question,
+                            retrieved,
+                            agent_key=payload.agent_key,
+                        )
+                        if retrieved
+                        else _build_kb_bounded_shortfall_answer(
+                            question,
+                            trimmed_history,
+                            route_mode=route_mode,
+                            agent_key=payload.agent_key,
+                        )
                     )
                 )
 
@@ -1745,6 +2124,7 @@ def chat_completion(
             route_mode in {MODEL_ROUTE_LOCAL_ONLY, MODEL_ROUTE_RETRIEVAL_ONLY}
             and not retrieved
             and len(answer) < 160
+            and not generation_first_mode
         ):
             answer = _build_kb_bounded_shortfall_answer(
                 question,
@@ -1752,8 +2132,6 @@ def chat_completion(
                 route_mode=route_mode,
                 agent_key=payload.agent_key,
             )
-
-        answer = _enhance_student_balance_answer(question, answer, retrieved)
 
         if retrieved:
             sources = [
@@ -1794,6 +2172,7 @@ def chat_completion(
         kb_ids=kb_ids,
         document_ids=payload.document_ids,
         route_mode=route_mode,
+        question_mode=question_mode,
         retrieved_count=len(retrieved),
         top_k=top_k,
         score_threshold=score_threshold,
@@ -1869,9 +2248,7 @@ def chat_completion(
         history=non_memory_history, max_rounds=max_rounds, max_tokens=max_tokens
     )
     keep_ids = {item.id for item in trimmed_after}
-    dropped_messages = [
-        item for item in non_memory_history if item.id not in keep_ids
-    ]
+    dropped_messages = [item for item in non_memory_history if item.id not in keep_ids]
     updated_memory = _build_long_term_memory_update(existing_memory, dropped_messages)
 
     if updated_memory:
