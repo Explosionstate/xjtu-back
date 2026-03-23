@@ -1,8 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from functools import lru_cache
+import json
 from pathlib import Path
-from threading import BoundedSemaphore
+import subprocess
+import sys
+from threading import BoundedSemaphore, Lock
 from time import perf_counter
 
 from app.core.config import settings
@@ -18,6 +21,11 @@ _runtime_import_attempted = False
 _GENERATION_SEMAPHORE = BoundedSemaphore(
     value=max(1, settings.local_transformer_max_concurrency)
 )
+_WORKER_STATE_LOCK = Lock()
+_WORKER_COOLDOWN_SECONDS = 90
+_WORKER_TIMEOUT_SECONDS = 24
+_worker_disabled_until = 0.0
+_worker_last_error = ""
 
 
 def _load_runtime_modules():
@@ -102,6 +110,7 @@ def _build_prompt(
     kb_hit: bool | None = None,
 ) -> str:
     style = _detect_answer_style(question)
+    open_answer_mode = _looks_like_open_guidance_question(question)
     evidence_contexts: list[str] = []
     background_contexts: list[str] = []
     for item in contexts[:5]:
@@ -135,8 +144,10 @@ def _build_prompt(
     if system_instruction and system_instruction.strip():
         instruction_block = f"系统指令:\n{system_instruction.strip()}\n\n"
 
-    if kb_hit is True:
-        kb_hint = "知识库已命中：请先给结论，再给1-2条证据，不要泛聊。"
+    if open_answer_mode:
+        kb_hint = "开放问题：请先独立回答，再把资料当作校验线索，不要复述原文。"
+    elif kb_hit is True:
+        kb_hint = "知识库已命中：请先给结论，再给1条关键证据，不要泛聊。"
     elif kb_hit is False:
         kb_hint = "知识库未命中：请自然说明边界并给最小可执行建议，不要编造事实。"
     else:
@@ -144,17 +155,126 @@ def _build_prompt(
 
     return (
         f"{instruction_block}"
-        "你是西交AI助手，请基于检索资料回答。"
+        "你是西交AI助手，请优先回答用户真正的问题。"
         f"{kb_hint}"
         "不要机械套用固定模板。"
         f"{style_hint}\n\n"
         f"问题: {question}\n\n"
-        f"知识库证据:\n{evidence_block or '（暂无高置信证据）'}\n\n"
+        f"知识库线索:\n{evidence_block or '（暂无高置信证据）'}\n\n"
         f"背景补充:\n{background_block or '（无额外背景）'}"
     )
 
 
 def generate_answer_with_local_transformer(
+    question: str,
+    contexts: list[str],
+    model_name: str | None = None,
+    temperature: float | None = None,
+    max_new_tokens: int | None = None,
+    system_instruction: str | None = None,
+    kb_hit: bool | None = None,
+) -> tuple[str, str, dict[str, int | str | bool]]:
+    if not settings.local_transformer_enabled:
+        raise BusinessError("本地 Transformer 模型已禁用", status_code=400)
+
+    return _generate_answer_via_worker(
+        question=question,
+        contexts=contexts,
+        model_name=model_name,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        system_instruction=system_instruction,
+        kb_hit=kb_hit,
+    )
+
+
+def _generate_answer_via_worker(
+    *,
+    question: str,
+    contexts: list[str],
+    model_name: str | None,
+    temperature: float | None,
+    max_new_tokens: int | None,
+    system_instruction: str | None,
+    kb_hit: bool | None,
+) -> tuple[str, str, dict[str, int | str | bool]]:
+    global _worker_disabled_until, _worker_last_error
+
+    now = perf_counter()
+    with _WORKER_STATE_LOCK:
+        if _worker_disabled_until > now:
+            remaining = int(max(1, _worker_disabled_until - now))
+            detail = f"本地模型运行时暂时不可用，请 {remaining}s 后重试。"
+            if _worker_last_error:
+                detail = f"{detail} 最近错误：{_worker_last_error}"
+            raise BusinessError(detail, status_code=503)
+
+    payload = {
+        "question": question,
+        "contexts": contexts,
+        "model_name": model_name,
+        "temperature": temperature,
+        "max_new_tokens": max_new_tokens,
+        "system_instruction": system_instruction,
+        "kb_hit": kb_hit,
+    }
+    cmd = [sys.executable, "-m", "app.services.local_transformer_worker"]
+    try:
+        result = subprocess.run(
+            cmd,
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_WORKER_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        with _WORKER_STATE_LOCK:
+            _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
+            _worker_last_error = "worker_timeout"
+        raise BusinessError(
+            "本地模型执行超时，已自动进入保护冷却。", status_code=503
+        ) from exc
+    except Exception as exc:
+        with _WORKER_STATE_LOCK:
+            _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
+            _worker_last_error = exc.__class__.__name__
+        raise BusinessError(
+            "本地模型运行时启动失败，已切换保护模式。", status_code=503
+        ) from exc
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip().splitlines()
+        last_error = stderr[-1][:120] if stderr else f"exit_{result.returncode}"
+        with _WORKER_STATE_LOCK:
+            _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
+            _worker_last_error = last_error
+        raise BusinessError("本地模型运行异常，已自动进入保护冷却。", status_code=503)
+
+    try:
+        output = json.loads((result.stdout or "").strip() or "{}")
+    except json.JSONDecodeError as exc:
+        with _WORKER_STATE_LOCK:
+            _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
+            _worker_last_error = "invalid_worker_json"
+        raise BusinessError(
+            "本地模型返回结果异常，已切换保护模式。", status_code=503
+        ) from exc
+
+    with _WORKER_STATE_LOCK:
+        _worker_disabled_until = 0.0
+        _worker_last_error = ""
+
+    answer = str(output.get("answer") or "").strip()
+    model_reference = str(output.get("model_reference") or model_name or "")
+    metrics = output.get("metrics") or {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    return answer, model_reference, metrics
+
+
+def _generate_answer_in_process(
     question: str,
     contexts: list[str],
     model_name: str | None = None,
@@ -264,23 +384,70 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
-    if any(token in q for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]):
+    if _looks_like_open_guidance_question(q):
+        return "guidance"
+    if any(
+        token in q
+        for token in ["对比", "比较", "区别", "差异", "vs", "优缺点", "哪个好"]
+    ):
         return "comparison"
+    if any(
+        token in q
+        for token in [
+            "怎么",
+            "如何",
+            "步骤",
+            "方案",
+            "计划",
+            "建议",
+            "修复",
+            "排查",
+            "优化",
+        ]
+    ):
+        return "guidance"
     if any(token in q for token in ["总结", "概述", "重点", "梳理", "归纳", "总览"]):
         return "summary"
-    if any(token in q for token in ["怎么", "如何", "步骤", "方案", "计划", "建议", "修复", "排查", "优化"]):
-        return "guidance"
-    if any(token in q for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]):
+    if any(
+        token in q
+        for token in ["为什么", "原因", "分析", "评估", "影响", "风险", "判断", "是否"]
+    ):
         return "analysis"
     return "direct"
+
+
+def _looks_like_open_guidance_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    decision_markers = ["还是", "要不要", "选择", "纠结", "不知道"]
+    open_markers = [
+        "跨考",
+        "考研",
+        "读研",
+        "实习",
+        "就业",
+        "方向",
+        "大厂",
+        "焦虑",
+        "迷茫",
+        "压力",
+        "痛苦",
+        "怎么办",
+        "思路",
+    ]
+    return any(marker in q for marker in open_markers) or (
+        any(marker in q for marker in decision_markers)
+        and any(marker in q for marker in ["跨考", "实习", "就业", "方向"])
+    )
 
 
 def _local_generation_profile(style: str) -> tuple[int, float]:
     profile = {
         "direct": (220, 0.2),
-        "analysis": (280, 0.22),
-        "comparison": (280, 0.24),
-        "guidance": (320, 0.25),
+        "analysis": (240, 0.22),
+        "comparison": (240, 0.24),
+        "guidance": (260, 0.23),
         "summary": (240, 0.2),
     }
     return profile.get(style, (240, 0.2))
@@ -296,11 +463,12 @@ def _generate(model, model_inputs: dict, kwargs: dict, torch_module=None):
 def local_transformer_runtime() -> dict[str, int | str | bool]:
     torch_module, _, _ = _load_runtime_modules()
     active_device = settings.transformer_device
-    cuda_available = bool(
-        torch_module is not None and torch_module.cuda.is_available()
-    )
+    cuda_available = bool(torch_module is not None and torch_module.cuda.is_available())
     if settings.transformer_device == "cuda" and not cuda_available:
         active_device = "cpu"
+    with _WORKER_STATE_LOCK:
+        worker_available = _worker_disabled_until <= perf_counter()
+        worker_last_error = _worker_last_error
     return {
         "local_transformer_enabled": settings.local_transformer_enabled,
         "local_model": settings.local_transformer_model,
@@ -309,4 +477,18 @@ def local_transformer_runtime() -> dict[str, int | str | bool]:
         "cuda_available": cuda_available,
         "max_concurrency": settings.local_transformer_max_concurrency,
         "queue_timeout_seconds": settings.local_transformer_queue_timeout_seconds,
+        "worker_isolated": True,
+        "worker_available": worker_available,
+        "worker_last_error": worker_last_error,
     }
+
+
+def local_transformer_backup_available() -> bool:
+    runtime = local_transformer_runtime()
+    if not bool(runtime.get("local_transformer_enabled")):
+        return False
+    if not bool(runtime.get("worker_available", True)):
+        return False
+    if settings.transformer_device == "cuda" and runtime.get("active_device") != "cuda":
+        return False
+    return True

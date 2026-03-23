@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import json
 import logging
+import socket
 from time import perf_counter
 import re
 from typing import Any
-
-from langchain_openai import ChatOpenAI
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 
 from app.core.config import settings
 from app.services.agent_profile_service import (
@@ -99,25 +102,65 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
 }
 
 
-@lru_cache(maxsize=16)
-def get_chat_llm(
+@lru_cache(maxsize=1)
+def _chat_completion_endpoint() -> str:
+    return urlparse.urljoin(settings.llm_base_url.rstrip("/") + "/", "chat/completions")
+
+
+def _invoke_chat_completion_direct(
+    *,
+    prompt: str,
     temperature: float,
     top_p: float,
     frequency_penalty: float,
     presence_penalty: float,
+    max_tokens: int,
     request_timeout: int,
-) -> ChatOpenAI:
-    return ChatOpenAI(
-        api_key=settings.api_key,
-        base_url=settings.llm_base_url,
-        model=settings.llm_model,
-        temperature=temperature,
-        top_p=top_p,
-        frequency_penalty=frequency_penalty,
-        presence_penalty=presence_penalty,
-        timeout=max(6, int(request_timeout)),
-        max_retries=0,
+) -> tuple[str, str | None]:
+    payload = {
+        "model": settings.llm_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "top_p": top_p,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    request = urlrequest.Request(
+        _chat_completion_endpoint(),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
     )
+    try:
+        with urlrequest.urlopen(
+            request, timeout=max(6, int(request_timeout))
+        ) as response:
+            raw = response.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+        raise RuntimeError(f"http_{exc.code}:{detail[:240]}") from exc
+    except (urlerror.URLError, TimeoutError, socket.timeout) as exc:
+        raise TimeoutError(str(exc)) from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid_json:{raw[:240]}") from exc
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"empty_choices:{raw[:240]}")
+    message = choices[0].get("message") or {}
+    answer = _normalize_answer_text(_flatten_text(message.get("content")))
+    reasoning = _extract_reasoning_from_mapping(
+        message
+    ) or _extract_reasoning_from_mapping(choices[0])
+    return answer, reasoning
 
 
 def answer_with_llm(
@@ -223,7 +266,7 @@ def answer_with_llm(
         ),
     )
     if open_answer_mode:
-        effective_timeout = min(effective_timeout, 18)
+        effective_timeout = min(effective_timeout, 90)
     elif allow_general_knowledge and not kb_hit:
         # Keep cloud direct-chat mode under the frontend request budget.
         timeout_cap = 30 if not compact_retrieval_contexts else 26
@@ -232,7 +275,7 @@ def answer_with_llm(
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
     effective_tokens = max(120, min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens))
     if open_answer_mode:
-        effective_tokens = min(effective_tokens, 220)
+        effective_tokens = min(effective_tokens, 280)
     if allow_general_knowledge and not kb_hit:
         effective_tokens = min(effective_tokens, 180)
     if allow_general_knowledge and not compact_retrieval_contexts:
@@ -243,32 +286,13 @@ def answer_with_llm(
         ("primary", prompt, base_timeout, effective_tokens)
     ]
     if open_answer_mode and retry_on_failure:
-        open_retry_prompt = _build_compact_retry_prompt(
-            question=question,
-            compact_contexts=compact_background_contexts,
-            system_instruction=system_instruction,
-            no_answer_rules=get_agent_no_answer_strategy(agent_key),
-        )
-        if agent_hint:
-            open_retry_prompt = f"{agent_hint}\n{open_retry_prompt}"
-        call_plan.append(
-            (
-                "open_retry",
-                open_retry_prompt,
-                6,
-                max(120, min(180, effective_tokens)),
-            )
-        )
-        open_final_prompt = _build_cloud_direct_prompt(
-            question=question,
-            compact_contexts=compact_background_contexts[:1],
-            system_instruction=system_instruction,
-            no_answer_rules=get_agent_no_answer_strategy(agent_key),
-        )
-        if agent_hint:
-            open_final_prompt = f"{agent_hint}\n{open_final_prompt}"
-        call_plan.append(("open_final", open_final_prompt, 6, 140))
-    if allow_general_knowledge and retry_on_failure and not kb_hit:
+        pass
+    if (
+        allow_general_knowledge
+        and retry_on_failure
+        and not kb_hit
+        and not open_answer_mode
+    ):
         retry_prompt = _build_compact_retry_prompt(
             question=question,
             compact_contexts=compact_background_contexts,
@@ -286,19 +310,14 @@ def answer_with_llm(
     for attempt_name, attempt_prompt, attempt_timeout, attempt_tokens in call_plan:
         started = perf_counter()
         try:
-            llm = get_chat_llm(
+            answer, reasoning = _invoke_chat_completion_direct(
+                prompt=attempt_prompt,
                 temperature=round(effective_temperature, 2),
                 top_p=round(profile.top_p, 2),
                 frequency_penalty=round(profile.frequency_penalty, 2),
                 presence_penalty=round(profile.presence_penalty, 2),
                 request_timeout=max(6, int(attempt_timeout)),
-            )
-            response = llm.invoke(
-                attempt_prompt,
                 max_tokens=attempt_tokens,
-            )
-            answer = _normalize_answer_text(
-                _extract_text_content(getattr(response, "content", ""))
             )
             elapsed_ms = int((perf_counter() - started) * 1000)
             logger.info(
@@ -314,25 +333,29 @@ def answer_with_llm(
             return LLMAnswerResult(
                 answer=answer,
                 mode="llm" if attempt_name == "primary" else "llm_retry",
-                reasoning=_extract_reasoning_text(response),
+                reasoning=reasoning,
             )
         except Exception as exc:  # noqa: BLE001
             elapsed_ms = int((perf_counter() - started) * 1000)
             timeout_like = _looks_like_timeout_error(exc)
             timeout_detected = timeout_detected or timeout_like
             last_exc = exc
-            logger.warning(
-                "llm invoke failed: mode=%s timeout=%ss elapsed_ms=%s timeout_like=%s err=%s",
-                attempt_name,
-                attempt_timeout,
-                elapsed_ms,
-                timeout_like,
-                exc.__class__.__name__,
-            )
             if timeout_like:
-                # Timeout often indicates upstream congestion; avoid stacking waits.
-                if attempt_name == "primary" and len(call_plan) > 1:
-                    continue
+                logger.info(
+                    "llm invoke timeout: mode=%s timeout=%ss elapsed_ms=%s",
+                    attempt_name,
+                    attempt_timeout,
+                    elapsed_ms,
+                )
+            else:
+                logger.warning(
+                    "llm invoke failed: mode=%s timeout=%ss elapsed_ms=%s err=%s",
+                    attempt_name,
+                    attempt_timeout,
+                    elapsed_ms,
+                    exc.__class__.__name__,
+                )
+            if timeout_like:
                 break
             continue
 
@@ -581,6 +604,12 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
+    if _looks_like_club_overload_query(q):
+        return "guidance"
+    if _looks_like_doctoral_extension_query(q):
+        return "guidance"
+    if _looks_like_learning_support_query(q):
+        return "guidance"
     if _looks_like_decision_guidance_query(q):
         return "guidance"
     if any(
@@ -635,6 +664,73 @@ def _looks_like_stress_conflict_query(question: str) -> bool:
     )
 
 
+def _looks_like_learning_support_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    support_markers = [
+        "挂科",
+        "重修",
+        "辅导",
+        "补习",
+        "答疑",
+        "学霸",
+        "帮帮",
+        "官方资源",
+        "学习资源",
+        "过不了",
+        "40多分",
+        "40 多分",
+        "听天书",
+    ]
+    return any(marker in q for marker in support_markers)
+
+
+def _looks_like_doctoral_extension_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    doctoral_markers = ["博士", "直博", "博士生"]
+    duration_markers = ["最长", "几年", "延期", "修业年限", "毕业", "发够文章"]
+    stress_markers = ["焦虑", "掉头发", "进展不顺", "根本不可能"]
+    return (
+        any(m in q for m in doctoral_markers)
+        and any(m in q for m in duration_markers)
+        and any(m in q for m in stress_markers)
+    )
+
+
+def _looks_like_club_overload_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    org_markers = ["学生会", "社团", "开会", "策划案", "退部", "学长学姐"]
+    overload_markers = ["没时间", "绑架", "作业", "图书馆", "不好意思", "平衡"]
+    return any(m in q for m in org_markers) and any(m in q for m in overload_markers)
+
+
+def _looks_like_service_process_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    service_tokens = [
+        "挂失",
+        "补办",
+        "办理",
+        "流程",
+        "步骤",
+        "校园卡",
+        "一卡通",
+        "饭卡",
+        "门禁卡",
+        "学生证",
+        "请假",
+        "选课",
+        "缴费",
+    ]
+    return any(token in q for token in service_tokens)
+
+
 def _render_decision_guidance_fallback(question_focus: str) -> str:
     return (
         f"先直接回答：对于“{question_focus}”，先不要急着做一次性押注，建议用 2-4 周做双轨验证。\n"
@@ -652,6 +748,60 @@ def _render_stress_conflict_fallback(question_focus: str) -> str:
         "2) 明天先拆任务：把事情分成“必须亲自做、可以委托、可以延后”三类，社团换届里能交接的立刻交接；\n"
         "3) 复习只保主线：每次只学45分钟，先抓最可能影响期末结果的课程和题型，不追求全做完；\n"
         "4) 给自己一个硬标准：连续两天睡眠不足或效率继续下滑，就必须减少社团投入，优先保考试。"
+    )
+
+
+def _render_learning_support_fallback(
+    question_focus: str, evidence_hint: str = ""
+) -> str:
+    hint = f"\n可参考线索：{evidence_hint}。" if evidence_hint else ""
+    return (
+        f"先直接回答：像“{question_focus}”这种已经出现明显挂科风险的情况，不建议你继续一个人死磕，最好马上把“老师答疑 + 学校辅导资源 + 同伴帮扶”三条线同时拉起来。\n"
+        "1) 先找任课教师或助教：这周就去问清楚期中失分点、期末重点和补救顺序；\n"
+        "2) 再找学院或辅导员：直接问有没有官方学业帮扶、答疑安排、朋辈辅导或补习资源；\n"
+        "3) 同步找一位学得好的同学或学长学姐，先带你补最基础的章节和题型，不要自己从头乱补；\n"
+        "4) 接下来两周只做一件事：把最可能决定期末及格的核心知识点和高频题型补起来。"
+        f"{hint}"
+    )
+
+
+def _render_doctoral_extension_fallback(
+    question_focus: str, evidence_hint: str = ""
+) -> str:
+    hint = f"\n可参考线索：{evidence_hint}。" if evidence_hint else ""
+    return (
+        f"先直接回答：像“{question_focus}”这种博士一年级就担心延期和毕业的情况，不代表你不适合读博，更不代表现在就能下结论说自己一定毕不了业。你现在最该做的，是先把“最长修业年限 + 导师预期 + 本学期最小可交付成果”这三件事弄清楚。\n"
+        "1) 先问学院研究生秘书或培养办：确认博士最长修业年限、延期条件和毕业基本要求；\n"
+        "2) 再和导师谈一次：把卡住你的具体问题、已有尝试、接下来3个月目标说清楚，不要只说自己焦虑；\n"
+        "3) 把目标从“几年内发够文章”改成“先做出一个可验证的小结果”，先恢复研究节奏；\n"
+        "4) 如果已经焦虑到明显影响睡眠、饮食或身体状态，就尽快找校内心理咨询/辅导员支持，不要硬扛。"
+        f"{hint}"
+    )
+
+
+def _render_club_overload_fallback(question_focus: str, evidence_hint: str = "") -> str:
+    hint = f"\n可参考线索：{evidence_hint}。" if evidence_hint else ""
+    return (
+        f"先直接回答：像“{question_focus}”这种情况，真正要优先保的是学业，你现在不是“得罪人”，而是在给自己恢复边界。\n"
+        "1) 先做取舍：学生会和两个大社团不可能长期同时高投入，至少要砍掉一项核心承诺；\n"
+        "2) 不要突然失联，直接和负责人说“开学初判断失误，学业已经明显受影响，需要从高频事务中退出或降频”；\n"
+        "3) 先提出替代方案：把手头任务交接清楚、给出过渡时间，这样比硬拖到彻底崩掉更负责；\n"
+        "4) 从这周开始固定晚间两到三个时段只留给上课、自习和作业，社团活动只能占剩余时间。"
+        f"{hint}"
+    )
+
+
+def _render_service_process_fallback(
+    question_focus: str, evidence_hint: str = ""
+) -> str:
+    hint = f"\n可参考线索：{evidence_hint}。" if evidence_hint else ""
+    return (
+        f"先直接答复：像“{question_focus}”这类校园事务，优先先挂失/冻结，再按学校流程补办或线下处理。\n"
+        "1) 先做止损：立刻挂失，避免继续被消费或误用；\n"
+        "2) 再找入口：优先查学校一卡通平台、校园服务大厅或相关服务窗口；\n"
+        "3) 如需补办，确认要不要带证件、是否缴费、去哪里领取；\n"
+        "4) 如果线上找不到，直接联系辅导员或校园卡服务点确认最快处理路径。"
+        f"{hint}"
     )
 
 
@@ -707,6 +857,14 @@ def _render_no_context_fallback(
             f"建议：{no_answer_text}。"
         )
     if style == "guidance":
+        if _looks_like_club_overload_query(normalized_question):
+            return _render_club_overload_fallback(question_focus)
+        if _looks_like_doctoral_extension_query(normalized_question):
+            return _render_doctoral_extension_fallback(question_focus)
+        if _looks_like_learning_support_query(normalized_question):
+            return _render_learning_support_fallback(question_focus)
+        if _looks_like_service_process_query(normalized_question):
+            return _render_service_process_fallback(question_focus)
         if _looks_like_stress_conflict_query(normalized_question):
             return _render_stress_conflict_fallback(question_focus)
         if _looks_like_decision_guidance_query(normalized_question):
@@ -741,6 +899,14 @@ def _render_general_knowledge_fallback(style: str, question_focus: str) -> str:
             "背景、核心要点、风险提示、下一步行动。"
         )
     if style == "guidance":
+        if _looks_like_club_overload_query(question_focus):
+            return _render_club_overload_fallback(question_focus)
+        if _looks_like_doctoral_extension_query(question_focus):
+            return _render_doctoral_extension_fallback(question_focus)
+        if _looks_like_learning_support_query(question_focus):
+            return _render_learning_support_fallback(question_focus)
+        if _looks_like_service_process_query(question_focus):
+            return _render_service_process_fallback(question_focus)
         if _looks_like_stress_conflict_query(question_focus):
             return _render_stress_conflict_fallback(question_focus)
         if _looks_like_decision_guidance_query(question_focus):
@@ -779,6 +945,14 @@ def _render_context_fallback(
         bullets = "\n".join(f"- {item}" for item in evidence_lines[:4])
         return f"本轮可提炼的重点如下：\n{bullets}"
     if style == "guidance":
+        if _looks_like_club_overload_query(normalized_question):
+            return _render_club_overload_fallback(question_focus, evidence_hint)
+        if _looks_like_doctoral_extension_query(normalized_question):
+            return _render_doctoral_extension_fallback(question_focus, evidence_hint)
+        if _looks_like_learning_support_query(normalized_question):
+            return _render_learning_support_fallback(question_focus, evidence_hint)
+        if _looks_like_service_process_query(normalized_question):
+            return _render_service_process_fallback(question_focus, evidence_hint)
         if _looks_like_stress_conflict_query(normalized_question):
             answer = _render_stress_conflict_fallback(question_focus)
             if evidence_hint:

@@ -26,6 +26,7 @@ from app.services.agent_profile_service import (
 from app.services.llm_service import LLMAnswerResult, answer_with_llm
 from app.services.local_transformer_service import (
     generate_answer_with_local_transformer,
+    local_transformer_backup_available,
 )
 from app.services.external_profile_service import load_user_profile_context
 from app.services.academic_service import get_my_academic_analysis
@@ -506,6 +507,14 @@ def _fast_retrieval_answer(
     if not snippets:
         snippets = ["已检索到相关片段，但可直接引用的文本较少。"]
     evidence_hint = _compact_text(snippets[0], 42)
+    if _looks_like_service_process_query(question):
+        return (
+            f"先直接答复：像“{question[:28]}”这类事务，建议你先立刻完成挂失/冻结，再尽快按学校流程补办或线下处理（{agent_focus}）。\n"
+            "1) 先做止损：优先挂失，避免继续消费或被他人使用；\n"
+            "2) 再查办理入口：看学校的一卡通平台、校园服务大厅或后勤/信息化服务窗口；\n"
+            "3) 如果需要补办，记下是否要带证件、缴费以及领取地点；\n"
+            f"可参考线索：{evidence_hint or '当前命中资料'}。"
+        )
     if style == "comparison":
         return (
             f"先给结论：围绕“{question[:26]}”，建议先按“投入产出、可持续性、机会成本”三维比较（{agent_focus}）。\n"
@@ -834,9 +843,23 @@ def _looks_like_fact_lookup_query(agent_key: str | None, question: str) -> bool:
         "政策",
         "规定",
         "流程",
+        "步骤",
         "材料",
         "申请",
         "办理",
+        "挂失",
+        "补办",
+        "丢了",
+        "丢失",
+        "博士",
+        "修业年限",
+        "最长",
+        "几年",
+        "延期",
+        "毕业要求",
+        "校园卡",
+        "一卡通",
+        "饭卡",
         "时间",
         "地点",
         "要求",
@@ -865,6 +888,28 @@ def _looks_like_fact_lookup_query(agent_key: str | None, question: str) -> bool:
     )
 
 
+def _looks_like_service_process_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    service_tokens = [
+        "挂失",
+        "补办",
+        "办理",
+        "流程",
+        "步骤",
+        "校园卡",
+        "一卡通",
+        "饭卡",
+        "门禁卡",
+        "学生证",
+        "请假",
+        "选课",
+        "缴费",
+    ]
+    return any(token in q for token in service_tokens)
+
+
 def _resolve_question_mode(agent_key: str | None, question: str) -> str:
     if _looks_like_crisis_query(question):
         return QUESTION_MODE_CRISIS
@@ -884,6 +929,30 @@ def _build_open_question_fallback(
     profile_context: str = "",
 ) -> str:
     focus = _compact_text(question, 60) or "当前问题"
+    if _looks_like_club_overload_query(question):
+        return (
+            f"先直接回答：像“{focus}”这种情况，真正要优先保的是学业，你现在不是“得罪人”，而是在给自己恢复边界。\n"
+            "1) 先做取舍：学生会和两个大社团不可能长期同时高投入，至少要砍掉一项核心承诺；\n"
+            "2) 不要突然失联，直接和负责人说“开学初判断失误，学业已经明显受影响，需要从高频事务中退出或降频”；\n"
+            "3) 先提出替代方案：把手头任务交接清楚、给出过渡时间，这样比硬拖到彻底崩掉更负责；\n"
+            "4) 从这周开始固定晚间两到三个时段只留给上课、自习和作业，社团活动只能占剩余时间。"
+        )
+    if _looks_like_doctoral_extension_query(question):
+        return (
+            f"先直接回答：像“{focus}”这种博士一年级就担心延期和毕业的情况，很常见，但现在最重要的不是提前判自己毕不了业，而是先把“最长修业年限 + 导师预期 + 接下来3个月里程碑”这三件事尽快确认清楚。\n"
+            "1) 先问学院研究生秘书或培养办：确认博士最长修业年限、延期条件和学位申请基本要求；\n"
+            "2) 再和导师单独谈一次：不要泛泛说焦虑，直接把“目前卡点、需要的支持、三个月目标”摆出来；\n"
+            "3) 把目标从“几年内发够文章”改成“本学期先解决一个核心研究问题，产出一个稳定小结果”；\n"
+            "4) 如果已经焦虑到明显影响睡眠和身体状态，就不要硬扛，尽快找校内心理咨询或辅导员做支持。"
+        )
+    if _looks_like_learning_support_query(question):
+        return (
+            f"先直接回答：像“{focus}”这种已经出现明显挂科风险的情况，不建议你继续一个人死磕，最好马上把“老师答疑 + 学校辅导资源 + 同伴帮扶”三条线同时拉起来。\n"
+            "1) 先找任课教师或助教，尽快问清楚期中失分点、期末重点和补救顺序；\n"
+            "2) 再找学院或辅导员，直接问有没有官方学业帮扶、答疑安排、朋辈辅导或补习资源；\n"
+            "3) 同步找一位学得好的同学或学长学姐，先带你补最基础的章节和题型；\n"
+            "4) 接下来两周只抓最可能决定及格的核心知识点和高频题型。"
+        )
     if _looks_like_stress_conflict_query(question):
         return (
             f"先直接回答：像“{focus}”这种考试和社团事务撞车的情况，你现在最需要的是先止损，而不是继续硬扛。\n"
@@ -931,6 +1000,53 @@ def _looks_like_stress_conflict_query(question: str) -> bool:
     conflict_markers = ["期末", "考试", "换届", "社团", "撞在一起", "冲突"]
     return any(marker in q for marker in stress_markers) and any(
         marker in q for marker in conflict_markers
+    )
+
+
+def _looks_like_learning_support_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    support_markers = [
+        "挂科",
+        "重修",
+        "辅导",
+        "补习",
+        "答疑",
+        "学霸",
+        "帮帮",
+        "官方资源",
+        "学习资源",
+        "过不了",
+        "40多分",
+        "40 多分",
+        "听天书",
+    ]
+    return any(marker in q for marker in support_markers)
+
+
+def _looks_like_doctoral_extension_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    doctoral_markers = ["博士", "直博", "博士生"]
+    duration_markers = ["最长", "几年", "延期", "修业年限", "毕业", "发够文章"]
+    stress_markers = ["焦虑", "掉头发", "进展不顺", "根本不可能"]
+    return (
+        any(m in q for m in doctoral_markers)
+        and any(m in q for m in duration_markers)
+        and any(m in q for m in stress_markers)
+    )
+
+
+def _looks_like_club_overload_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    org_markers = ["学生会", "社团", "开会", "策划案", "退部", "学长学姐"]
+    overload_markers = ["没时间", "绑架", "作业", "图书馆", "不好意思", "平衡"]
+    return any(marker in q for marker in org_markers) and any(
+        marker in q for marker in overload_markers
     )
 
 
@@ -1473,11 +1589,11 @@ def chat_completion(
             )
             retrieval_contexts = _format_retrieval_contexts_for_generation(retrieved)
             background_contexts: list[str] = []
-            if history_context:
+            if question_mode != QUESTION_MODE_FACT and history_context:
                 background_contexts.append(
                     f"[会话背景] {_compact_text(history_context, 360)}"
                 )
-            if profile_context_text:
+            if question_mode != QUESTION_MODE_FACT and profile_context_text:
                 background_contexts.append(
                     f"[用户画像] {_compact_text(profile_context_text, 320)}"
                 )
@@ -1505,9 +1621,9 @@ def chat_completion(
                 llm_retrieval_contexts = retrieval_contexts
 
             def _attempt_local_open_backup() -> LLMAnswerResult | None:
-                if not settings.local_transformer_enabled:
+                if not local_transformer_backup_available():
                     return None
-                local_timeout = min(18, max(8, generation_timeout // 3))
+                local_timeout = min(6, max(4, generation_timeout // 5))
                 local_executor = ThreadPoolExecutor(max_workers=1)
                 local_future = local_executor.submit(
                     generate_answer_with_local_transformer,
@@ -1722,8 +1838,10 @@ def chat_completion(
                         local_future.cancel()
                         local_executor.shutdown(wait=False, cancel_futures=True)
                 elif cloud_enabled:
-                    allow_general_mode = (
-                        route_mode == MODEL_ROUTE_CLOUD_ONLY or prefer_model_answer
+                    allow_general_mode = prefer_model_answer or (
+                        route_mode == MODEL_ROUTE_CLOUD_ONLY
+                        and question_mode != QUESTION_MODE_FACT
+                        and not bool(retrieved)
                     )
                     kb_hit_flag = False if prefer_model_answer else bool(retrieved)
                     llm_result = answer_with_llm(

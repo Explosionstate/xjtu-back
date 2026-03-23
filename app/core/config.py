@@ -27,7 +27,7 @@ FIXED_LLM_TIMEOUT_SECONDS = 24
 FIXED_XJTUEXER_SSO_CONSUME_URL = "http://127.0.0.1:8080/api/sso/consume"
 FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS = 5
 FIXED_ACADEMIC_DB_URL = (
-    "mysql+pymysql://root:zzyhhz19708@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
+    "mysql+pymysql://root:admin@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
 )
 FIXED_ACADEMIC_QUERY_TIMEOUT_SECONDS = 8
 FIXED_LOCAL_TRANSFORMER_ENABLED = True
