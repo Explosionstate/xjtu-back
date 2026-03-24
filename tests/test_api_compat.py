@@ -1,8 +1,37 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
+from app.core.config import settings
+from app.db.session import SessionLocal
 from app.main import app
+from app.models.knowledge_base import KnowledgeBase
+
+
+def _ensure_active_kb(name: str) -> str:
+    db = SessionLocal()
+    try:
+        kb = db.scalar(select(KnowledgeBase).where(KnowledgeBase.name == name))
+        if kb is None:
+            kb = KnowledgeBase(
+                name=name,
+                description="compat test kb",
+                department="qa",
+                owner="admin",
+                status="active",
+                embedding_model=settings.default_embedding_model,
+            )
+            db.add(kb)
+            db.commit()
+            db.refresh(kb)
+        elif kb.status != "active":
+            kb.status = "active"
+            db.commit()
+            db.refresh(kb)
+        return str(kb.id)
+    finally:
+        db.close()
 
 
 def _login_and_get_token(client: TestClient) -> str:
@@ -120,7 +149,7 @@ def test_cloud_only_mode_skips_rag_and_keeps_direct_answer(monkeypatch) -> None:
             headers={"Authorization": f"Bearer {token}"},
             json={
                 "conversationId": "cloud-direct-test",
-                "agentKey": "student-growth",
+                "agentKey": "default",
                 "llmEnabled": True,
                 "localTransformerEnabled": False,
                 "kbIds": ["kb-x"],
@@ -135,6 +164,65 @@ def test_cloud_only_mode_skips_rag_and_keeps_direct_answer(monkeypatch) -> None:
         assert "云端 Qwen 直答内容" in answer
         assert "资料不足" not in answer
         assert "知识库" not in answer
+
+
+def test_bound_agent_generation_first_prefetches_kb_context(monkeypatch) -> None:
+    from app.services import chat_service
+
+    _ensure_active_kb("学生成长助手知识库")
+    observed: dict[str, object] = {}
+
+    def _fake_answer_with_llm(*args, **kwargs):
+        observed["allow_general_knowledge"] = kwargs.get("allow_general_knowledge")
+        observed["kb_hit"] = kwargs.get("kb_hit")
+        observed["retrieval_contexts"] = list(kwargs.get("retrieval_contexts") or [])
+        observed["contexts"] = list(kwargs.get("contexts") or [])
+        return chat_service.LLMAnswerResult(
+            answer="这是带知识库依据的选课说明。",
+            mode="llm",
+        )
+
+    def _fake_retrieve(*args, **kwargs):
+        observed["kb_ids"] = list(kwargs.get("kb_ids") or [])
+        return [
+            {
+                "chunk_id": "chunk-1",
+                "document_id": "doc-1",
+                "content": "本科生选课应关注培养方案、学分要求、时间窗口和课程容量限制。",
+                "source_location": "学生成长助手知识库/选课要求.md",
+                "score": 0.93,
+            }
+        ]
+
+    monkeypatch.setattr(chat_service, "answer_with_llm", _fake_answer_with_llm)
+    monkeypatch.setattr(chat_service, "hybrid_retrieve", _fake_retrieve)
+    monkeypatch.setattr(chat_service, "_format_rule_answer", lambda _question: "")
+    monkeypatch.setattr(chat_service, "load_user_profile_context", lambda _login: "")
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "conversationId": "bound-agent-prefetch-test",
+                "agentKey": "student-growth",
+                "llmEnabled": True,
+                "localTransformerEnabled": False,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "我是一名大一软件学院学生，我现在要选课了，选课有什么要求吗",
+                    }
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        assert observed["kb_hit"] is True
+        assert observed["allow_general_knowledge"] is False
+        assert observed["retrieval_contexts"]
 
 
 def test_hybrid_mode_kb_miss_uses_cloud_completion(monkeypatch) -> None:
@@ -155,7 +243,9 @@ def test_hybrid_mode_kb_miss_uses_cloud_completion(monkeypatch) -> None:
         return []
 
     def _unexpected_local(*args, **kwargs):
-        raise AssertionError("hybrid mode with kb miss should not call local transformer")
+        raise AssertionError(
+            "hybrid mode with kb miss should not call local transformer"
+        )
 
     monkeypatch.setattr(chat_service, "answer_with_llm", _fake_answer_with_llm)
     monkeypatch.setattr(chat_service, "hybrid_retrieve", _empty_retrieve)
@@ -186,3 +276,87 @@ def test_hybrid_mode_kb_miss_uses_cloud_completion(monkeypatch) -> None:
         answer = payload["data"]["choices"][0]["message"]["content"]
         assert "混合模式下的云端补全回答" in answer
         assert cloud_calls["count"] >= 1
+
+
+def test_chat_completion_uses_agent_bound_kb_scope(monkeypatch) -> None:
+    from app.services import chat_service
+
+    bound_kb_id = _ensure_active_kb("学生成长助手知识库")
+
+    observed: dict[str, object] = {}
+
+    def _fake_retrieve(*args, **kwargs):
+        observed["kb_ids"] = list(kwargs.get("kb_ids") or [])
+        observed["document_ids"] = kwargs.get("document_ids")
+        return [
+            {
+                "chunk_id": "chunk-1",
+                "document_id": "doc-1",
+                "kb_id": bound_kb_id,
+                "content": "学生成长助手知识库中的测试内容。",
+                "source_location": "学生成长助手知识库/qa.txt",
+                "score": 0.91,
+            }
+        ]
+
+    monkeypatch.setattr(chat_service, "hybrid_retrieve", _fake_retrieve)
+    monkeypatch.setattr(chat_service, "_format_rule_answer", lambda _question: "")
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "conversationId": "agent-bound-kb-chat-test",
+                "agentKey": "student-growth",
+                "llmEnabled": False,
+                "localTransformerEnabled": False,
+                "kbIds": ["kb-should-be-ignored"],
+                "documentIds": ["doc-should-be-filtered"],
+                "messages": [{"role": "user", "content": "请给我一条学习建议"}],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        assert observed["kb_ids"] == [bound_kb_id]
+        assert observed["document_ids"] is None
+
+
+def test_retrieval_debug_uses_agent_bound_kb_scope(monkeypatch) -> None:
+    from app.api.routes import chat as chat_route
+
+    bound_kb_id = _ensure_active_kb("学情报告助手知识库")
+
+    observed: dict[str, object] = {}
+
+    def _fake_retrieve_with_debug(*args, **kwargs):
+        observed["kb_ids"] = list(kwargs.get("kb_ids") or [])
+        observed["document_ids"] = kwargs.get("document_ids")
+        observed["agent_key"] = kwargs.get("agent_key")
+        return [], []
+
+    monkeypatch.setattr(
+        chat_route, "hybrid_retrieve_with_debug", _fake_retrieve_with_debug
+    )
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/retrieval-debug",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "query": "请生成月度学情报告",
+                "agentKey": "report-assistant",
+                "kbIds": ["kb-should-be-ignored"],
+                "documentIds": ["doc-should-be-filtered"],
+                "topK": 5,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        assert observed["kb_ids"] == [bound_kb_id]
+        assert observed["document_ids"] is None
+        assert observed["agent_key"] == "report-assistant"

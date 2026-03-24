@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.errors import BusinessError
-from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentChunk
+from app.models.knowledge_base import KnowledgeBase
+from app.services.agent_profile_service import get_agent_bound_kb_name
 from app.schemas.knowledge_base import (
     KnowledgeBaseCloneRequest,
     KnowledgeBaseCreateRequest,
@@ -180,6 +181,41 @@ def clone_knowledge_base(
     clone_kb_vectorstore(source_kb_id=source.id, target_kb_id=cloned.id)
     cloned.document_count = 0
     return cloned
+
+
+def resolve_agent_bound_kb_scope(
+    db: Session,
+    *,
+    agent_key: str | None,
+    document_ids: list[str] | None = None,
+) -> tuple[list[str], list[str] | None] | None:
+    kb_name = get_agent_bound_kb_name(agent_key)
+    if not kb_name:
+        return None
+
+    kb = db.scalar(
+        select(KnowledgeBase).where(
+            KnowledgeBase.name == kb_name,
+            KnowledgeBase.status == "active",
+        )
+    )
+    if kb is None:
+        raise BusinessError(f"未找到智能体绑定的知识库：{kb_name}", status_code=404)
+
+    filtered_document_ids: list[str] | None = None
+    if document_ids:
+        filtered_document_ids = list(
+            db.scalars(
+                select(Document.id).where(
+                    Document.kb_id == kb.id,
+                    Document.id.in_(document_ids),
+                )
+            ).all()
+        )
+        if not filtered_document_ids:
+            filtered_document_ids = None
+
+    return [kb.id], filtered_document_ids
 
 
 def rebuild_kb_vectorstore(db: Session, kb_id: str) -> dict[str, int | bool]:

@@ -23,6 +23,15 @@ class AgentProfile:
 
 DEFAULT_AGENT_KEY = "default"
 
+AGENT_BOUND_KB_NAMES: dict[str, str] = {
+    "student-growth": "学生成长助手知识库",
+    "teacher-assistant": "教师助教助手知识库",
+    "counselor-ideology": "辅导员思政助手知识库",
+    "risk-warning": "学情预警助手知识库",
+    "report-assistant": "学情报告助手知识库",
+    "policy-qa": "思政知识问答知识库",
+}
+
 _ALIASES = {
     "student": "student-growth",
     "student_growth": "student-growth",
@@ -86,8 +95,23 @@ AGENT_PROFILES: dict[str, AgentProfile] = {
             "补充1-2条最关键缺失信息，并给可立即执行的保守建议。",
         ),
         retrieval_focus_terms=("学业", "学习", "课程", "成绩", "预警", "辅导", "成长"),
-        source_positive_keywords=("student", "学生", "学业", "学习", "预警", "辅导", "成长"),
-        source_negative_keywords=("xjtu-back", "xjtu-front", "api", "readme", "部署", "脚本"),
+        source_positive_keywords=(
+            "student",
+            "学生",
+            "学业",
+            "学习",
+            "预警",
+            "辅导",
+            "成长",
+        ),
+        source_negative_keywords=(
+            "xjtu-back",
+            "xjtu-front",
+            "api",
+            "readme",
+            "部署",
+            "脚本",
+        ),
         needs_profile_context=True,
     ),
     "teacher-assistant": AgentProfile(
@@ -127,8 +151,24 @@ AGENT_PROFILES: dict[str, AgentProfile] = {
             "说明未命中关键教学依据，并提示需补充的班级/课程信息。",
             "给一个可立即试行的低风险课堂方案。",
         ),
-        retrieval_focus_terms=("教学", "课堂", "教案", "作业", "评价", "反馈", "课程目标"),
-        source_positive_keywords=("teacher", "教师", "教学", "课堂", "教案", "课程", "评价"),
+        retrieval_focus_terms=(
+            "教学",
+            "课堂",
+            "教案",
+            "作业",
+            "评价",
+            "反馈",
+            "课程目标",
+        ),
+        source_positive_keywords=(
+            "teacher",
+            "教师",
+            "教学",
+            "课堂",
+            "教案",
+            "课程",
+            "评价",
+        ),
         source_negative_keywords=("ops", "deploy", "脚本", "api", "requirements"),
         needs_profile_context=True,
     ),
@@ -169,7 +209,14 @@ AGENT_PROFILES: dict[str, AgentProfile] = {
             "自然说明依据不足，并保持中性语气。",
             "给出低风险沟通起步动作与需要补充的事实点。",
         ),
-        retrieval_focus_terms=("辅导员", "思政", "谈心", "班级管理", "学生管理", "风险"),
+        retrieval_focus_terms=(
+            "辅导员",
+            "思政",
+            "谈心",
+            "班级管理",
+            "学生管理",
+            "风险",
+        ),
         source_positive_keywords=("辅导员", "思政", "管理", "学生事务", "心理", "预警"),
         source_negative_keywords=("代码", "schema", "create table", "api"),
         needs_profile_context=True,
@@ -340,6 +387,11 @@ def get_agent_profile(agent_key: str | None) -> AgentProfile:
     return AGENT_PROFILES.get(normalized, AGENT_PROFILES[DEFAULT_AGENT_KEY])
 
 
+def get_agent_bound_kb_name(agent_key: str | None) -> str | None:
+    normalized = normalize_agent_key(agent_key)
+    return AGENT_BOUND_KB_NAMES.get(normalized)
+
+
 def _join_rules(items: tuple[str, ...]) -> str:
     return "\n".join(f"- {item}" for item in items if item.strip())
 
@@ -380,9 +432,7 @@ def build_agent_output_hint(
     if kb_hit is True:
         kb_line = f"已命中知识库，请优先执行：{'；'.join(profile.kb_strategy[:2])}"
     elif kb_hit is False and not allow_general_knowledge:
-        kb_line = (
-            f"知识库未命中，请执行无答案策略：{'；'.join(profile.no_answer_strategy[:2])}"
-        )
+        kb_line = f"知识库未命中，请执行无答案策略：{'；'.join(profile.no_answer_strategy[:2])}"
     elif kb_hit is False and allow_general_knowledge:
         kb_line = "知识库未命中，可给通用建议，但需明确哪些是通用判断。"
     else:

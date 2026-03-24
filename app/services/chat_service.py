@@ -19,6 +19,7 @@ from app.models.rbac import User
 from app.schemas.chat import ChatCompletionRequest, ChatThinking, SourceItem
 from app.services.agent_profile_service import (
     build_agent_system_instruction,
+    get_agent_bound_kb_name,
     get_agent_no_answer_strategy,
     needs_profile_context,
     normalize_agent_key,
@@ -44,6 +45,7 @@ from app.services.system_config_service import (
     DEFAULT_CONTEXT_MAX_TOKENS,
     get_config_values,
 )
+from app.services.kb_service import resolve_agent_bound_kb_scope
 
 
 CHAT_TOTAL_TIMEOUT_SECONDS = 60
@@ -176,6 +178,26 @@ def _strip_internal_template_text(raw_answer: str) -> str:
             continue
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+_PRIVATE_REASONING_MARKERS = (
+    "Thinking Process:",
+    "Analyze the Request:",
+    "Determine the Conclusion:",
+    "Drafting Content",
+    "Review and Refine",
+    "Character Count Check",
+)
+
+
+def _looks_like_private_reasoning_text(text: str | None) -> bool:
+    content = (text or "").strip()
+    if not content:
+        return False
+    lowered = content.lower()
+    if any(marker.lower() in lowered for marker in _PRIVATE_REASONING_MARKERS):
+        return True
+    return bool(re.search(r"(?m)^\d+\.\s+\*\*.*\*\*", content))
 
 
 def _extract_answer_sections(
@@ -362,7 +384,10 @@ def _format_final_user_answer(
                 (
                     item
                     for item in sentence_pool
-                    if any(token in item for token in ["建议", "可以", "优先", "下一步", "先"])
+                    if any(
+                        token in item
+                        for token in ["建议", "可以", "优先", "下一步", "先"]
+                    )
                     and item != conclusion
                 ),
                 "",
@@ -1444,7 +1469,9 @@ def _build_summary_thinking(
         steps.append("命中系统内置规则回答，未进入知识库检索和模型生成。")
     else:
         scope_text = _build_scope_text(kb_ids, document_ids)
-        if retrieved_count > 0:
+        if route_mode == MODEL_ROUTE_CLOUD_ONLY and retrieval_ms <= 0:
+            steps.append(f"当前为云端直答模式，本轮未优先执行{scope_text}检索。")
+        elif retrieved_count > 0:
             steps.append(
                 f"已在{scope_text}中筛到 {retrieved_count} 条相关片段（Top-K={top_k}，阈值={score_threshold:.2f}）。"
             )
@@ -1508,7 +1535,11 @@ def _build_thinking_payload(
     workflow_stage: str,
     total_ms: int,
 ) -> ChatThinking:
-    if llm_result and llm_result.reasoning:
+    if (
+        llm_result
+        and llm_result.reasoning
+        and not _looks_like_private_reasoning_text(llm_result.reasoning)
+    ):
         return ChatThinking(
             title="思考过程",
             content=llm_result.reasoning,
@@ -1563,12 +1594,21 @@ def chat_completion(
 
     question = raw_question.strip()
     route_mode, cloud_enabled, local_enabled = _resolve_model_route_mode(payload)
-    kb_ids = payload.kb_ids or [
-        item.id
-        for item in db.scalars(
-            select(KnowledgeBase).where(KnowledgeBase.status == "active")
-        ).all()
-    ]
+    resolved_scope = resolve_agent_bound_kb_scope(
+        db,
+        agent_key=payload.agent_key,
+        document_ids=payload.document_ids,
+    )
+    if resolved_scope is not None:
+        kb_ids, document_ids = resolved_scope
+    else:
+        kb_ids = payload.kb_ids or [
+            item.id
+            for item in db.scalars(
+                select(KnowledgeBase).where(KnowledgeBase.status == "active")
+            ).all()
+        ]
+        document_ids = payload.document_ids
     retrieval_config = get_effective_retrieval_config(
         db=db,
         conversation_id=conversation_id,
@@ -1678,7 +1718,7 @@ def chat_completion(
             db=db,
             query=runtime_query,
             kb_ids=kb_ids,
-            document_ids=payload.document_ids,
+            document_ids=document_ids,
             top_k=runtime_top_k,
             score_threshold=runtime_threshold,
             fusion_mode=fusion_mode,
@@ -1990,7 +2030,11 @@ def chat_completion(
                     compact = _compact_text(item, 280)
                     if compact:
                         background_contexts.append(compact)
-            prefer_model_answer = generation_first_mode and not is_academic_analysis
+            prefer_model_answer = (
+                generation_first_mode
+                and not is_academic_analysis
+                and not bool(retrieved)
+            )
             if prefer_model_answer:
                 generation_contexts = background_contexts[:3]
                 llm_retrieval_contexts: list[str] = []
@@ -2108,9 +2152,10 @@ def chat_completion(
                     if (
                         route_mode == MODEL_ROUTE_HYBRID
                         and prefer_model_answer
-                        and llm_result.mode in {
-                        "timeout_fallback",
-                        "error_fallback",
+                        and llm_result.mode
+                        in {
+                            "timeout_fallback",
+                            "error_fallback",
                         }
                     ):
                         backup_result = _attempt_local_open_backup()
@@ -2316,6 +2361,20 @@ def chat_completion(
                 (payload.agent_key or "").strip().lower()
             )
             _load_profile(question)
+            if get_agent_bound_kb_name(payload.agent_key) and not retrieved:
+                try:
+                    _retrieve(
+                        question,
+                        runtime_top_k=min(4, max(top_k, 2)),
+                        runtime_threshold=max(
+                            MIN_RELAXED_THRESHOLD,
+                            min(score_threshold, 0.2),
+                        ),
+                        allow_relaxed_retry=True,
+                        detail="正在优先检索专属知识库...",
+                    )
+                except Exception:
+                    logger.debug("pre-answer retrieval skipped", exc_info=True)
             answer = _generate(question, [], system_instruction)
             graph_result = {
                 "error": "",
@@ -2340,16 +2399,16 @@ def chat_completion(
             workflow_budget_reserved = 2 if cloud_enabled else 6
             workflow_timeout = max(
                 8,
-                min(workflow_timeout_cap, chat_total_timeout - workflow_budget_reserved),
+                min(
+                    workflow_timeout_cap, chat_total_timeout - workflow_budget_reserved
+                ),
             )
             if cloud_enabled:
                 workflow_timeout = max(
                     workflow_timeout,
                     min(workflow_timeout_cap, max(12, generation_timeout + 2)),
                 )
-                workflow_timeout = min(
-                    workflow_timeout, max(8, chat_total_timeout - 1)
-                )
+                workflow_timeout = min(workflow_timeout, max(8, chat_total_timeout - 1))
 
             executor = ThreadPoolExecutor(max_workers=1)
             future = executor.submit(
@@ -2408,9 +2467,7 @@ def chat_completion(
                 workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
                 if timed_out:
                     if workflow_stage == "generation" and not future.done():
-                        remaining_total = chat_total_timeout - (
-                            perf_counter() - start
-                        )
+                        remaining_total = chat_total_timeout - (perf_counter() - start)
                         grace_timeout = min(3.0, max(0.0, remaining_total - 0.4))
                         if grace_timeout >= 0.8:
                             grace_start = perf_counter()
@@ -2714,7 +2771,7 @@ def chat_completion(
     thinking = _build_thinking_payload(
         trimmed_history=trimmed_history,
         kb_ids=kb_ids,
-        document_ids=payload.document_ids,
+        document_ids=document_ids,
         route_mode=route_mode,
         question_mode=question_mode,
         retrieved_count=len(retrieved),

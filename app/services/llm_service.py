@@ -227,11 +227,7 @@ def _build_timeout_guided_fallback(
         tail = "本轮云端响应超时，我先基于现有线索给你最稳妥的答案；你补充场景后我可继续细化。"
     else:
         tail = f"当前以可核验线索为准；若需要更精确结论，建议：{no_answer_hint}。"
-    return (
-        f"{lead}：围绕“{focus}”，先给你当前最稳妥的回答。\n"
-        f"{evidence_block}\n"
-        f"{tail}"
-    )
+    return f"{lead}：围绕“{focus}”，先给你当前最稳妥的回答。\n{evidence_block}\n{tail}"
 
 
 def answer_with_llm(
@@ -260,8 +256,14 @@ def answer_with_llm(
         if retrieval_contexts is not None
         else ([] if kb_hit is False else list(contexts))
     )
-    retrieval_limit = profile.context_limit if is_complex_query else max(1, profile.context_limit - 1)
-    retrieval_chars = profile.context_chars if is_complex_query else max(360, profile.context_chars - 220)
+    retrieval_limit = (
+        profile.context_limit if is_complex_query else max(1, profile.context_limit - 1)
+    )
+    retrieval_chars = (
+        profile.context_chars
+        if is_complex_query
+        else max(360, profile.context_chars - 220)
+    )
     compact_retrieval_contexts = _compact_contexts(
         contexts=raw_retrieval_contexts,
         limit=retrieval_limit,
@@ -1044,9 +1046,18 @@ def _compact_contexts(contexts: list[str], limit: int, max_chars: int) -> list[s
 
 
 def _normalize_answer_text(answer: str) -> str:
-    text = (answer or "").strip()
+    text = (answer or "").replace("\r\n", "\n").strip()
     if not text:
         return ""
+    text = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
+    text = re.sub(r"(?is)<system-reminder>.*?</system-reminder>", "", text).strip()
+    if re.search(r"(?i)thinking process\s*:", text):
+        public_match = re.search(
+            r"(?m)^(?:\*\*)?(结论|直接回答|答案|依据|行动建议|补充说明)(?:\*\*)?\s*$",
+            text,
+        )
+        if public_match:
+            text = text[public_match.start() :].strip()
     lines = [line.rstrip() for line in text.splitlines()]
     cleaned_lines: list[str] = []
     for line in lines:

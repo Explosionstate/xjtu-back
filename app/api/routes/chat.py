@@ -32,6 +32,7 @@ from app.services.chat_service import (
     clear_conversation_context,
     rollback_conversation_context,
 )
+from app.services.kb_service import resolve_agent_bound_kb_scope
 from app.services.retrieval_config_service import get_effective_retrieval_config
 from app.services.retrieval_service import hybrid_retrieve_with_debug
 
@@ -166,12 +167,21 @@ def retrieval_debug(
     current_user=Depends(get_current_user),
 ) -> RetrievalDebugResponse:
     _ = current_user
-    kb_ids = payload.kb_ids or [
-        item.id
-        for item in db.scalars(
-            select(KnowledgeBase).where(KnowledgeBase.status == "active")
-        ).all()
-    ]
+    resolved_scope = resolve_agent_bound_kb_scope(
+        db,
+        agent_key=payload.agent_key,
+        document_ids=payload.document_ids,
+    )
+    if resolved_scope is not None:
+        kb_ids, document_ids = resolved_scope
+    else:
+        kb_ids = payload.kb_ids or [
+            item.id
+            for item in db.scalars(
+                select(KnowledgeBase).where(KnowledgeBase.status == "active")
+            ).all()
+        ]
+        document_ids = payload.document_ids
     cfg = get_effective_retrieval_config(
         db=db,
         conversation_id=None,
@@ -184,11 +194,12 @@ def retrieval_debug(
         db=db,
         query=payload.query,
         kb_ids=kb_ids,
-        document_ids=payload.document_ids,
+        document_ids=document_ids,
         top_k=int(cfg["retrieval_top_k"]),
         score_threshold=float(cfg["score_threshold"]),
         fusion_mode=str(cfg["fusion_mode"]),
         alpha=float(cfg["alpha"]),
+        agent_key=payload.agent_key,
     )
     top_ids = {item["chunk_id"] for item in results}
     top_rows = [item for item in debug_rows if item["chunk_id"] in top_ids]
@@ -289,19 +300,25 @@ async def ws_chat_completions(
                 finally:
                     worker_db.close()
 
-            completion_task = asyncio.create_task(asyncio.to_thread(_run_chat_completion))
+            completion_task = asyncio.create_task(
+                asyncio.to_thread(_run_chat_completion)
+            )
             try:
                 while True:
                     if completion_task.done() and progress_queue.empty():
                         break
                     try:
-                        event = await asyncio.wait_for(progress_queue.get(), timeout=0.08)
+                        event = await asyncio.wait_for(
+                            progress_queue.get(), timeout=0.08
+                        )
                     except asyncio.TimeoutError:
                         continue
                     await _emit_progress_event(websocket, event)
                 result = await completion_task
             except Exception as exc:
-                await websocket.send_json({"type": "error", "detail": str(exc) or "问答失败"})
+                await websocket.send_json(
+                    {"type": "error", "detail": str(exc) or "问答失败"}
+                )
                 continue
 
             await websocket.send_json(

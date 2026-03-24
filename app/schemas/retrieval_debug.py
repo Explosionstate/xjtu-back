@@ -7,6 +7,10 @@ class RetrievalDebugRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     query: str = Field(min_length=1)
+    agent_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("agent_key", "agentKey"),
+    )
     kb_ids: list[str] | None = Field(
         default=None,
         validation_alias=AliasChoices("kb_ids", "kbIds"),
