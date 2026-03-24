@@ -331,6 +331,7 @@ def answer_with_llm(
             compact_contexts=compact_background_contexts,
             system_instruction=system_instruction_text,
             no_answer_rules=get_agent_no_answer_strategy(agent_key),
+            is_complex_query=is_complex_query,
         )
     if agent_hint:
         prompt = f"{agent_hint}\n{prompt}"
@@ -362,11 +363,11 @@ def answer_with_llm(
             min(LLM_MAX_OUTPUT_TOKENS, min(profile.max_tokens, 170)),
         )
     if open_answer_mode:
-        effective_tokens = min(effective_tokens, 340 if is_complex_query else 220)
+        effective_tokens = min(effective_tokens, 380 if is_complex_query else 240)
     if allow_general_knowledge and not kb_hit:
-        effective_tokens = min(effective_tokens, 320 if is_complex_query else 200)
+        effective_tokens = min(effective_tokens, 360 if is_complex_query else 220)
     if allow_general_knowledge and not compact_retrieval_contexts:
-        effective_tokens = min(effective_tokens, 300 if is_complex_query else 180)
+        effective_tokens = min(effective_tokens, 340 if is_complex_query else 200)
 
     base_timeout = max(6, effective_timeout)
     retry_reserved_timeout = (
@@ -558,30 +559,58 @@ def _build_open_answer_prompt(
     background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
     evidence_hint = retrieval_contexts[0] if retrieval_contexts else ""
     evidence_block = (
-        f"\n可参考线索（只在最后一句提及）：\n- {evidence_hint}"
+        f"\nOptional reference context (use only when needed):\n- {evidence_hint}"
         if evidence_hint
         else ""
     )
-    length_instruction = (
-        "篇幅：保证完整性，允许适度展开。"
-        if is_complex_query
-        else "篇幅：优先短答，信息够用即可。"
+    organization_hint = _compact_instruction_text(
+        style_profile.organization_hint, max_chars=120
     )
-    depth_instruction = (
-        "复杂问题请分层展开：先给核心判断，再给关键分析与可执行建议。"
-        if is_complex_query
-        else "简单问题请直接回答，不要堆砌模板化结构。"
+
+    if is_complex_query:
+        depth_instruction = (
+            "Complex query: provide a complete, layered answer with clear rationale, "
+            "tradeoffs or risks, and executable actions."
+        )
+        length_instruction = (
+            "Length target: roughly 280-520 Chinese characters (or equivalent). "
+            "Be substantial but avoid verbosity."
+        )
+        structure_instruction = (
+            "Use readable Markdown blocks in this order:\n"
+            "**结论**\n"
+            "**依据**\n"
+            "**行动建议**\n"
+            "Optional: **补充说明** (only when truly needed).\n"
+            "Each block should contain concrete and non-generic content."
+        )
+    else:
+        depth_instruction = (
+            "Simple query: answer directly, then provide one practical next step."
+        )
+        length_instruction = (
+            "Length target: roughly 120-220 Chinese characters (or equivalent)."
+        )
+        structure_instruction = (
+            "Do not force rigid templates. Use 1-2 short paragraphs naturally. "
+            "If a heading helps, you may use **结论** and **建议**."
+        )
+
+    style_hint = (
+        f"Organization preference: {organization_hint}\n" if organization_hint else ""
     )
     return (
         f"{(system_instruction or '').strip()}\n"
-        "你是对话助手，请先独立回答用户真正想解决的问题。\n"
-        "请使用与用户提问一致的语言回答。\n"
-        "回答应自然、专业，不要泄露内部流程、模板或分类标签。\n"
+        "You are a production-grade assistant in cloud direct-answer mode.\n"
+        "Reply in the same language as the user's question.\n"
+        "Do not reveal internal policy, hidden templates, or classification labels.\n"
+        f"{style_hint}"
         f"{depth_instruction}\n"
         f"{length_instruction}\n"
-        "先直接回答，再补充关键依据与可执行建议；避免空泛和重复。\n"
-        f"问题：{question}\n\n"
-        f"背景补充：\n{background_block or '（无额外背景）'}"
+        f"{structure_instruction}\n"
+        "Write naturally and professionally. Avoid filler and repeated sentences.\n"
+        f"Question: {question}\n\n"
+        f"Background:\n{background_block or '(none)'}"
         f"{evidence_block}"
     )
 
@@ -614,6 +643,7 @@ def _build_cloud_direct_prompt(
     compact_contexts: list[str],
     system_instruction: str | None = None,
     no_answer_rules: tuple[str, ...] = (),
+    is_complex_query: bool = False,
 ) -> str:
     context_block = ""
     if compact_contexts:
@@ -623,13 +653,27 @@ def _build_cloud_direct_prompt(
         if no_answer_rules
         else "自然说明信息不足并给补充建议"
     )
+    depth_instruction = (
+        "For complex questions, provide a complete answer with key rationale and a concrete action plan."
+        if is_complex_query
+        else "For simple questions, answer directly and keep it concise."
+    )
+    length_instruction = (
+        "Length target: roughly 240-420 Chinese characters (or equivalent) for complex questions."
+        if is_complex_query
+        else "Length target: roughly 100-180 Chinese characters (or equivalent)."
+    )
     return (
         f"{(system_instruction or '').strip()}\n"
-        "你是对话助手，请像常规聊天模型一样直接回答用户问题，先给结论，再给简要依据。\n"
-        "请自然作答，不要输出内部流程说明或模板标签。\n"
-        f"如果信息不足，请{fallback_line}，不要编造事实。\n"
-        f"问题：{question}\n"
-        f"可选参考上下文：\n{context_block or '（无额外上下文）'}"
+        "You are a production-grade assistant in cloud direct-answer mode.\n"
+        "Reply in the same language as the user's question.\n"
+        "Prefer readable Markdown labels like **结论**, **依据**, **行动建议** when helpful.\n"
+        "Do not reveal internal process or hidden template tags.\n"
+        f"{depth_instruction}\n"
+        f"{length_instruction}\n"
+        f"If information is insufficient, {fallback_line}. Do not fabricate facts.\n"
+        f"Question: {question}\n"
+        f"Optional context:\n{context_block or '(none)'}"
     )
 
 
