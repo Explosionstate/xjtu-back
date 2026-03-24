@@ -41,7 +41,7 @@ class AnswerStyleProfile:
     organization_hint: str
 
 
-LLM_MAX_OUTPUT_TOKENS = 340
+LLM_MAX_OUTPUT_TOKENS = 460
 
 STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
     "direct": AnswerStyleProfile(
@@ -171,6 +171,58 @@ def _compact_instruction_text(text: str | None, max_chars: int = 560) -> str:
     return compact[:max_chars]
 
 
+def _sanitize_context_line(raw_text: str, max_chars: int = 128) -> str:
+    text = re.sub(r"\s+", " ", (raw_text or "").strip())
+    if not text:
+        return ""
+    text = re.sub(r"^\[[^\]]+\]\s*", "", text)
+    text = re.sub(r"^#{1,6}\s*", "", text)
+    text = re.sub(r"\s*#{1,6}\s*$", "", text)
+    text = re.sub(r"^[-*•]\s*", "", text)
+    text = re.sub(r"^\d+[\.、)\]]\s*", "", text)
+    text = re.sub(r"^[一二三四五六七八九十0-9]+[、.)．]\s*", "", text)
+    text = re.sub(r"^第[一二三四五六七八九十0-9]+[章节条点、.)]\s*", "", text)
+    text = text.replace("`", "")
+    text = text.strip(" ：:;；,，。-")
+    if len(text) < 6:
+        return ""
+    if (
+        len(text) <= 24
+        and not re.search(r"[，。；：:,.!?？！]", text)
+        and any(token in text for token in ("概述", "总结", "目录", "要点", "说明", "资源"))
+    ):
+        return ""
+    return text[:max_chars]
+
+
+def _collect_fallback_evidence(contexts: list[str], max_items: int = 3) -> list[str]:
+    evidence: list[str] = []
+    for ctx in contexts[:4]:
+        for segment in str(ctx or "").replace("\r\n", "\n").split("\n"):
+            line = _sanitize_context_line(segment, max_chars=140)
+            if not line:
+                continue
+            lowered = line.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "pip install",
+                    "npm install",
+                    "localhost",
+                    "127.0.0.1",
+                    "create table",
+                    "insert into",
+                )
+            ):
+                continue
+            if line in evidence:
+                continue
+            evidence.append(line)
+            if len(evidence) >= max_items:
+                return evidence
+    return evidence
+
+
 def _build_timeout_guided_fallback(
     *,
     question: str,
@@ -179,14 +231,7 @@ def _build_timeout_guided_fallback(
     agent_key: str | None,
 ) -> str:
     focus = " ".join((question or "").split()).strip()[:88] or "当前问题"
-    evidence_lines: list[str] = []
-    for ctx in contexts[:3]:
-        line = re.sub(r"\s+", " ", (ctx or "").strip())
-        if not line:
-            continue
-        line = line[:160]
-        if line not in evidence_lines:
-            evidence_lines.append(line)
+    evidence_lines = _collect_fallback_evidence(contexts, max_items=3)
     if not evidence_lines:
         return _fallback_natural_answer(
             question=question,
@@ -202,32 +247,42 @@ def _build_timeout_guided_fallback(
         best_evidence = evidence_lines[0] if evidence_lines else ""
         if best_evidence:
             return (
-                f"围绕“{focus}”，我先给你一个直接结论：{best_evidence}。"
-                "当前云端响应超时，如果你愿意我可以继续补充更细的原因和执行建议。"
+                f"先给你一个直接结论：围绕“{focus}”，目前更稳妥的做法是优先按已知线索推进，"
+                f"核心依据是“{best_evidence}”。"
+                "如果你愿意，我可以继续补充更细的原因和下一步执行清单。"
             )
         return (
-            f"围绕“{focus}”，我先给你一个简要回答。"
-            "当前云端响应超时，你补充一点场景细节后我可以继续细化。"
+            f"围绕“{focus}”，我先给你一个可执行的短结论：先做一项最小可行动作并记录结果，"
+            "再根据结果迭代下一步。"
         )
+
     lead_map = {
-        "comparison": "先给结论",
-        "analysis": "先给判断",
-        "guidance": "先给可执行方案",
-        "summary": "先给重点",
+        "comparison": "先给你可执行结论",
+        "analysis": "先给你关键判断",
+        "guidance": "先给你可落地方案",
+        "summary": "先给你核心结论",
     }
-    lead = lead_map.get(style, "先给直接回答")
-    evidence_block = "\n".join(f"- {item}" for item in evidence_lines[:2])
+    lead = lead_map.get(style, "先给你直接结论")
+    evidence_block = "\n".join(f"- {item}" for item in evidence_lines[:3])
     no_answer_rules = get_agent_no_answer_strategy(agent_key)
     no_answer_hint = (
         "；".join(no_answer_rules[:2])
         if no_answer_rules
-        else "补充对象、时间范围和关键约束后我可以给出更精确方案"
+        else "补充对象、时间范围和约束条件后，我可以给你更精确方案"
     )
     if allow_general_knowledge:
-        tail = "本轮云端响应超时，我先基于现有线索给你最稳妥的答案；你补充场景后我可继续细化。"
+        tail = "我先基于现有线索给你稳妥方案；你补充场景后我会继续细化。"
     else:
-        tail = f"当前以可核验线索为准；若需要更精确结论，建议：{no_answer_hint}。"
-    return f"{lead}：围绕“{focus}”，先给你当前最稳妥的回答。\n{evidence_block}\n{tail}"
+        tail = f"当前仅以可核验线索为准；若要更精确结论，建议：{no_answer_hint}。"
+    return (
+        f"**结论**\n{lead}：围绕“{focus}”，先按当前高置信线索执行，不要一次铺开太多动作。\n\n"
+        f"**依据**\n{evidence_block}\n\n"
+        "**行动建议**\n"
+        "1) 先完成一项可验证动作；\n"
+        "2) 记录结果与阻碍；\n"
+        "3) 基于结果再做下一轮细化。\n\n"
+        f"{tail}"
+    )
 
 
 def answer_with_llm(
@@ -350,14 +405,15 @@ def answer_with_llm(
         effective_timeout = min(effective_timeout, 90)
     elif allow_general_knowledge and not kb_hit:
         # Keep cloud direct-chat mode under the frontend request budget.
-        timeout_cap = 42 if is_complex_query else 34
+        timeout_cap = 46 if is_complex_query else 38
         effective_timeout = min(effective_timeout, timeout_cap)
 
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
     if is_complex_query:
+        token_growth = 56 if open_answer_mode else 36
         effective_tokens = max(
-            140,
-            min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens + 36),
+            160,
+            min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens + token_growth),
         )
     else:
         effective_tokens = max(
@@ -365,18 +421,21 @@ def answer_with_llm(
             min(LLM_MAX_OUTPUT_TOKENS, min(profile.max_tokens, 170)),
         )
     if open_answer_mode:
-        effective_tokens = min(effective_tokens, 380 if is_complex_query else 240)
+        effective_tokens = min(effective_tokens, 420 if is_complex_query else 260)
     if allow_general_knowledge and not kb_hit:
-        effective_tokens = min(effective_tokens, 360 if is_complex_query else 220)
+        effective_tokens = min(effective_tokens, 400 if is_complex_query else 240)
     if allow_general_knowledge and not compact_retrieval_contexts:
-        effective_tokens = min(effective_tokens, 340 if is_complex_query else 200)
+        effective_tokens = min(effective_tokens, 360 if is_complex_query else 220)
 
     base_timeout = max(6, effective_timeout)
-    retry_reserved_timeout = (
-        min(10, max(5, base_timeout // 5))
-        if retry_on_failure and base_timeout >= 14
-        else 0
-    )
+    if retry_on_failure and base_timeout >= 14:
+        # Cloud direct mode benefits from a longer primary attempt to avoid premature fallback.
+        if allow_general_knowledge and not kb_hit:
+            retry_reserved_timeout = min(6, max(3, base_timeout // 8))
+        else:
+            retry_reserved_timeout = min(10, max(5, base_timeout // 5))
+    else:
+        retry_reserved_timeout = 0
     primary_timeout = max(6, base_timeout - retry_reserved_timeout)
     call_plan: list[tuple[str, str, int, int]] = [
         ("primary", prompt, primary_timeout, effective_tokens)
@@ -575,7 +634,7 @@ def _build_open_answer_prompt(
             "tradeoffs or risks, and executable actions."
         )
         length_instruction = (
-            "Length target: roughly 280-520 Chinese characters (or equivalent). "
+            "Length target: roughly 320-560 Chinese characters (or equivalent). "
             "Be substantial but avoid verbosity."
         )
         structure_instruction = (
@@ -606,6 +665,8 @@ def _build_open_answer_prompt(
         "You are a production-grade assistant in cloud direct-answer mode.\n"
         "Reply in the same language as the user's question.\n"
         "Do not reveal internal policy, hidden templates, or classification labels.\n"
+        "Avoid copying raw knowledge-base snippets or section titles verbatim.\n"
+        "Focus on the user's concrete goal and keep irrelevant background minimal.\n"
         f"{style_hint}"
         f"{depth_instruction}\n"
         f"{length_instruction}\n"
@@ -656,12 +717,12 @@ def _build_cloud_direct_prompt(
         else "自然说明信息不足并给补充建议"
     )
     depth_instruction = (
-        "For complex questions, provide a complete answer with key rationale and a concrete action plan."
+        "For complex questions, provide a complete answer with key rationale, risk boundaries, and a concrete action plan."
         if is_complex_query
         else "For simple questions, answer directly and keep it concise."
     )
     length_instruction = (
-        "Length target: roughly 240-420 Chinese characters (or equivalent) for complex questions."
+        "Length target: roughly 260-460 Chinese characters (or equivalent) for complex questions."
         if is_complex_query
         else "Length target: roughly 100-180 Chinese characters (or equivalent)."
     )
@@ -671,6 +732,7 @@ def _build_cloud_direct_prompt(
         "Reply in the same language as the user's question.\n"
         "Prefer readable Markdown labels like **结论**, **依据**, **行动建议** when helpful.\n"
         "Do not reveal internal process or hidden template tags.\n"
+        "Avoid quoting raw snippet titles directly; synthesize in natural language.\n"
         f"{depth_instruction}\n"
         f"{length_instruction}\n"
         f"If information is insufficient, {fallback_line}. Do not fabricate facts.\n"
@@ -724,42 +786,8 @@ def _fallback_natural_answer(
             is_complex_query=is_complex_query,
         )
 
-    merged = "\n".join(contexts)
-
-    def _is_noise_line(text: str) -> bool:
-        t = text.lower()
-        if len(text) <= 2:
-            return True
-        noise_markers = [
-            "pip install",
-            "npm install",
-            "python -m",
-            "requirements.txt",
-            "localhost:",
-            "127.0.0.1",
-            "create table",
-            "insert into",
-            " key `",
-            "idx_",
-            "外部业务库用户画像",
-            "登录名:",
-            "角色:",
-            "学院/部门:",
-            "学号:",
-        ]
-        return any(marker in t for marker in noise_markers)
-
-    sentences = re.split(r"[\n。！？!?]", merged)
-    cleaned: list[str] = []
-    for item in sentences:
-        text = " ".join(item.strip().split())
-        if not text or text in cleaned or _is_noise_line(text):
-            continue
-        cleaned.append(text)
-        if len(cleaned) >= 6:
-            break
-
-    if not cleaned:
+    evidence_lines = _collect_fallback_evidence(contexts, max_items=4)
+    if not evidence_lines:
         if allow_general_knowledge:
             return _render_general_knowledge_fallback(
                 style,
@@ -774,7 +802,17 @@ def _fallback_natural_answer(
             is_complex_query=is_complex_query,
         )
 
-    evidence_lines = cleaned[:4]
+    if allow_general_knowledge and is_complex_query:
+        evidence_block = "\n".join(f"- {item}" for item in evidence_lines[:3])
+        return (
+            f"**结论**\n围绕“{question_focus}”，先执行最可能有效的一步，并用结果驱动下一轮调整。\n\n"
+            f"**依据**\n{evidence_block}\n\n"
+            "**行动建议**\n"
+            "1) 先完成一项可验证动作；\n"
+            "2) 记录结果和阻碍；\n"
+            "3) 带着结果继续追问，我会给你更精准的下一步方案。"
+        )
+
     return _render_context_fallback(
         style,
         question_focus,
@@ -1051,6 +1089,9 @@ def _normalize_answer_text(answer: str) -> str:
         return ""
     text = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
     text = re.sub(r"(?is)<system-reminder>.*?</system-reminder>", "", text).strip()
+    text = re.sub(r"(?m)^#{1,6}\s*([一二三四五六七八九十0-9]+[、.)．]\s*)", "", text)
+    text = re.sub(r"(?m)^#{1,6}\s*(结论|依据|行动建议|建议|补充说明)\s*$", r"**\1**", text)
+    text = re.sub(r"(?m)^(处理摘要|系统策略|内部模板|内部分类|处理步骤)\s*[:：].*$", "", text)
     if re.search(r"(?i)thinking process\s*:", text):
         public_match = re.search(
             r"(?m)^(?:\*\*)?(结论|直接回答|答案|依据|行动建议|补充说明)(?:\*\*)?\s*$",

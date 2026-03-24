@@ -113,9 +113,9 @@ def _resolve_model_route_mode(
 
 def _model_route_desc(route_mode: str) -> str:
     return {
-        MODEL_ROUTE_CLOUD_ONLY: "云端模型直答（Qwen 主答，知识库按需校验）",
+        MODEL_ROUTE_CLOUD_ONLY: "云端模型直答（Qwen 主答，不依赖知识库）",
         MODEL_ROUTE_HYBRID: "云端+本地协同（Qwen 主答，知识库轻量补充）",
-        MODEL_ROUTE_LOCAL_ONLY: "仅本地模型（Qwen 主答）",
+        MODEL_ROUTE_LOCAL_ONLY: "仅本地模型（知识库增强回答）",
         MODEL_ROUTE_RETRIEVAL_ONLY: "检索整理模式（未启用模型）",
     }.get(route_mode, route_mode)
 
@@ -698,6 +698,51 @@ def _format_retrieval_contexts_for_generation(
         if len(formatted) >= limit:
             break
     return formatted
+
+
+def _build_unique_sources(
+    retrieved: list[dict],
+    limit: int = 5,
+) -> list[SourceItem]:
+    deduped: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    for item in retrieved:
+        source_location = str(item.get("source_location") or "").strip()
+        content = str(item.get("content") or "").strip()
+        if not source_location or not content:
+            continue
+        score_raw = item.get("score")
+        try:
+            score = float(score_raw)
+        except (TypeError, ValueError):
+            score = 0.0
+        key = source_location.lower()
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = {
+                "source_location": source_location,
+                "content": content,
+                "score": score,
+            }
+            order.append(key)
+            continue
+        if score > float(existing.get("score", 0.0)):
+            existing["score"] = score
+            existing["content"] = content
+
+    output: list[SourceItem] = []
+    for key in order:
+        row = deduped.get(key) or {}
+        output.append(
+            SourceItem(
+                source_location=str(row.get("source_location") or ""),
+                content=str(row.get("content") or ""),
+                score=round(float(row.get("score") or 0.0), 4),
+            )
+        )
+        if len(output) >= limit:
+            break
+    return output
 
 
 def _fast_retrieval_answer(
@@ -1458,63 +1503,71 @@ def _build_summary_thinking(
     total_ms: int,
 ) -> ChatThinking:
     steps: list[str] = []
-    if trimmed_history:
-        rounds = max(1, (len(trimmed_history) + 1) // 2)
-        steps.append(f"已结合最近 {rounds} 轮对话上下文整理当前问题。")
+    rounds = max(1, (len(trimmed_history) + 1) // 2) if trimmed_history else 0
+    route_desc = _model_route_desc(route_mode)
+    if rounds > 0:
+        steps.append(f"已结合最近 {rounds} 轮上下文，回答策略为：{route_desc}。")
     else:
-        steps.append("已读取当前问题并准备检索。")
-    steps.append(f"当前回答策略：{_model_route_desc(route_mode)}。")
+        steps.append(f"已读取当前问题，回答策略为：{route_desc}。")
 
     if rule_answer:
-        steps.append("命中系统内置规则回答，未进入知识库检索和模型生成。")
+        steps.append("命中系统规则快速回答，未进入检索与模型生成。")
     else:
         scope_text = _build_scope_text(kb_ids, document_ids)
         if route_mode == MODEL_ROUTE_CLOUD_ONLY and retrieval_ms <= 0:
-            steps.append(f"当前为云端直答模式，本轮未优先执行{scope_text}检索。")
+            steps.append("云端直答模式：本轮跳过知识库检索，直接进入模型生成。")
         elif retrieved_count > 0:
             steps.append(
-                f"已在{scope_text}中筛到 {retrieved_count} 条相关片段（Top-K={top_k}，阈值={score_threshold:.2f}）。"
+                f"检索结果：在{scope_text}命中 {retrieved_count} 条高相关资料（Top-K={top_k}）。"
             )
         else:
             steps.append(
-                f"已在{scope_text}中完成检索，但当前阈值 {score_threshold:.2f} 下没有足够相关的参考资料。"
+                f"检索结果：在{scope_text}未命中高置信资料（阈值 {score_threshold:.2f}）。"
             )
 
         if llm_result is None:
-            steps.append("本次回答直接基于检索结果整理。")
+            steps.append("生成结果：基于检索结果完成整理。")
         elif llm_result.mode in {"llm", "llm_retry"}:
-            if question_mode == QUESTION_MODE_OPEN:
-                steps.append("已先由模型独立回答，再补充知识库线索做轻量校验。")
-            elif route_mode == MODEL_ROUTE_CLOUD_ONLY and retrieved_count == 0:
-                steps.append("已基于云端模型直接生成最终回答。")
-            else:
-                steps.append("已基于检索结果组织最终回答。")
+            steps.append("生成结果：由大模型主答完成。")
         elif llm_result.mode == "disabled":
-            steps.append(
-                "当前未启用可返回 reasoning 的模型，本次回答由检索结果整理生成。"
-            )
+            steps.append("生成结果：模型未启用，按检索证据完成回答。")
+        elif "fallback" in llm_result.mode:
+            steps.append("生成结果：主答超时或异常，已切换到稳妥兜底回答。")
         else:
-            steps.append("模型未返回可公开展示的 reasoning，本次展示的是系统处理摘要。")
+            steps.append(f"生成结果：已完成回答（mode={llm_result.mode}）。")
 
-    steps.append("这里展示的是处理摘要，不是模型私有思维链。")
-    steps.append(
-        "性能耗时："
-        f"profile_ms={profile_ms}，retrieval_ms={retrieval_ms}，"
-        f"llm_ms={llm_ms}，total_ms={total_ms}。"
-    )
+    perf_parts = [f"总耗时 {total_ms}ms"]
+    if profile_ms > 0:
+        perf_parts.append(f"画像 {profile_ms}ms")
+    if retrieval_ms > 0:
+        perf_parts.append(f"检索 {retrieval_ms}ms")
+    if llm_ms > 0:
+        perf_parts.append(f"生成 {llm_ms}ms")
     if workflow_wait_ms > 0:
-        steps.append(f"流程等待耗时：workflow_wait_ms={workflow_wait_ms}。")
+        perf_parts.append(f"等待 {workflow_wait_ms}ms")
+    steps.append("性能：" + "，".join(perf_parts) + "。")
     if workflow_stage and workflow_stage != "done":
-        steps.append(f"当前判定卡点：workflow_stage={workflow_stage}。")
+        steps.append(f"当前阶段：{workflow_stage}。")
+    steps.append("以上为系统处理摘要，不包含模型私有推理链。")
     return ChatThinking(
         title="处理摘要",
-        content="\n".join(
-            f"{index}. {step}" for index, step in enumerate(steps, start=1)
-        ),
+        content="\n".join(f"- {step}" for step in steps),
         kind="summary",
         is_real=False,
         collapsed=True,
     )
+
+
+def _trim_public_reasoning(reasoning: str, max_chars: int = 900) -> str:
+    text = (reasoning or "").replace("\r\n", "\n").strip()
+    if not text:
+        return ""
+    text = _strip_internal_template_text(text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) <= max_chars:
+        return text
+    trimmed = text[:max_chars].rstrip()
+    return f"{trimmed}\n\n（思考内容较长，已截断展示）"
 
 
 def _build_thinking_payload(
@@ -1540,9 +1593,10 @@ def _build_thinking_payload(
         and llm_result.reasoning
         and not _looks_like_private_reasoning_text(llm_result.reasoning)
     ):
+        public_reasoning = _trim_public_reasoning(llm_result.reasoning)
         return ChatThinking(
             title="思考过程",
-            content=llm_result.reasoning,
+            content=public_reasoning,
             kind="reasoning",
             is_real=True,
             collapsed=True,
@@ -1935,28 +1989,32 @@ def chat_completion(
                 status="start",
                 detail=detail,
             )
-            query = _resolve_retrieval_query(runtime_question)
             try:
-                retrieved = _run_retrieval_query(
-                    query,
-                    effective_top_k,
-                    effective_threshold,
-                )
-                if allow_relaxed_retry and not retrieved:
-                    relaxed_top_k = min(8, max(effective_top_k + 2, 3))
-                    relaxed_threshold = max(
-                        MIN_RELAXED_THRESHOLD,
-                        min(0.24, effective_threshold - 0.06),
+                if route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
+                    retrieval_skipped = True
+                    retrieved = []
+                else:
+                    query = _resolve_retrieval_query(runtime_question)
+                    retrieved = _run_retrieval_query(
+                        query,
+                        effective_top_k,
+                        effective_threshold,
                     )
-                    if (
-                        relaxed_top_k > effective_top_k
-                        or relaxed_threshold < effective_threshold
-                    ):
-                        retrieved = _run_retrieval_query(
-                            query,
-                            relaxed_top_k,
-                            relaxed_threshold,
+                    if allow_relaxed_retry and not retrieved:
+                        relaxed_top_k = min(8, max(effective_top_k + 2, 3))
+                        relaxed_threshold = max(
+                            MIN_RELAXED_THRESHOLD,
+                            min(0.24, effective_threshold - 0.06),
                         )
+                        if (
+                            relaxed_top_k > effective_top_k
+                            or relaxed_threshold < effective_threshold
+                        ):
+                            retrieved = _run_retrieval_query(
+                                query,
+                                relaxed_top_k,
+                                relaxed_threshold,
+                            )
             except Exception:
                 logger.exception(
                     "retrieval failed: conversation=%s agent=%s",
@@ -2016,6 +2074,9 @@ def chat_completion(
                 if contexts
                 else _format_retrieval_contexts_for_generation(retrieved)
             )
+            cloud_direct_mode = route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled
+            if cloud_direct_mode:
+                retrieval_contexts = []
             background_contexts: list[str] = []
             if question_mode != QUESTION_MODE_FACT and history_context:
                 background_contexts.append(
@@ -2031,9 +2092,12 @@ def chat_completion(
                     if compact:
                         background_contexts.append(compact)
             prefer_model_answer = (
-                generation_first_mode
-                and not is_academic_analysis
-                and not bool(retrieved)
+                cloud_direct_mode
+                or (
+                    generation_first_mode
+                    and not is_academic_analysis
+                    and not bool(retrieved)
+                )
             )
             if prefer_model_answer:
                 generation_contexts = background_contexts[:3]
@@ -2275,23 +2339,26 @@ def chat_completion(
                         local_future.cancel()
                         local_executor.shutdown(wait=False, cancel_futures=True)
                 elif cloud_enabled:
-                    allow_general_mode = prefer_model_answer or (
-                        route_mode == MODEL_ROUTE_CLOUD_ONLY
-                        and question_mode != QUESTION_MODE_FACT
-                        and not bool(retrieved)
+                    allow_general_mode = True if cloud_direct_mode else prefer_model_answer
+                    kb_hit_flag = False if (prefer_model_answer or cloud_direct_mode) else bool(retrieved)
+                    cloud_system_instruction = (
+                        ""
+                        if cloud_direct_mode
+                        else (
+                            ""
+                            if (
+                                allow_general_mode
+                                and not kb_hit_flag
+                                and not prefer_model_answer
+                            )
+                            else system_instruction
+                        )
                     )
-                    kb_hit_flag = False if prefer_model_answer else bool(retrieved)
                     llm_result = answer_with_llm(
                         question=runtime_question,
                         contexts=generation_contexts,
                         llm_enabled=cloud_enabled,
-                        system_instruction=""
-                        if (
-                            allow_general_mode
-                            and not kb_hit_flag
-                            and not prefer_model_answer
-                        )
-                        else system_instruction,
+                        system_instruction=cloud_system_instruction,
                         agent_key=payload.agent_key,
                         timeout_seconds=generation_timeout,
                         allow_general_knowledge=allow_general_mode,
@@ -2361,7 +2428,11 @@ def chat_completion(
                 (payload.agent_key or "").strip().lower()
             )
             _load_profile(question)
-            if get_agent_bound_kb_name(payload.agent_key) and not retrieved:
+            if (
+                route_mode != MODEL_ROUTE_CLOUD_ONLY
+                and get_agent_bound_kb_name(payload.agent_key)
+                and not retrieved
+            ):
                 try:
                     _retrieve(
                         question,
@@ -2726,17 +2797,11 @@ def chat_completion(
                 agent_key=payload.agent_key,
             )
 
-        if retrieved:
-            sources = [
-                SourceItem(
-                    source_location=item["source_location"],
-                    content=item["content"],
-                    score=round(item["score"], 4),
-                )
-                for item in retrieved
-            ]
-        else:
-            sources = []
+        show_sources = route_mode in {
+            MODEL_ROUTE_LOCAL_ONLY,
+            MODEL_ROUTE_RETRIEVAL_ONLY,
+        }
+        sources = _build_unique_sources(retrieved) if (show_sources and retrieved) else []
 
     if route_mode in {MODEL_ROUTE_LOCAL_ONLY, MODEL_ROUTE_RETRIEVAL_ONLY}:
         answer = _format_final_user_answer(
@@ -2790,7 +2855,7 @@ def chat_completion(
     thinking = ChatThinking(
         title=thinking.title,
         content=thinking_content
-        or "1. 已完成当前问题处理。\n2. 这里展示的是系统处理摘要，不是模型私有思维链。",
+        or "- 已完成当前问题处理。\n- 这里展示的是系统处理摘要，不包含模型私有思维链。",
         kind=thinking.kind,
         is_real=thinking.is_real,
         collapsed=thinking.collapsed,
