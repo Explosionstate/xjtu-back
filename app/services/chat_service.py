@@ -187,6 +187,12 @@ _PRIVATE_REASONING_MARKERS = (
     "Drafting Content",
     "Review and Refine",
     "Character Count Check",
+    "<system-reminder>",
+    "Plan Mode",
+    "READ-ONLY",
+    "CRITICAL: Plan mode ACTIVE",
+    "Your operational mode has changed from plan to build.",
+    "You are no longer in read-only mode.",
 )
 
 
@@ -787,6 +793,14 @@ def _fast_retrieval_answer(
         snippets = ["已检索到相关片段，但可直接引用的文本较少。"]
     evidence_hint = _compact_text(snippets[0], 42)
     if _looks_like_service_process_query(question):
+        if _looks_like_course_selection_query(question):
+            return (
+                f"先直接答复：像“{question[:28]}”这类选课问题，先确认培养方案要求，再核对选课时间、学分限制和先修条件（{agent_focus}）。\n"
+                "1) 先看培养方案：确认本学期必修、限选、任选以及建议修读顺序；\n"
+                "2) 再看系统限制：核对学分上下限、先修课程、时间冲突和课程容量；\n"
+                "3) 提交前再检查：确认退补改时间、是否需要学院审批、是否影响后续课程安排；\n"
+                f"可参考线索：{evidence_hint or '当前命中资料'}。"
+            )
         return (
             f"先直接答复：像“{question[:28]}”这类事务，建议你先立刻完成挂失/冻结，再尽快按学校流程补办或线下处理（{agent_focus}）。\n"
             "1) 先做止损：优先挂失，避免继续消费或被他人使用；\n"
@@ -825,6 +839,8 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
+    if _looks_like_service_process_query(q):
+        return "service_process"
     if _looks_like_decision_guidance_query(q):
         return "guidance"
     if any(
@@ -1212,6 +1228,29 @@ def _looks_like_service_process_query(question: str) -> bool:
     return any(token in q for token in service_tokens)
 
 
+def _looks_like_course_selection_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    return "选课" in q or (
+        any(token in q for token in ["课程", "学分", "绩点", "培养方案", "先修"])
+        and any(token in q for token in ["要求", "规则", "限制", "时间"])
+    )
+
+
+def _should_prefer_bound_retrieval_generation(
+    agent_key: str | None,
+    *,
+    question_mode: str,
+    question: str,
+) -> bool:
+    if not get_agent_bound_kb_name(agent_key):
+        return False
+    return question_mode == QUESTION_MODE_FACT or _looks_like_service_process_query(
+        question
+    )
+
+
 def _looks_like_open_guidance_query(question: str) -> bool:
     q = (question or "").strip().lower()
     if not q:
@@ -1450,6 +1489,8 @@ def _build_summary_thinking(
     score_threshold: float,
     rule_answer: bool,
     llm_result: LLMAnswerResult | None,
+    used_retrieval_in_generation: bool,
+    prefer_model_answer_used: bool,
     profile_ms: int,
     retrieval_ms: int,
     llm_ms: int,
@@ -1483,16 +1524,23 @@ def _build_summary_thinking(
         if llm_result is None:
             steps.append("本次回答直接基于检索结果整理。")
         elif llm_result.mode in {"llm", "llm_retry"}:
-            if question_mode == QUESTION_MODE_OPEN:
+            if used_retrieval_in_generation:
+                steps.append("已基于检索结果组织最终回答。")
+            elif prefer_model_answer_used:
                 steps.append("已先由模型独立回答，再补充知识库线索做轻量校验。")
             elif route_mode == MODEL_ROUTE_CLOUD_ONLY and retrieved_count == 0:
                 steps.append("已基于云端模型直接生成最终回答。")
             else:
-                steps.append("已基于检索结果组织最终回答。")
+                steps.append("已基于云端模型直接生成最终回答。")
         elif llm_result.mode == "disabled":
             steps.append(
                 "当前未启用可返回 reasoning 的模型，本次回答由检索结果整理生成。"
             )
+        elif llm_result.mode in {"timeout_fallback", "error_fallback"}:
+            if retrieved_count > 0:
+                steps.append("云端生成未稳定完成，已基于命中片段返回兜底答案。")
+            else:
+                steps.append("云端生成未稳定完成，当前展示的是系统兜底结果。")
         else:
             steps.append("模型未返回可公开展示的 reasoning，本次展示的是系统处理摘要。")
 
@@ -1528,6 +1576,8 @@ def _build_thinking_payload(
     score_threshold: float,
     rule_answer: bool,
     llm_result: LLMAnswerResult | None,
+    used_retrieval_in_generation: bool,
+    prefer_model_answer_used: bool,
     profile_ms: int,
     retrieval_ms: int,
     llm_ms: int,
@@ -1558,6 +1608,8 @@ def _build_thinking_payload(
         score_threshold=score_threshold,
         rule_answer=rule_answer,
         llm_result=llm_result,
+        used_retrieval_in_generation=used_retrieval_in_generation,
+        prefer_model_answer_used=prefer_model_answer_used,
         profile_ms=profile_ms,
         retrieval_ms=retrieval_ms,
         llm_ms=llm_ms,
@@ -1730,6 +1782,11 @@ def chat_completion(
 
     question_mode = _resolve_question_mode(payload.agent_key, question)
     is_academic_analysis = question_mode == QUESTION_MODE_ACADEMIC
+    prefer_bound_retrieval_generation = _should_prefer_bound_retrieval_generation(
+        payload.agent_key,
+        question_mode=question_mode,
+        question=question,
+    )
     generation_first_mode = _should_use_generation_first_mode(
         question_mode=question_mode,
         route_mode=route_mode,
@@ -1740,7 +1797,7 @@ def chat_completion(
     # - Cloud mode: direct LLM answer (KB retrieval is optional, not mandatory).
     # - Local mode: retrieval-enhanced answering only.
     if route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
-        generation_first_mode = True
+        generation_first_mode = not prefer_bound_retrieval_generation
     elif route_mode == MODEL_ROUTE_LOCAL_ONLY:
         generation_first_mode = False
     chat_total_timeout = (
@@ -1796,6 +1853,10 @@ def chat_completion(
         chat_total_timeout = max(chat_total_timeout, 120)
         workflow_timeout_cap = max(workflow_timeout_cap, 112)
         generation_timeout = max(generation_timeout, 90)
+    elif prefer_bound_retrieval_generation and cloud_enabled:
+        chat_total_timeout = max(chat_total_timeout, 96)
+        workflow_timeout_cap = max(workflow_timeout_cap, 90)
+        generation_timeout = max(generation_timeout, 72)
 
     logger.info(
         "chat time budget: conversation=%s agent=%s route=%s cloud=%s local=%s total=%ss workflow_cap=%ss generation=%ss",
@@ -1812,6 +1873,8 @@ def chat_completion(
     start = perf_counter()
     llm_result: LLMAnswerResult | None = None
     retrieved: list[dict] = []
+    used_retrieval_in_generation = False
+    prefer_model_answer_used = False
     profile_context_text = ""
     profile_ms = 0
     retrieval_ms = 0
@@ -2000,7 +2063,11 @@ def chat_completion(
             contexts: list[str],
             system_instruction: str,
         ) -> str:
-            nonlocal llm_result, llm_ms, workflow_stage
+            nonlocal llm_result
+            nonlocal llm_ms
+            nonlocal workflow_stage
+            nonlocal used_retrieval_in_generation
+            nonlocal prefer_model_answer_used
             workflow_stage = "generation"
             stage_start = perf_counter()
             _emit_progress(
@@ -2030,11 +2097,17 @@ def chat_completion(
                     compact = _compact_text(item, 280)
                     if compact:
                         background_contexts.append(compact)
+            retrieval_led_fact_mode = _should_prefer_bound_retrieval_generation(
+                payload.agent_key,
+                question_mode=question_mode,
+                question=runtime_question,
+            )
             prefer_model_answer = (
                 generation_first_mode
                 and not is_academic_analysis
                 and not bool(retrieved)
             )
+            prefer_model_answer_used = prefer_model_answer
             if prefer_model_answer:
                 generation_contexts = background_contexts[:3]
                 llm_retrieval_contexts: list[str] = []
@@ -2042,8 +2115,16 @@ def chat_completion(
                 route_mode in {MODEL_ROUTE_CLOUD_ONLY, MODEL_ROUTE_HYBRID}
                 and cloud_enabled
             ):
-                generation_contexts = (background_contexts + retrieval_contexts[:1])[:3]
-                llm_retrieval_contexts = retrieval_contexts[:1]
+                if retrieval_led_fact_mode:
+                    llm_retrieval_contexts = retrieval_contexts[:3]
+                    generation_contexts = (
+                        llm_retrieval_contexts + background_contexts[:1]
+                    )[:4]
+                else:
+                    generation_contexts = (
+                        background_contexts + retrieval_contexts[:1]
+                    )[:3]
+                    llm_retrieval_contexts = retrieval_contexts[:1]
             else:
                 generation_contexts = (
                     (retrieval_contexts + background_contexts)[:4]
@@ -2051,6 +2132,7 @@ def chat_completion(
                     else []
                 )
                 llm_retrieval_contexts = retrieval_contexts
+            used_retrieval_in_generation = bool(llm_retrieval_contexts)
 
             def _attempt_local_open_backup() -> LLMAnswerResult | None:
                 if not local_transformer_backup_available():
@@ -2779,6 +2861,8 @@ def chat_completion(
         score_threshold=score_threshold,
         rule_answer=bool(rule_answer_text),
         llm_result=llm_result,
+        used_retrieval_in_generation=used_retrieval_in_generation,
+        prefer_model_answer_used=prefer_model_answer_used,
         profile_ms=profile_ms,
         retrieval_ms=retrieval_ms,
         llm_ms=llm_ms,

@@ -223,6 +223,161 @@ def test_bound_agent_generation_first_prefetches_kb_context(monkeypatch) -> None
         assert observed["kb_hit"] is True
         assert observed["allow_general_knowledge"] is False
         assert observed["retrieval_contexts"]
+        thinking = payload["data"].get("thinking") or {}
+        content = str(thinking.get("content") or "")
+        assert "已基于检索结果组织最终回答" in content
+        assert "已先由模型独立回答" not in content
+
+
+def test_bound_fact_query_prefers_retrieval_led_generation(monkeypatch) -> None:
+    from app.services import chat_service
+
+    _ensure_active_kb("学生成长助手知识库")
+    observed: dict[str, object] = {"retrieve_calls": 0}
+
+    def _fake_answer_with_llm(*args, **kwargs):
+        observed["allow_general_knowledge"] = kwargs.get("allow_general_knowledge")
+        observed["kb_hit"] = kwargs.get("kb_hit")
+        observed["retrieval_contexts"] = list(kwargs.get("retrieval_contexts") or [])
+        return chat_service.LLMAnswerResult(
+            answer="请优先核对培养方案、学分限制和选课时间。",
+            mode="llm",
+        )
+
+    def _fake_retrieve(*args, **kwargs):
+        observed["retrieve_calls"] = int(observed["retrieve_calls"] or 0) + 1
+        return [
+            {
+                "chunk_id": "chunk-1",
+                "document_id": "doc-1",
+                "content": "本科生选课前需核对培养方案、学分要求和课程修读顺序。",
+                "source_location": "学生成长助手知识库/选课要求.md",
+                "score": 0.95,
+            },
+            {
+                "chunk_id": "chunk-2",
+                "document_id": "doc-1",
+                "content": "选课时还需关注先修课程限制、时间冲突和课程容量。",
+                "source_location": "学生成长助手知识库/选课要求.md",
+                "score": 0.92,
+            },
+            {
+                "chunk_id": "chunk-3",
+                "document_id": "doc-1",
+                "content": "提交前应确认退补改时间窗口及是否需要学院审批。",
+                "source_location": "学生成长助手知识库/选课要求.md",
+                "score": 0.90,
+            },
+        ]
+
+    def _fake_workflow(**kwargs):
+        kwargs["load_profile_fn"](kwargs["question"])
+        contexts, _retrieved = kwargs["retrieve_fn"](kwargs["question"])
+        answer = kwargs["generate_fn"](kwargs["question"], contexts, "")
+        return {
+            "error": "",
+            "system_instruction": "",
+            "answer": answer,
+            "blocked_stage": "",
+            "blocked_word": "",
+        }
+
+    monkeypatch.setattr(chat_service, "answer_with_llm", _fake_answer_with_llm)
+    monkeypatch.setattr(chat_service, "hybrid_retrieve", _fake_retrieve)
+    monkeypatch.setattr(chat_service, "run_chat_workflow_graph", _fake_workflow)
+    monkeypatch.setattr(chat_service, "_format_rule_answer", lambda _question: "")
+    monkeypatch.setattr(chat_service, "load_user_profile_context", lambda _login: "")
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "conversationId": "bound-fact-led-test",
+                "agentKey": "student-growth",
+                "llmEnabled": True,
+                "localTransformerEnabled": False,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "我是大一软件学院学生，我现在要选课了，选课有什么要求吗",
+                    }
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        assert observed["retrieve_calls"] >= 1
+        assert observed["allow_general_knowledge"] is False
+        assert observed["kb_hit"] is True
+        assert len(list(observed["retrieval_contexts"] or [])) >= 2
+        thinking = payload["data"].get("thinking") or {}
+        content = str(thinking.get("content") or "")
+        assert "已基于检索结果组织最终回答" in content
+
+
+def test_private_reasoning_is_hidden_from_thinking_payload(monkeypatch) -> None:
+    from app.services import chat_service
+
+    monkeypatch.setattr(chat_service, "_format_rule_answer", lambda _question: "")
+    monkeypatch.setattr(chat_service, "hybrid_retrieve", lambda *args, **kwargs: [])
+    monkeypatch.setattr(chat_service, "load_user_profile_context", lambda _login: "")
+
+    def _fake_answer_with_llm(*args, **kwargs):
+        return chat_service.LLMAnswerResult(
+            answer="这是正常回答。",
+            mode="llm",
+            reasoning=(
+                "<system-reminder>\n"
+                "Your operational mode has changed from plan to build.\n"
+                "You are no longer in read-only mode.\n"
+                "</system-reminder>\n"
+                "CRITICAL: Plan mode ACTIVE\n"
+                "READ-ONLY"
+            ),
+        )
+
+    monkeypatch.setattr(chat_service, "answer_with_llm", _fake_answer_with_llm)
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "conversationId": "private-reasoning-hidden-test",
+                "agentKey": "default",
+                "llmEnabled": True,
+                "localTransformerEnabled": False,
+                "messages": [{"role": "user", "content": "请解释一下选课要求"}],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        thinking = payload["data"].get("thinking") or {}
+        assert thinking.get("title") == "处理摘要"
+        assert "system-reminder" not in str(thinking.get("content") or "").lower()
+
+
+def test_fast_retrieval_answer_for_course_selection_is_not_generic_loss_flow() -> None:
+    from app.services import chat_service
+
+    answer = chat_service._fast_retrieval_answer(
+        "我是大一软件学院学生，我现在要选课了，选课有什么要求吗",
+        [
+            {
+                "content": "本科生选课前需核对培养方案、学分要求和课程修读顺序。",
+                "source_location": "学生成长助手知识库/选课要求.md",
+            }
+        ],
+        agent_key="student-growth",
+    )
+    assert "培养方案" in answer
+    assert "学分" in answer
+    assert "挂失" not in answer
 
 
 def test_hybrid_mode_kb_miss_uses_cloud_completion(monkeypatch) -> None:

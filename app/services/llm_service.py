@@ -88,6 +88,17 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
         presence_penalty=0.12,
         organization_hint="按可执行步骤输出，每步写清目标与动作。",
     ),
+    "service_process": AnswerStyleProfile(
+        style="service_process",
+        context_limit=3,
+        context_chars=520,
+        max_tokens=240,
+        temperature_floor=0.16,
+        top_p=0.84,
+        frequency_penalty=0.2,
+        presence_penalty=0.06,
+        organization_hint="先给结论，再按要求、时间/入口、限制条件、注意事项输出。",
+    ),
     "summary": AnswerStyleProfile(
         style="summary",
         context_limit=3,
@@ -200,9 +211,28 @@ def _build_timeout_guided_fallback(
     is_complex_query = complexity_mode == "complex"
     if not is_complex_query:
         best_evidence = evidence_lines[0] if evidence_lines else ""
-        if best_evidence:
+        evidence_hint = re.sub(r"[#`>*_\-|]+", " ", best_evidence)
+        evidence_hint = re.sub(r"\s+", " ", evidence_hint).strip()[:120]
+        if style == "service_process":
+            if _looks_like_course_selection_query(question):
+                return _render_course_selection_fallback(focus, evidence_hint)
+            return _render_service_process_fallback(focus, evidence_hint)
+        if style == "guidance":
+            if _looks_like_club_overload_query(question):
+                return _render_club_overload_fallback(focus, evidence_hint)
+            if _looks_like_doctoral_extension_query(question):
+                return _render_doctoral_extension_fallback(focus, evidence_hint)
+            if _looks_like_learning_support_query(question):
+                return _render_learning_support_fallback(focus, evidence_hint)
+            if _looks_like_service_process_query(question):
+                return _render_service_process_fallback(focus, evidence_hint)
+            if _looks_like_stress_conflict_query(question):
+                return _render_stress_conflict_fallback(focus)
+            if _looks_like_decision_guidance_query(question):
+                return _render_decision_guidance_fallback(focus)
+        if evidence_hint:
             return (
-                f"围绕“{focus}”，我先给你一个直接结论：{best_evidence}。"
+                f"围绕“{focus}”，我先给你一个直接结论：当前可核验线索显示，{evidence_hint}。"
                 "当前云端响应超时，如果你愿意我可以继续补充更细的原因和执行建议。"
             )
         return (
@@ -510,9 +540,15 @@ def _build_structured_prompt(
     )
 
     if kb_hit:
-        evidence_policy = (
-            "知识库已命中：先独立给出判断，再用1条证据做校验；不要复读证据原文。"
-        )
+        if style_profile.style == "service_process":
+            evidence_policy = (
+                "知识库已命中：先直接给出可执行结论，再按要求、时间/入口、限制条件、注意事项组织回答；"
+                "综合2-3条证据，不要复读表格或原文。"
+            )
+        else:
+            evidence_policy = (
+                "知识库已命中：先独立给出判断，再用1条证据做校验；不要复读证据原文。"
+            )
     elif allow_general_knowledge:
         evidence_policy = "知识库未命中：可结合通用知识回答，但需要明确哪些是通用判断。"
     else:
@@ -520,16 +556,20 @@ def _build_structured_prompt(
             f"知识库未命中：不编造事实；按该智能体无答案策略执行：{no_answer_hint}"
         )
 
-    complexity_instruction = (
-        "复杂问题：使用自然小标题或编号，至少覆盖结论、关键依据、风险边界、执行步骤；内容要具体，避免空泛。"
-        if is_complex_query
-        else "简单问题：直接自然回答，不要强行套固定三段式；1-3段即可说清楚。"
-    )
-    length_instruction = (
-        "篇幅：更详细完整，可适度展开。"
-        if is_complex_query
-        else "篇幅：尽量简洁，避免重复和冗余铺垫。"
-    )
+    if style_profile.style == "service_process":
+        complexity_instruction = "流程/要求类问题：优先输出检查清单，可使用编号；覆盖要求、时间/入口、限制条件、注意事项。"
+        length_instruction = "篇幅：控制在清晰可执行的 3-6 行，不要复读原始片段。"
+    else:
+        complexity_instruction = (
+            "复杂问题：使用自然小标题或编号，至少覆盖结论、关键依据、风险边界、执行步骤；内容要具体，避免空泛。"
+            if is_complex_query
+            else "简单问题：直接自然回答，不要强行套固定三段式；1-3段即可说清楚。"
+        )
+        length_instruction = (
+            "篇幅：更详细完整，可适度展开。"
+            if is_complex_query
+            else "篇幅：尽量简洁，避免重复和冗余铺垫。"
+        )
     return (
         f"{(system_instruction or '').strip()}\n"
         f"{academic_prompt}"
@@ -794,6 +834,8 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
+    if _looks_like_service_process_query(q):
+        return "service_process"
     if _looks_like_club_overload_query(q):
         return "guidance"
     if _looks_like_doctoral_extension_query(q):
@@ -954,6 +996,30 @@ def _looks_like_service_process_query(question: str) -> bool:
     return any(token in q for token in service_tokens)
 
 
+def _looks_like_course_selection_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    return "选课" in q or (
+        any(token in q for token in ["课程", "学分", "绩点", "培养方案", "先修"])
+        and any(token in q for token in ["要求", "规则", "限制", "时间"])
+    )
+
+
+def _render_course_selection_fallback(
+    question_focus: str, evidence_hint: str = ""
+) -> str:
+    hint = f"\n可参考线索：{evidence_hint}。" if evidence_hint else ""
+    return (
+        f"先直接答复：围绕“{question_focus}”，选课前要先确认培养方案要求，再核对时间窗口、学分限制和先修条件。\n"
+        "1) 先看培养方案：确认本学期必修、限选、任选和建议修读顺序；\n"
+        "2) 再看系统限制：核对学分上下限、先修课程、时间冲突和课程容量；\n"
+        "3) 提交前再检查：确认退补改时间、是否需要学院审批、是否影响后续课程安排；\n"
+        "4) 若规则拿不准，优先联系学院教务老师或辅导员核实。"
+        f"{hint}"
+    )
+
+
 def _render_decision_guidance_fallback(question_focus: str) -> str:
     return (
         f"先直接回答：对于“{question_focus}”，先不要急着做一次性押注，建议用 2-4 周做双轨验证。\n"
@@ -1046,18 +1112,9 @@ def _compact_contexts(contexts: list[str], limit: int, max_chars: int) -> list[s
 
 
 def _normalize_answer_text(answer: str) -> str:
-    text = (answer or "").replace("\r\n", "\n").strip()
+    text = _sanitize_model_text(answer)
     if not text:
         return ""
-    text = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
-    text = re.sub(r"(?is)<system-reminder>.*?</system-reminder>", "", text).strip()
-    if re.search(r"(?i)thinking process\s*:", text):
-        public_match = re.search(
-            r"(?m)^(?:\*\*)?(结论|直接回答|答案|依据|行动建议|补充说明)(?:\*\*)?\s*$",
-            text,
-        )
-        if public_match:
-            text = text[public_match.start() :].strip()
     lines = [line.rstrip() for line in text.splitlines()]
     cleaned_lines: list[str] = []
     for line in lines:
@@ -1070,6 +1127,29 @@ def _normalize_answer_text(answer: str) -> str:
             continue
         cleaned_lines.append(stripped)
     return "\n".join(cleaned_lines).strip()
+
+
+def _normalize_reasoning_text(reasoning: str | None) -> str | None:
+    text = _normalize_answer_text(reasoning or "")
+    return text or None
+
+
+def _sanitize_model_text(text: str | None) -> str:
+    content = (text or "").replace("\r\n", "\n").strip()
+    if not content:
+        return ""
+    content = re.sub(r"(?is)<think>.*?</think>", "", content).strip()
+    content = re.sub(
+        r"(?is)<system-reminder>.*?</system-reminder>", "", content
+    ).strip()
+    if re.search(r"(?i)thinking process\s*:", content):
+        public_match = re.search(
+            r"(?m)^(?:\*\*)?(结论|直接回答|答案|依据|行动建议|补充说明)(?:\*\*)?\s*$",
+            content,
+        )
+        if public_match:
+            content = content[public_match.start() :].strip()
+    return content
 
 
 def _render_no_context_fallback(
@@ -1094,6 +1174,10 @@ def _render_no_context_fallback(
             f"当前资料不足，暂时无法对“{question_focus}”做有效摘要。\n"
             f"建议：{no_answer_text}。"
         )
+    if style == "service_process":
+        if _looks_like_course_selection_query(normalized_question):
+            return _render_course_selection_fallback(question_focus)
+        return _render_service_process_fallback(question_focus)
     if style == "guidance":
         if _looks_like_club_overload_query(normalized_question):
             return _render_club_overload_fallback(question_focus)
@@ -1145,6 +1229,10 @@ def _render_general_knowledge_fallback(
             f"关于“{question_focus}”，我先给你一个可直接使用的通用摘要结构：\n"
             "背景、核心要点、风险提示、下一步行动。"
         )
+    if style == "service_process":
+        if _looks_like_course_selection_query(question_focus):
+            return _render_course_selection_fallback(question_focus)
+        return _render_service_process_fallback(question_focus)
     if style == "guidance":
         if _looks_like_club_overload_query(question_focus):
             return _render_club_overload_fallback(question_focus)
@@ -1229,6 +1317,10 @@ def _render_context_fallback(
             "4) 按复盘结果滚动调整计划，并优先处理高收益低成本事项。\n"
             f"可参考线索：{evidence_hint or '当前命中资料'}。"
         )
+    if style == "service_process":
+        if _looks_like_course_selection_query(normalized_question):
+            return _render_course_selection_fallback(question_focus, evidence_hint)
+        return _render_service_process_fallback(question_focus, evidence_hint)
     if style == "analysis" or any(
         token in normalized_question for token in ["原因", "分析", "风险"]
     ):
@@ -1270,7 +1362,7 @@ def _extract_reasoning_text(response: Any) -> str | None:
         container = getattr(response, container_name, None)
         text = _extract_reasoning_from_mapping(container)
         if text:
-            return text
+            return _normalize_reasoning_text(text)
 
     content = getattr(response, "content", None)
     if isinstance(content, list):
@@ -1290,7 +1382,7 @@ def _extract_reasoning_text(response: Any) -> str | None:
             if text:
                 parts.append(text)
         if parts:
-            return "\n".join(parts).strip()
+            return _normalize_reasoning_text("\n".join(parts).strip())
     return None
 
 
@@ -1301,7 +1393,7 @@ def _extract_reasoning_from_mapping(value: Any) -> str | None:
     for key in ("reasoning_content", "reasoning", "thinking", "thoughts"):
         text = _flatten_text(value.get(key))
         if text:
-            return text
+            return _normalize_reasoning_text(text)
 
     for nested in value.values():
         text = _extract_reasoning_from_mapping(nested)
