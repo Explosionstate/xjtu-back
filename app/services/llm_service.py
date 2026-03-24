@@ -390,7 +390,8 @@ def answer_with_llm(
             no_answer_rules=get_agent_no_answer_strategy(agent_key),
             is_complex_query=is_complex_query,
         )
-    if agent_hint:
+    cloud_direct_fast_mode = allow_general_knowledge and not kb_hit
+    if agent_hint and not cloud_direct_fast_mode:
         prompt = f"{agent_hint}\n{prompt}"
 
     effective_timeout = max(
@@ -405,7 +406,7 @@ def answer_with_llm(
         effective_timeout = min(effective_timeout, 90)
     elif allow_general_knowledge and not kb_hit:
         # Keep cloud direct-chat mode under the frontend request budget.
-        timeout_cap = 46 if is_complex_query else 38
+        timeout_cap = 42 if is_complex_query else 34
         effective_timeout = min(effective_timeout, timeout_cap)
 
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
@@ -421,17 +422,17 @@ def answer_with_llm(
             min(LLM_MAX_OUTPUT_TOKENS, min(profile.max_tokens, 170)),
         )
     if open_answer_mode:
-        effective_tokens = min(effective_tokens, 420 if is_complex_query else 260)
+        effective_tokens = min(effective_tokens, 380 if is_complex_query else 230)
     if allow_general_knowledge and not kb_hit:
-        effective_tokens = min(effective_tokens, 400 if is_complex_query else 240)
+        effective_tokens = min(effective_tokens, 340 if is_complex_query else 210)
     if allow_general_knowledge and not compact_retrieval_contexts:
-        effective_tokens = min(effective_tokens, 360 if is_complex_query else 220)
+        effective_tokens = min(effective_tokens, 320 if is_complex_query else 190)
 
     base_timeout = max(6, effective_timeout)
     if retry_on_failure and base_timeout >= 14:
         # Cloud direct mode benefits from a longer primary attempt to avoid premature fallback.
         if allow_general_knowledge and not kb_hit:
-            retry_reserved_timeout = min(6, max(3, base_timeout // 8))
+            retry_reserved_timeout = min(5, max(2, base_timeout // 9))
         else:
             retry_reserved_timeout = min(10, max(5, base_timeout // 5))
     else:
@@ -451,7 +452,7 @@ def answer_with_llm(
             system_instruction=system_instruction_text,
             no_answer_rules=get_agent_no_answer_strategy(agent_key),
         )
-        if agent_hint:
+        if agent_hint and not cloud_direct_fast_mode:
             retry_prompt = f"{agent_hint}\n{retry_prompt}"
         retry_tokens = max(96, min(200, max(120, effective_tokens - 20)))
         call_plan.append(("retry_compact", retry_prompt, retry_timeout, retry_tokens))
@@ -630,31 +631,24 @@ def _build_open_answer_prompt(
 
     if is_complex_query:
         depth_instruction = (
-            "Complex query: provide a complete, layered answer with clear rationale, "
-            "tradeoffs or risks, and executable actions."
+            "Complex query: provide a complete answer with rationale, key tradeoffs, and executable actions."
         )
         length_instruction = (
-            "Length target: roughly 320-560 Chinese characters (or equivalent). "
+            "Length target: roughly 260-460 Chinese characters (or equivalent). "
             "Be substantial but avoid verbosity."
         )
         structure_instruction = (
-            "Use readable Markdown blocks in this order:\n"
-            "**结论**\n"
-            "**依据**\n"
-            "**行动建议**\n"
-            "Optional: **补充说明** (only when truly needed).\n"
-            "Each block should contain concrete and non-generic content."
+            "Use readable structure such as **结论** / **依据** / **行动建议** when helpful."
         )
     else:
         depth_instruction = (
             "Simple query: answer directly, then provide one practical next step."
         )
         length_instruction = (
-            "Length target: roughly 120-220 Chinese characters (or equivalent)."
+            "Length target: roughly 90-170 Chinese characters (or equivalent)."
         )
         structure_instruction = (
-            "Do not force rigid templates. Use 1-2 short paragraphs naturally. "
-            "If a heading helps, you may use **结论** and **建议**."
+            "Do not force rigid templates. Use 1-2 short paragraphs naturally."
         )
 
     style_hint = (
@@ -717,20 +711,20 @@ def _build_cloud_direct_prompt(
         else "自然说明信息不足并给补充建议"
     )
     depth_instruction = (
-        "For complex questions, provide a complete answer with key rationale, risk boundaries, and a concrete action plan."
+        "For complex questions, provide a complete answer with key rationale and concrete actions."
         if is_complex_query
         else "For simple questions, answer directly and keep it concise."
     )
     length_instruction = (
-        "Length target: roughly 260-460 Chinese characters (or equivalent) for complex questions."
+        "Length target: roughly 220-380 Chinese characters (or equivalent) for complex questions."
         if is_complex_query
-        else "Length target: roughly 100-180 Chinese characters (or equivalent)."
+        else "Length target: roughly 90-160 Chinese characters (or equivalent)."
     )
     return (
         f"{(system_instruction or '').strip()}\n"
         "You are a production-grade assistant in cloud direct-answer mode.\n"
         "Reply in the same language as the user's question.\n"
-        "Prefer readable Markdown labels like **结论**, **依据**, **行动建议** when helpful.\n"
+        "Use concise and natural wording.\n"
         "Do not reveal internal process or hidden template tags.\n"
         "Avoid quoting raw snippet titles directly; synthesize in natural language.\n"
         f"{depth_instruction}\n"

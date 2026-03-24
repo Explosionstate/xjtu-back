@@ -205,6 +205,7 @@ def _extract_answer_sections(
 ) -> tuple[dict[str, str], list[str]]:
     sections: dict[str, list[str]] = {
         "conclusion": [],
+        "evidence": [],
         "advice": [],
         "missing": [],
     }
@@ -223,6 +224,14 @@ def _extract_answer_sections(
             "行动建议",
             "下一步",
             "可执行方案",
+        ],
+        "evidence": [
+            "依据",
+            "证据",
+            "关键依据",
+            "支撑点",
+            "理由",
+            "参考依据",
         ],
         "missing": [
             "缺少的依据",
@@ -394,6 +403,34 @@ def _format_final_user_answer(
             )
             advice = candidate or "先执行最小可行步骤，再根据补充信息细化方案。"
 
+    evidence = _clean_answer_fragment(extracted.get("evidence", ""))
+    if not evidence:
+        candidate = next(
+            (
+                item
+                for item in sentence_pool
+                if any(
+                    token in item
+                    for token in ["依据", "证据", "基于", "因为", "来自", "显示"]
+                )
+                and item not in {conclusion, advice}
+            ),
+            "",
+        )
+        evidence = candidate
+    if not evidence and retrieved:
+        snippets: list[str] = []
+        for item in retrieved[:2]:
+            text = _compact_text(str(item.get("content") or ""), 80)
+            if not text:
+                continue
+            if text in snippets:
+                continue
+            snippets.append(text)
+        evidence = "；".join(snippets)
+    if not evidence:
+        evidence = "当前知识库可直接引用的高置信证据有限，已按保守原则整理回答。"
+
     missing = _clean_answer_fragment(extracted.get("missing", ""))
     if not missing:
         missing = _infer_missing_evidence(
@@ -403,12 +440,37 @@ def _format_final_user_answer(
         )
 
     conclusion = _compact_text(conclusion, 130)
+    evidence = _compact_text(evidence, 220)
     advice = _compact_text(advice, 180)
     missing = _compact_text(missing, 190)
     if missing and missing[-1] not in "。！？":
         missing = f"{missing}。"
 
-    return f"结论：{conclusion}\n建议：{advice}\n缺少的依据：{missing}"
+    def _split_points(text: str, *, max_items: int, max_chars: int) -> list[str]:
+        output: list[str] = []
+        for part in re.split(r"[；;。！？!?]\s*|\n+", text or ""):
+            cleaned = _clean_answer_fragment(part)
+            if not cleaned:
+                continue
+            compact = _compact_text(cleaned, max_chars)
+            if compact in output:
+                continue
+            output.append(compact)
+            if len(output) >= max_items:
+                break
+        return output
+
+    evidence_points = _split_points(evidence, max_items=2, max_chars=96) or [evidence]
+    advice_points = _split_points(advice, max_items=3, max_chars=96) or [advice]
+
+    lines = [f"结论：{conclusion}", "", "依据："]
+    lines.extend(f"{index}. {item}" for index, item in enumerate(evidence_points, start=1))
+    lines.append("")
+    lines.append("建议：")
+    lines.extend(f"{index}. {item}" for index, item in enumerate(advice_points, start=1))
+    lines.append("")
+    lines.append(f"缺少的依据：{missing}")
+    return "\n".join(lines).strip()
 
 
 def _is_long_term_memory_message(message: Message) -> bool:
@@ -1504,51 +1566,39 @@ def _build_summary_thinking(
 ) -> ChatThinking:
     steps: list[str] = []
     rounds = max(1, (len(trimmed_history) + 1) // 2) if trimmed_history else 0
-    route_desc = _model_route_desc(route_mode)
-    if rounds > 0:
-        steps.append(f"已结合最近 {rounds} 轮上下文，回答策略为：{route_desc}。")
-    else:
-        steps.append(f"已读取当前问题，回答策略为：{route_desc}。")
+    cloud_direct_mode = route_mode == MODEL_ROUTE_CLOUD_ONLY
 
     if rule_answer:
-        steps.append("命中系统规则快速回答，未进入检索与模型生成。")
+        steps.append("已识别当前问题属于规则类场景，并直接给出可执行答复。")
+    elif cloud_direct_mode:
+        if rounds > 0:
+            steps.append(f"已理解你的问题重点，并结合最近 {rounds} 轮对话补充必要上下文。")
+        else:
+            steps.append("已理解你的问题重点，并聚焦当前提问生成回答。")
+        if llm_result is not None and llm_result.mode in {"llm", "llm_retry"}:
+            steps.append("已完成云端模型回答生成，并对表述做了可读性整理。")
+        elif llm_result is not None and "fallback" in llm_result.mode:
+            steps.append("云端响应出现波动，已先给出稳妥的可执行答复，并可继续细化。")
+        else:
+            steps.append("已完成问题处理并返回当前最佳回答。")
     else:
         scope_text = _build_scope_text(kb_ids, document_ids)
-        if route_mode == MODEL_ROUTE_CLOUD_ONLY and retrieval_ms <= 0:
-            steps.append("云端直答模式：本轮跳过知识库检索，直接进入模型生成。")
-        elif retrieved_count > 0:
-            steps.append(
-                f"检索结果：在{scope_text}命中 {retrieved_count} 条高相关资料（Top-K={top_k}）。"
-            )
+        if retrieved_count > 0:
+            steps.append(f"已在{scope_text}中检索到 {retrieved_count} 条相关资料，并提炼关键线索。")
+            steps.append("已结合检索线索整理回答，确保内容与知识库信息一致。")
         else:
-            steps.append(
-                f"检索结果：在{scope_text}未命中高置信资料（阈值 {score_threshold:.2f}）。"
-            )
+            steps.append(f"已在{scope_text}完成检索，但当前问题缺少可直接支撑的高置信资料。")
+            steps.append("已基于现有资料范围给出保守回答，并提示补充所需信息。")
+        if llm_result is not None and llm_result.mode.startswith("local_transformer"):
+            steps.append("已由本地模型基于检索资料生成分段回答。")
+        elif llm_result is not None and "fallback" in llm_result.mode:
+            steps.append("生成阶段出现波动，已切换为稳定的知识库约束答复。")
 
-        if llm_result is None:
-            steps.append("生成结果：基于检索结果完成整理。")
-        elif llm_result.mode in {"llm", "llm_retry"}:
-            steps.append("生成结果：由大模型主答完成。")
-        elif llm_result.mode == "disabled":
-            steps.append("生成结果：模型未启用，按检索证据完成回答。")
-        elif "fallback" in llm_result.mode:
-            steps.append("生成结果：主答超时或异常，已切换到稳妥兜底回答。")
-        else:
-            steps.append(f"生成结果：已完成回答（mode={llm_result.mode}）。")
-
-    perf_parts = [f"总耗时 {total_ms}ms"]
-    if profile_ms > 0:
-        perf_parts.append(f"画像 {profile_ms}ms")
-    if retrieval_ms > 0:
-        perf_parts.append(f"检索 {retrieval_ms}ms")
-    if llm_ms > 0:
-        perf_parts.append(f"生成 {llm_ms}ms")
-    if workflow_wait_ms > 0:
-        perf_parts.append(f"等待 {workflow_wait_ms}ms")
-    steps.append("性能：" + "，".join(perf_parts) + "。")
-    if workflow_stage and workflow_stage != "done":
-        steps.append(f"当前阶段：{workflow_stage}。")
-    steps.append("以上为系统处理摘要，不包含模型私有推理链。")
+    total_seconds = max(0.1, round(total_ms / 1000, 1))
+    steps.append(f"本次处理约耗时 {total_seconds} 秒。")
+    if workflow_stage and workflow_stage not in {"init", "done"}:
+        steps.append(f"当前进度：{workflow_stage} 阶段已完成。")
+    steps.append("以上为可公开展示的处理过程，不包含模型私有推理内容。")
     return ChatThinking(
         title="处理摘要",
         content="\n".join(f"- {step}" for step in steps),
@@ -2035,9 +2085,9 @@ def chat_completion(
                     )
                 else:
                     if retrieval_skipped:
-                        preview = "云端直答模式，已跳过知识库检索。"
+                        preview = "已完成问题理解与上下文整理，正在生成回答。"
                     elif route_mode == MODEL_ROUTE_CLOUD_ONLY:
-                        preview = "高置信检索命中不足，已切换云端模型直接回答。"
+                        preview = "已完成信息准备，正在生成回答。"
                     elif route_mode in {MODEL_ROUTE_HYBRID, MODEL_ROUTE_LOCAL_ONLY}:
                         preview = "高置信检索命中不足，将按知识库约束策略返回。"
                     else:
@@ -2068,7 +2118,11 @@ def chat_completion(
                 status="start",
                 detail="正在生成最终回答...",
             )
-            history_context = _resolve_history_context(runtime_question)
+            history_context = (
+                _resolve_history_context(runtime_question)
+                if question_mode != QUESTION_MODE_FACT
+                else ""
+            )
             retrieval_contexts = (
                 contexts[:4]
                 if contexts
@@ -2079,8 +2133,9 @@ def chat_completion(
                 retrieval_contexts = []
             background_contexts: list[str] = []
             if question_mode != QUESTION_MODE_FACT and history_context:
+                history_max_chars = 180 if cloud_direct_mode else 360
                 background_contexts.append(
-                    f"[会话背景] {_compact_text(history_context, 360)}"
+                    f"[会话背景] {_compact_text(history_context, history_max_chars)}"
                 )
             if question_mode != QUESTION_MODE_FACT and profile_context_text:
                 background_contexts.append(
