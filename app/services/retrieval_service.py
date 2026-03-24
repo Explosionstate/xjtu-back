@@ -217,6 +217,43 @@ def _is_precise_fact_query(query: str) -> bool:
     return fact_hits >= 2 and open_hits == 0 and len(q) <= 72
 
 
+def _is_complex_retrieval_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    if len(q) >= 64:
+        return True
+    complex_markers = [
+        "分析",
+        "对比",
+        "比较",
+        "趋势",
+        "报告",
+        "风险",
+        "干预",
+        "规划",
+        "方案",
+        "评估",
+    ]
+    return any(marker in q for marker in complex_markers)
+
+
+def _should_skip_reranker(
+    *,
+    query: str,
+    top_k: int,
+    candidate_count: int,
+    precise_fact_query: bool,
+) -> bool:
+    if candidate_count <= 0:
+        return True
+    if precise_fact_query and candidate_count <= 16:
+        return True
+    if not _is_complex_retrieval_query(query) and top_k <= 3 and candidate_count <= 18:
+        return True
+    return False
+
+
 def _token_overlap_score(query_tokens: set[str], content: str) -> float:
     if not query_tokens:
         return 0.0
@@ -414,10 +451,15 @@ def hybrid_retrieve_with_debug(
         local_top_k = min(local_top_k, 12)
         local_threshold = max(local_threshold, 0.22)
     precise_fact_query = _is_precise_fact_query(query_text)
+    query_is_complex = _is_complex_retrieval_query(query_text)
 
-    max_candidates = min(320, max(48, int(local_top_k) * 20))
+    max_candidates = (
+        min(320, max(56, int(local_top_k) * 20))
+        if query_is_complex
+        else min(220, max(36, int(local_top_k) * 14))
+    )
     if precise_fact_query:
-        max_candidates = min(max_candidates, 180)
+        max_candidates = min(max_candidates, 140)
     if document_ids:
         max_candidates = min(360, max(max_candidates, 80))
 
@@ -487,7 +529,11 @@ def hybrid_retrieve_with_debug(
             ).all()
         }
 
-        dense_top_k = min(10, max(local_top_k + 1, local_top_k * 2 - 1))
+        dense_top_k = (
+            min(10, max(local_top_k + 1, local_top_k * 2 - 1))
+            if query_is_complex
+            else min(7, max(local_top_k, local_top_k + 1))
+        )
         query_embedding_cache: dict[str, list[float]] = {}
         for kb_id in unique_kb_ids:
             model_name = normalize_embedding_model_name(
@@ -529,8 +575,22 @@ def hybrid_retrieve_with_debug(
     ][: max(local_top_k * 2 + 2, local_top_k)]
 
     results: list[dict] = []
+    seen_content_keys: set[str] = set()
+    source_counter: dict[str, int] = defaultdict(int)
+    source_limit = 1 if precise_fact_query else 2
     for chunk_id in sorted_ids:
         row = chunk_cache[chunk_id]
+        source_key = str(row.source_location or "").strip().lower()
+        if source_key:
+            if source_counter.get(source_key, 0) >= source_limit:
+                continue
+        compact_key = re.sub(r"\s+", " ", str(row.content or "").strip().lower())[:120]
+        if compact_key and compact_key in seen_content_keys:
+            continue
+        if compact_key:
+            seen_content_keys.add(compact_key)
+        if source_key:
+            source_counter[source_key] = source_counter.get(source_key, 0) + 1
         results.append(
             {
                 "chunk_id": row.id,
@@ -550,12 +610,24 @@ def hybrid_retrieve_with_debug(
                 ),
             }
         )
+        if len(results) >= max(local_top_k * 3, local_top_k + 4):
+            break
 
-    reranked = rerank_candidates(
+    if _should_skip_reranker(
         query=query_text,
-        candidates=results,
-        model_name=settings.reranker_model,
-    )
+        top_k=local_top_k,
+        candidate_count=len(results),
+        precise_fact_query=precise_fact_query,
+    ):
+        reranked = list(results)
+        for item in reranked:
+            item["rerank_score"] = float(item.get("fused_score", 0.0))
+    else:
+        reranked = rerank_candidates(
+            query=query_text,
+            candidates=results,
+            model_name=settings.reranker_model,
+        )
 
     for item in reranked:
         base_score = float(item.get("score", 0.0)) + _keyword_bonus(

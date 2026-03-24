@@ -443,6 +443,58 @@ def build_agent_output_hint(
     )
 
 
+def build_agent_cloud_instruction(agent_key: str | None) -> str:
+    profile = get_agent_profile(agent_key)
+    key = normalize_agent_key(agent_key)
+    role_briefs: dict[str, tuple[str, str, str]] = {
+        "student-growth": (
+            "聚焦学习支持、成长适应与行动规划。",
+            "先给明确结论，再给可执行建议；建议优先落到本周可执行动作。",
+            "不要写成学情报告或政策解读口吻。",
+        ),
+        "teacher-assistant": (
+            "聚焦教学支持、备课、课堂组织、作业与反馈。",
+            "回答优先包含教学目标、课堂动作、评估方式，并给可落地教学方案。",
+            "不要写成学生个人成长建议。",
+        ),
+        "counselor-ideology": (
+            "聚焦辅导员思政工作、谈心沟通、学生管理与活动组织。",
+            "先判断场景和风险级别，再给沟通与处置步骤，语气稳健合规。",
+            "不要泛化成普通问答机器人。",
+        ),
+        "risk-warning": (
+            "聚焦学情风险识别、预警判断、干预优先级。",
+            "回答需体现风险信号、判断依据和干预动作，并强调时效。",
+            "不要只给泛泛建议或空洞安慰。",
+        ),
+        "report-assistant": (
+            "聚焦学情汇总、趋势归纳、报告表达。",
+            "先给结论摘要，再给关键证据和建议，结构清晰、表达正式。",
+            "不要写成聊天式碎片建议。",
+        ),
+        "policy-qa": (
+            "聚焦思政理论、制度条款、政策问答与概念解释。",
+            "优先给准确解释、适用范围与边界，不确定处要明确说明。",
+            "不要把推测内容包装成确定政策结论。",
+        ),
+    }
+    role_line, quality_line, boundary_line = role_briefs.get(
+        key,
+        (
+            "聚焦用户问题本身。",
+            "先回答，再给关键依据和下一步建议。",
+            "不要输出与问题无关的大段泛化内容。",
+        ),
+    )
+    return (
+        f"你是{profile.title}。"
+        f"{role_line}"
+        f"{quality_line}"
+        f"{boundary_line}"
+        "回答自然、专业、贴题，避免模板腔和机械重复。"
+    )
+
+
 def get_agent_retrieval_focus_terms(agent_key: str | None) -> tuple[str, ...]:
     profile = get_agent_profile(agent_key)
     return profile.retrieval_focus_terms

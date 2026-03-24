@@ -18,6 +18,7 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.rbac import User
 from app.schemas.chat import ChatCompletionRequest, ChatThinking, SourceItem
 from app.services.agent_profile_service import (
+    build_agent_cloud_instruction,
     build_agent_system_instruction,
     get_agent_bound_kb_name,
     get_agent_no_answer_strategy,
@@ -298,9 +299,45 @@ def _infer_missing_evidence(
     question: str,
     question_mode: str,
     retrieved: list[dict],
+    agent_key: str | None = None,
 ) -> str:
     lowered = (question or "").strip().lower()
     points: list[str] = []
+    normalized_agent = normalize_agent_key(agent_key)
+
+    role_points: dict[str, tuple[str, ...]] = {
+        "student-growth": (
+            "最近一学期成绩明细与薄弱课程清单",
+            "每周可投入学习时间与阶段目标",
+            "当前学习阻碍（时间冲突、习惯、压力）",
+        ),
+        "teacher-assistant": (
+            "课程目标、授课对象与课时安排",
+            "班级基础水平与当前课堂问题",
+            "可用教学资源和评估约束",
+        ),
+        "counselor-ideology": (
+            "学生基本情况、事件背景与时间线",
+            "风险等级线索与已沟通记录",
+            "可协同部门或可用支持资源",
+        ),
+        "risk-warning": (
+            "预警对象、时间窗口与异常指标",
+            "历史风险记录与近期变化趋势",
+            "干预资源和责任人安排",
+        ),
+        "report-assistant": (
+            "统计口径、数据时间范围与样本范围",
+            "关键指标明细与对比对象",
+            "报告用途和读者对象",
+        ),
+        "policy-qa": (
+            "政策适用对象与具体场景",
+            "时间范围和版本口径",
+            "需核验的条款来源或制度名称",
+        ),
+    }
+    points.extend(role_points.get(normalized_agent, ()))
 
     if question_mode == QUESTION_MODE_ACADEMIC or any(
         token in lowered for token in ["学业", "成绩", "学分", "课程", "挂科", "重修"]
@@ -369,10 +406,12 @@ def _format_final_user_answer(
     question: str,
     question_mode: str,
     retrieved: list[dict],
+    agent_key: str | None = None,
 ) -> str:
     cleaned_answer = _strip_internal_template_text(answer)
     extracted, fallback_lines = _extract_answer_sections(cleaned_answer)
     sentence_pool = _split_brief_sentences(cleaned_answer)
+    is_complex = _is_complex_question(question, question_mode)
 
     conclusion = _clean_answer_fragment(extracted.get("conclusion", ""))
     if not conclusion:
@@ -437,12 +476,13 @@ def _format_final_user_answer(
             question=question,
             question_mode=question_mode,
             retrieved=retrieved,
+            agent_key=agent_key,
         )
 
-    conclusion = _compact_text(conclusion, 130)
-    evidence = _compact_text(evidence, 220)
-    advice = _compact_text(advice, 180)
-    missing = _compact_text(missing, 190)
+    conclusion = _compact_text(conclusion, 170 if is_complex else 130)
+    evidence = _compact_text(evidence, 260 if is_complex else 180)
+    advice = _compact_text(advice, 220 if is_complex else 160)
+    missing = _compact_text(missing, 220 if is_complex else 170)
     if missing and missing[-1] not in "。！？":
         missing = f"{missing}。"
 
@@ -460,14 +500,32 @@ def _format_final_user_answer(
                 break
         return output
 
-    evidence_points = _split_points(evidence, max_items=2, max_chars=96) or [evidence]
-    advice_points = _split_points(advice, max_items=3, max_chars=96) or [advice]
+    evidence_points = _split_points(
+        evidence,
+        max_items=3 if is_complex else 1,
+        max_chars=100 if is_complex else 140,
+    ) or [evidence]
+    advice_points = _split_points(
+        advice,
+        max_items=3 if is_complex else 2,
+        max_chars=100 if is_complex else 120,
+    ) or [advice]
 
     lines = [f"结论：{conclusion}", "", "依据："]
-    lines.extend(f"{index}. {item}" for index, item in enumerate(evidence_points, start=1))
+    if len(evidence_points) == 1:
+        lines.append(evidence_points[0])
+    else:
+        lines.extend(
+            f"{index}. {item}" for index, item in enumerate(evidence_points, start=1)
+        )
     lines.append("")
     lines.append("建议：")
-    lines.extend(f"{index}. {item}" for index, item in enumerate(advice_points, start=1))
+    if len(advice_points) == 1:
+        lines.append(advice_points[0])
+    else:
+        lines.extend(
+            f"{index}. {item}" for index, item in enumerate(advice_points, start=1)
+        )
     lines.append("")
     lines.append(f"缺少的依据：{missing}")
     return "\n".join(lines).strip()
@@ -964,6 +1022,25 @@ def _detect_answer_style(question: str) -> str:
     return "direct"
 
 
+def _is_complex_question(question: str, question_mode: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    if question_mode in {QUESTION_MODE_ACADEMIC, QUESTION_MODE_CRISIS}:
+        return True
+    style = _detect_answer_style(question)
+    if style in {"analysis", "comparison"}:
+        return True
+    punctuation_score = q.count("，") + q.count(",") + q.count("；") + q.count(";")
+    if style == "guidance" and (len(q) >= 26 or punctuation_score >= 2):
+        return True
+    if style == "summary" and len(q) >= 38:
+        return True
+    if len(q) >= 58 or punctuation_score >= 3:
+        return True
+    return False
+
+
 def _looks_like_decision_guidance_query(question: str) -> bool:
     q = (question or "").strip().lower()
     if not q:
@@ -1212,10 +1289,23 @@ def _format_academic_analysis_context(login_name: str) -> str:
     )
 
 
-def _is_guidance_query(question: str) -> bool:
+def _is_guidance_query(question: str, agent_key: str | None = None) -> bool:
     q = (question or "").strip().lower()
-    flags = ["学生", "建议", "指南", "总结", "重点", "规划", "学习", "生活"]
-    return any(flag in q for flag in flags)
+    if not q:
+        return False
+    common_flags = ["建议", "指南", "总结", "重点", "规划", "方案", "怎么做", "如何做"]
+    if any(flag in q for flag in common_flags):
+        return True
+
+    normalized_agent = normalize_agent_key(agent_key)
+    agent_flags: dict[str, tuple[str, ...]] = {
+        "student-growth": ("学生", "学习", "生活", "成长", "学业"),
+        "teacher-assistant": ("教学", "课堂", "备课", "作业", "教案", "授课", "评价"),
+        "counselor-ideology": ("辅导员", "思政", "谈心", "班级", "学生管理", "活动组织"),
+        "risk-warning": ("预警", "风险", "异常", "干预", "监测", "识别"),
+        "report-assistant": ("报告", "汇总", "趋势", "分析", "归纳", "简报"),
+    }
+    return any(flag in q for flag in agent_flags.get(normalized_agent, ()))
 
 
 def _looks_like_fact_lookup_query(agent_key: str | None, question: str) -> bool:
@@ -1373,7 +1463,7 @@ def _resolve_question_mode(agent_key: str | None, question: str) -> str:
         return QUESTION_MODE_OPEN
     if _looks_like_fact_lookup_query(agent_key, question):
         return QUESTION_MODE_FACT
-    if _is_student_growth_agent(agent_key) or _is_guidance_query(question):
+    if _is_student_growth_agent(agent_key) or _is_guidance_query(question, agent_key):
         return QUESTION_MODE_OPEN
     lowered = (question or "").lower()
     return (
@@ -1413,9 +1503,55 @@ def _should_use_generation_first_mode(
 def _build_open_question_fallback(
     question: str,
     trimmed_history: list[Message],
+    agent_key: str | None = None,
     long_term_memory: str = "",
     profile_context: str = "",
 ) -> str:
+    normalized_agent = normalize_agent_key(agent_key)
+    if normalized_agent != "student-growth":
+        focus = _compact_text(question, 60) or "当前问题"
+        role_plan: dict[str, tuple[str, str, str]] = {
+            "teacher-assistant": (
+                "先对齐本节课目标与学生现状，再组织可执行的课堂动作。",
+                "先明确课堂目标和时间约束；",
+                "再设计“讲解-练习-反馈”闭环，并在课后用1个指标复盘。",
+            ),
+            "counselor-ideology": (
+                "先做风险分级，再用低冲突方式开展沟通与跟进。",
+                "先确认事实和风险等级；",
+                "再安排“谈心-协同-复盘”三步处置，避免先入为主定性。",
+            ),
+            "risk-warning": (
+                "先确定风险等级与触发证据，再安排本周干预优先级。",
+                "先补齐时间区间和对象范围；",
+                "再按“高风险先干预、低风险先监测”推进。",
+            ),
+            "report-assistant": (
+                "先明确报告口径，再输出可确认结论与待确认项。",
+                "先锁定统计范围和时间窗口；",
+                "再按“结论-依据-建议”组织报告，缺数据处显式标注。",
+            ),
+            "policy-qa": (
+                "先给可核验的制度解释，再说明适用范围与边界。",
+                "先确认政策对象、时间和适用场景；",
+                "再按“结论-依据-执行建议”答复，不编造条款细节。",
+            ),
+        }
+        lead, step1, step2 = role_plan.get(
+            normalized_agent,
+            (
+                "先聚焦问题本身给出可执行建议，再根据补充信息细化。",
+                "先明确目标和约束条件；",
+                "再按最小可执行步骤推进并复盘结果。",
+            ),
+        )
+        return (
+            f"先直接回答：围绕“{focus}”，{lead}\n"
+            f"1) {step1}\n"
+            f"2) {step2}\n"
+            "3) 你补充关键事实后，我可以给出更精确的下一步方案。"
+        )
+
     focus = _compact_text(question, 60) or "当前问题"
     if _looks_like_club_overload_query(question):
         return (
@@ -1698,21 +1834,26 @@ def chat_completion(
 
     question = raw_question.strip()
     route_mode, cloud_enabled, local_enabled = _resolve_model_route_mode(payload)
-    resolved_scope = resolve_agent_bound_kb_scope(
-        db,
-        agent_key=payload.agent_key,
-        document_ids=payload.document_ids,
-    )
-    if resolved_scope is not None:
-        kb_ids, document_ids = resolved_scope
-    else:
-        kb_ids = payload.kb_ids or [
-            item.id
-            for item in db.scalars(
-                select(KnowledgeBase).where(KnowledgeBase.status == "active")
-            ).all()
-        ]
+    if route_mode == MODEL_ROUTE_CLOUD_ONLY:
+        # Cloud direct mode should not depend on bound knowledge-base availability.
+        kb_ids = payload.kb_ids or []
         document_ids = payload.document_ids
+    else:
+        resolved_scope = resolve_agent_bound_kb_scope(
+            db,
+            agent_key=payload.agent_key,
+            document_ids=payload.document_ids,
+        )
+        if resolved_scope is not None:
+            kb_ids, document_ids = resolved_scope
+        else:
+            kb_ids = payload.kb_ids or [
+                item.id
+                for item in db.scalars(
+                    select(KnowledgeBase).where(KnowledgeBase.status == "active")
+                ).all()
+            ]
+            document_ids = payload.document_ids
     retrieval_config = get_effective_retrieval_config(
         db=db,
         conversation_id=conversation_id,
@@ -1726,7 +1867,7 @@ def chat_completion(
     fusion_mode = str(retrieval_config["fusion_mode"])
     alpha = float(retrieval_config["alpha"])
 
-    if _is_guidance_query(question):
+    if _is_guidance_query(question, payload.agent_key):
         # Guidance tasks need enough recall coverage; avoid over-aggressive truncation.
         top_k = min(max(top_k, 4), 12)
         score_threshold = min(score_threshold, 0.24)
@@ -1792,6 +1933,12 @@ def chat_completion(
         cached_query = retrieval_query_cache.get(key)
         if cached_query is not None:
             return cached_query
+        if route_mode == MODEL_ROUTE_CLOUD_ONLY:
+            retrieval_query_cache[key] = key
+            return key
+        if not is_complex_query and len(key) <= 26:
+            retrieval_query_cache[key] = key
+            return key
         if _looks_like_service_process_query(key) or _looks_like_fact_lookup_query(
             payload.agent_key, key
         ):
@@ -1834,6 +1981,22 @@ def chat_completion(
 
     question_mode = _resolve_question_mode(payload.agent_key, question)
     is_academic_analysis = question_mode == QUESTION_MODE_ACADEMIC
+    is_complex_query = _is_complex_question(question, question_mode)
+
+    if question_mode == QUESTION_MODE_FACT:
+        top_k = min(max(top_k, 2), 4 if is_complex_query else 3)
+        score_threshold = max(score_threshold, 0.24 if is_complex_query else 0.28)
+    elif question_mode == QUESTION_MODE_OPEN and route_mode != MODEL_ROUTE_CLOUD_ONLY:
+        if is_complex_query:
+            top_k = min(max(top_k, 4), 10)
+            score_threshold = min(score_threshold, 0.24)
+        else:
+            top_k = min(max(top_k, 3), 6)
+            score_threshold = max(score_threshold, 0.22)
+    elif question_mode == QUESTION_MODE_CRISIS:
+        top_k = min(max(top_k, 3), 6)
+        score_threshold = min(score_threshold, 0.24)
+
     generation_first_mode = _should_use_generation_first_mode(
         question_mode=question_mode,
         route_mode=route_mode,
@@ -1873,44 +2036,66 @@ def chat_completion(
             workflow_timeout_cap = max(workflow_timeout_cap, 90)
             generation_timeout = max(generation_timeout, 70)
         else:
-            # Keep cloud-only non-academic responses under frontend timeout budget.
-            chat_total_timeout = min(
-                chat_total_timeout, NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS
-            )
-            workflow_timeout_cap = min(
-                workflow_timeout_cap,
-                NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS,
-            )
-            generation_timeout = max(
-                generation_timeout,
-                NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS,
-            )
+            # Cloud direct mode should stay responsive for simple queries.
+            if is_complex_query:
+                chat_total_timeout = min(
+                    chat_total_timeout,
+                    min(NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS, 56),
+                )
+                workflow_timeout_cap = min(
+                    workflow_timeout_cap,
+                    min(NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS, 50),
+                )
+                generation_timeout = min(max(generation_timeout, 34), 44)
+            else:
+                chat_total_timeout = min(chat_total_timeout, 40)
+                workflow_timeout_cap = min(workflow_timeout_cap, 34)
+                generation_timeout = min(max(generation_timeout, 20), 28)
     elif (
         route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not is_academic_analysis
     ):
         workflow_timeout_cap = min(
-            max(workflow_timeout_cap, 52),
-            NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS,
+            max(workflow_timeout_cap, 40),
+            50 if is_complex_query else 38,
         )
         generation_timeout = max(
             generation_timeout,
-            max(36, NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS - 2),
+            34 if is_complex_query else 24,
         )
+        generation_timeout = min(generation_timeout, 46 if is_complex_query else 30)
     if question_mode == QUESTION_MODE_OPEN and route_mode != MODEL_ROUTE_RETRIEVAL_ONLY:
-        chat_total_timeout = max(chat_total_timeout, 120)
-        workflow_timeout_cap = max(workflow_timeout_cap, 112)
-        generation_timeout = max(generation_timeout, 90)
+        if route_mode == MODEL_ROUTE_CLOUD_ONLY:
+            if is_complex_query:
+                chat_total_timeout = max(chat_total_timeout, 64)
+                workflow_timeout_cap = max(workflow_timeout_cap, 56)
+                generation_timeout = max(generation_timeout, 38)
+            else:
+                chat_total_timeout = min(chat_total_timeout, 44)
+                workflow_timeout_cap = min(workflow_timeout_cap, 36)
+                generation_timeout = min(generation_timeout, 26)
+        else:
+            if is_complex_query:
+                chat_total_timeout = max(chat_total_timeout, 86)
+                workflow_timeout_cap = max(workflow_timeout_cap, 74)
+                generation_timeout = max(generation_timeout, 52)
+            else:
+                chat_total_timeout = max(chat_total_timeout, 68)
+                workflow_timeout_cap = max(workflow_timeout_cap, 58)
+                generation_timeout = max(generation_timeout, 40)
 
     logger.info(
-        "chat time budget: conversation=%s agent=%s route=%s cloud=%s local=%s total=%ss workflow_cap=%ss generation=%ss",
+        "chat time budget: conversation=%s agent=%s route=%s mode=%s cloud=%s local=%s total=%ss workflow_cap=%ss generation=%ss top_k=%s threshold=%.3f",
         conversation_id,
         payload.agent_key,
         route_mode,
+        "complex" if is_complex_query else "simple",
         cloud_enabled,
         local_enabled,
         chat_total_timeout,
         workflow_timeout_cap,
         generation_timeout,
+        top_k,
+        score_threshold,
     )
 
     start = perf_counter()
@@ -2118,22 +2303,29 @@ def chat_completion(
                 status="start",
                 detail="正在生成最终回答...",
             )
-            history_context = (
-                _resolve_history_context(runtime_question)
-                if question_mode != QUESTION_MODE_FACT
-                else ""
-            )
             retrieval_contexts = (
                 contexts[:4]
                 if contexts
                 else _format_retrieval_contexts_for_generation(retrieved)
             )
             cloud_direct_mode = route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled
+            history_context = (
+                _resolve_history_context(runtime_question)
+                if (
+                    question_mode != QUESTION_MODE_FACT
+                    and (not cloud_direct_mode or is_complex_query)
+                )
+                else ""
+            )
             if cloud_direct_mode:
                 retrieval_contexts = []
             background_contexts: list[str] = []
             if question_mode != QUESTION_MODE_FACT and history_context:
-                history_max_chars = 180 if cloud_direct_mode else 360
+                history_max_chars = (
+                    220 if (cloud_direct_mode and is_complex_query) else 140
+                    if cloud_direct_mode
+                    else 360
+                )
                 background_contexts.append(
                     f"[会话背景] {_compact_text(history_context, history_max_chars)}"
                 )
@@ -2155,7 +2347,7 @@ def chat_completion(
                 )
             )
             if prefer_model_answer:
-                generation_contexts = background_contexts[:3]
+                generation_contexts = background_contexts[: (3 if is_complex_query else 1)]
                 llm_retrieval_contexts: list[str] = []
             elif (
                 route_mode in {MODEL_ROUTE_CLOUD_ONLY, MODEL_ROUTE_HYBRID}
@@ -2316,6 +2508,7 @@ def chat_completion(
                                     _build_open_question_fallback(
                                         runtime_question,
                                         trimmed_history,
+                                        agent_key=payload.agent_key,
                                         long_term_memory=long_term_memory,
                                         profile_context=profile_context_text,
                                     )
@@ -2359,6 +2552,7 @@ def chat_completion(
                                     _build_open_question_fallback(
                                         runtime_question,
                                         trimmed_history,
+                                        agent_key=payload.agent_key,
                                         long_term_memory=long_term_memory,
                                         profile_context=profile_context_text,
                                     )
@@ -2397,7 +2591,7 @@ def chat_completion(
                     allow_general_mode = True if cloud_direct_mode else prefer_model_answer
                     kb_hit_flag = False if (prefer_model_answer or cloud_direct_mode) else bool(retrieved)
                     cloud_system_instruction = (
-                        ""
+                        build_agent_cloud_instruction(payload.agent_key)
                         if cloud_direct_mode
                         else (
                             ""
@@ -2479,8 +2673,12 @@ def chat_completion(
             return llm_result.answer
 
         if generation_first_mode:
-            system_instruction = build_agent_system_instruction(
-                (payload.agent_key or "").strip().lower()
+            system_instruction = (
+                build_agent_cloud_instruction((payload.agent_key or "").strip().lower())
+                if route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled
+                else build_agent_system_instruction(
+                    (payload.agent_key or "").strip().lower()
+                )
             )
             _load_profile(question)
             if (
@@ -2627,6 +2825,7 @@ def chat_completion(
                         timeout_answer = _build_open_question_fallback(
                             question,
                             trimmed_history,
+                            agent_key=payload.agent_key,
                             long_term_memory=long_term_memory,
                             profile_context=profile_context_text,
                         )
@@ -2729,6 +2928,7 @@ def chat_completion(
                 answer = _build_open_question_fallback(
                     question,
                     trimmed_history,
+                    agent_key=payload.agent_key,
                     long_term_memory=long_term_memory,
                     profile_context=profile_context_text,
                 )
@@ -2748,7 +2948,7 @@ def chat_completion(
                     question=question,
                     contexts=fallback_retrieval_contexts + fallback_background_contexts,
                     llm_enabled=True,
-                    system_instruction="",
+                    system_instruction=build_agent_cloud_instruction(payload.agent_key),
                     agent_key=payload.agent_key,
                     timeout_seconds=max(4, min(8, generation_timeout)),
                     allow_general_knowledge=True,
@@ -2781,6 +2981,7 @@ def chat_completion(
                 _build_open_question_fallback(
                     question,
                     trimmed_history,
+                    agent_key=payload.agent_key,
                     long_term_memory=long_term_memory,
                     profile_context=profile_context_text,
                 )
@@ -2802,6 +3003,7 @@ def chat_completion(
                     _build_open_question_fallback(
                         question,
                         trimmed_history,
+                        agent_key=payload.agent_key,
                         long_term_memory=long_term_memory,
                         profile_context=profile_context_text,
                     )
@@ -2819,6 +3021,7 @@ def chat_completion(
                     _build_open_question_fallback(
                         question,
                         trimmed_history,
+                        agent_key=payload.agent_key,
                         long_term_memory=long_term_memory,
                         profile_context=profile_context_text,
                     )
@@ -2864,6 +3067,7 @@ def chat_completion(
             question=question,
             question_mode=question_mode,
             retrieved=retrieved,
+            agent_key=payload.agent_key,
         )
 
     blocked_output_word = detect_sensitive_text(answer, sensitive_words)

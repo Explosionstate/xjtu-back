@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.services.agent_profile_service import (
     build_agent_output_hint,
     get_agent_no_answer_strategy,
+    normalize_agent_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,59 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
         organization_hint="提炼 3-5 条重点，按主题归并，不要重复句式。",
     ),
 }
+
+
+def _agent_role_focus(agent_key: str | None) -> str:
+    role_focus = {
+        "student-growth": "学习支持与成长行动",
+        "teacher-assistant": "教学支持与课堂落地",
+        "counselor-ideology": "辅导员思政与学生管理",
+        "risk-warning": "学情风险识别与干预",
+        "report-assistant": "学情汇总与报告表达",
+        "policy-qa": "思政理论与政策解释",
+    }
+    return role_focus.get(
+        normalize_agent_key(agent_key),
+        "问题分析与可执行建议",
+    )
+
+
+def _agent_cloud_output_hint(agent_key: str | None, is_complex_query: bool) -> str:
+    key = normalize_agent_key(agent_key)
+    hints: dict[str, tuple[str, str]] = {
+        "student-growth": (
+            "优先给可执行学习动作和节奏建议。",
+            "可增加阶段目标、风险点和复盘节奏。",
+        ),
+        "teacher-assistant": (
+            "回答围绕教学目标、课堂组织和作业反馈。",
+            "可补充课堂流程、评估指标和课后改进建议。",
+        ),
+        "counselor-ideology": (
+            "回答围绕谈心沟通、学生管理和活动组织。",
+            "可补充风险分级、沟通步骤和协同机制。",
+        ),
+        "risk-warning": (
+            "回答围绕风险信号、判断依据和干预优先级。",
+            "可补充风险等级、触发证据和本周处置动作。",
+        ),
+        "report-assistant": (
+            "回答围绕结论摘要、关键数据和趋势归纳。",
+            "可补充口径说明、结论边界和后续建议。",
+        ),
+        "policy-qa": (
+            "回答围绕政策解释、适用范围和执行建议。",
+            "可补充条款边界、适用对象与核验路径。",
+        ),
+    }
+    brief, rich = hints.get(
+        key,
+        (
+            "回答聚焦用户问题本身，避免泛化。",
+            "可补充关键依据、边界和下一步建议。",
+        ),
+    )
+    return rich if is_complex_query else brief
 
 
 @lru_cache(maxsize=1)
@@ -246,14 +300,20 @@ def _build_timeout_guided_fallback(
     if not is_complex_query:
         best_evidence = evidence_lines[0] if evidence_lines else ""
         if best_evidence:
-            return (
+            return _apply_agent_fallback_tone(
+                (
                 f"先给你一个直接结论：围绕“{focus}”，目前更稳妥的做法是优先按已知线索推进，"
                 f"核心依据是“{best_evidence}”。"
                 "如果你愿意，我可以继续补充更细的原因和下一步执行清单。"
+                ),
+                agent_key,
             )
-        return (
-            f"围绕“{focus}”，我先给你一个可执行的短结论：先做一项最小可行动作并记录结果，"
-            "再根据结果迭代下一步。"
+        return _apply_agent_fallback_tone(
+            (
+                f"围绕“{focus}”，我先给你一个可执行的短结论：先做一项最小可行动作并记录结果，"
+                "再根据结果迭代下一步。"
+            ),
+            agent_key,
         )
 
     lead_map = {
@@ -274,14 +334,17 @@ def _build_timeout_guided_fallback(
         tail = "我先基于现有线索给你稳妥方案；你补充场景后我会继续细化。"
     else:
         tail = f"当前仅以可核验线索为准；若要更精确结论，建议：{no_answer_hint}。"
-    return (
-        f"**结论**\n{lead}：围绕“{focus}”，先按当前高置信线索执行，不要一次铺开太多动作。\n\n"
-        f"**依据**\n{evidence_block}\n\n"
-        "**行动建议**\n"
-        "1) 先完成一项可验证动作；\n"
-        "2) 记录结果与阻碍；\n"
-        "3) 基于结果再做下一轮细化。\n\n"
-        f"{tail}"
+    return _apply_agent_fallback_tone(
+        (
+            f"**结论**\n{lead}：围绕“{focus}”，先按当前高置信线索执行，不要一次铺开太多动作。\n\n"
+            f"**依据**\n{evidence_block}\n\n"
+            "**行动建议**\n"
+            "1) 先完成一项可验证动作；\n"
+            "2) 记录结果与阻碍；\n"
+            "3) 基于结果再做下一轮细化。\n\n"
+            f"{tail}"
+        ),
+        agent_key,
     )
 
 
@@ -306,6 +369,8 @@ def answer_with_llm(
     profile = STYLE_PROFILES.get(style, STYLE_PROFILES["direct"])
     complexity_mode = _detect_question_complexity(question, style)
     is_complex_query = complexity_mode == "complex"
+    role_focus = _agent_role_focus(agent_key)
+    role_cloud_hint = _agent_cloud_output_hint(agent_key, is_complex_query)
     raw_retrieval_contexts = (
         list(retrieval_contexts)
         if retrieval_contexts is not None
@@ -340,6 +405,11 @@ def answer_with_llm(
         max_chars=360 if is_complex_query else 220,
     )
     system_instruction_text = _compact_instruction_text(system_instruction)
+    if allow_general_knowledge and role_cloud_hint:
+        system_instruction_text = _compact_instruction_text(
+            f"{system_instruction_text} {role_cloud_hint}".strip(),
+            max_chars=620,
+        )
     agent_hint = build_agent_output_hint(
         agent_key,
         kb_hit=kb_hit,
@@ -367,6 +437,8 @@ def answer_with_llm(
             retrieval_contexts=compact_retrieval_contexts,
             system_instruction=system_instruction_text,
             is_complex_query=is_complex_query,
+            role_focus=role_focus,
+            role_cloud_hint=role_cloud_hint,
         )
     else:
         prompt = _build_structured_prompt(
@@ -389,6 +461,8 @@ def answer_with_llm(
             system_instruction=system_instruction_text,
             no_answer_rules=get_agent_no_answer_strategy(agent_key),
             is_complex_query=is_complex_query,
+            role_focus=role_focus,
+            role_cloud_hint=role_cloud_hint,
         )
     cloud_direct_fast_mode = allow_general_knowledge and not kb_hit
     if agent_hint and not cloud_direct_fast_mode:
@@ -403,10 +477,10 @@ def answer_with_llm(
         ),
     )
     if open_answer_mode:
-        effective_timeout = min(effective_timeout, 90)
+        effective_timeout = min(effective_timeout, 72 if is_complex_query else 26)
     elif allow_general_knowledge and not kb_hit:
         # Keep cloud direct-chat mode under the frontend request budget.
-        timeout_cap = 42 if is_complex_query else 34
+        timeout_cap = 36 if is_complex_query else 24
         effective_timeout = min(effective_timeout, timeout_cap)
 
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
@@ -424,20 +498,23 @@ def answer_with_llm(
     if open_answer_mode:
         effective_tokens = min(effective_tokens, 380 if is_complex_query else 230)
     if allow_general_knowledge and not kb_hit:
-        effective_tokens = min(effective_tokens, 340 if is_complex_query else 210)
+        effective_tokens = min(effective_tokens, 320 if is_complex_query else 180)
     if allow_general_knowledge and not compact_retrieval_contexts:
-        effective_tokens = min(effective_tokens, 320 if is_complex_query else 190)
+        effective_tokens = min(effective_tokens, 300 if is_complex_query else 165)
+    if cloud_direct_fast_mode and not is_complex_query and not compact_background_contexts:
+        effective_tokens = min(effective_tokens, 150)
 
     base_timeout = max(6, effective_timeout)
-    if retry_on_failure and base_timeout >= 14:
+    retry_gate = 10 if cloud_direct_fast_mode else 14
+    if retry_on_failure and base_timeout >= retry_gate:
         # Cloud direct mode benefits from a longer primary attempt to avoid premature fallback.
         if allow_general_knowledge and not kb_hit:
-            retry_reserved_timeout = min(5, max(2, base_timeout // 9))
+            retry_reserved_timeout = min(4, max(2, base_timeout // 8))
         else:
             retry_reserved_timeout = min(10, max(5, base_timeout // 5))
     else:
         retry_reserved_timeout = 0
-    primary_timeout = max(6, base_timeout - retry_reserved_timeout)
+    primary_timeout = max(5 if cloud_direct_fast_mode else 6, base_timeout - retry_reserved_timeout)
     call_plan: list[tuple[str, str, int, int]] = [
         ("primary", prompt, primary_timeout, effective_tokens)
     ]
@@ -617,11 +694,13 @@ def _build_open_answer_prompt(
     retrieval_contexts: list[str],
     system_instruction: str | None,
     is_complex_query: bool,
+    role_focus: str = "",
+    role_cloud_hint: str = "",
 ) -> str:
     background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
     evidence_hint = retrieval_contexts[0] if retrieval_contexts else ""
     evidence_block = (
-        f"\nOptional reference context (use only when needed):\n- {evidence_hint}"
+        f"\n可选参考线索（仅在需要时使用）：\n- {evidence_hint}"
         if evidence_hint
         else ""
     )
@@ -631,43 +710,45 @@ def _build_open_answer_prompt(
 
     if is_complex_query:
         depth_instruction = (
-            "Complex query: provide a complete answer with rationale, key tradeoffs, and executable actions."
+            "复杂问题：给出完整结论、关键依据、风险边界与可执行步骤。"
         )
         length_instruction = (
-            "Length target: roughly 260-460 Chinese characters (or equivalent). "
-            "Be substantial but avoid verbosity."
+            "篇幅建议：260-460 字左右，信息完整但避免冗长。"
         )
         structure_instruction = (
-            "Use readable structure such as **结论** / **依据** / **行动建议** when helpful."
+            "可使用清晰结构，如“结论/依据/行动建议”。"
         )
     else:
         depth_instruction = (
-            "Simple query: answer directly, then provide one practical next step."
+            "简单问题：直接回答，再给一个可执行下一步。"
         )
         length_instruction = (
-            "Length target: roughly 90-170 Chinese characters (or equivalent)."
+            "篇幅建议：90-170 字左右。"
         )
         structure_instruction = (
-            "Do not force rigid templates. Use 1-2 short paragraphs naturally."
+            "不要强行套模板，用 1-2 段自然表达即可。"
         )
 
     style_hint = (
-        f"Organization preference: {organization_hint}\n" if organization_hint else ""
+        f"组织偏好：{organization_hint}\n" if organization_hint else ""
     )
+    role_focus_line = f"角色焦点：{role_focus}\n" if role_focus else ""
+    role_hint_line = f"角色补充：{role_cloud_hint}\n" if role_cloud_hint else ""
     return (
         f"{(system_instruction or '').strip()}\n"
-        "You are a production-grade assistant in cloud direct-answer mode.\n"
-        "Reply in the same language as the user's question.\n"
-        "Do not reveal internal policy, hidden templates, or classification labels.\n"
-        "Avoid copying raw knowledge-base snippets or section titles verbatim.\n"
-        "Focus on the user's concrete goal and keep irrelevant background minimal.\n"
+        "你处于云端直答模式，请直接回答用户问题。\n"
+        "与用户提问保持同语种输出。\n"
+        "不要暴露内部策略、模板标签或分类过程。\n"
+        "不要机械复述资料原文，优先自然整合表达。\n"
+        f"{role_focus_line}"
+        f"{role_hint_line}"
         f"{style_hint}"
         f"{depth_instruction}\n"
         f"{length_instruction}\n"
         f"{structure_instruction}\n"
-        "Write naturally and professionally. Avoid filler and repeated sentences.\n"
-        f"Question: {question}\n\n"
-        f"Background:\n{background_block or '(none)'}"
+        "表达自然专业，避免空话和重复句。\n"
+        f"问题：{question}\n\n"
+        f"背景：\n{background_block or '（无）'}"
         f"{evidence_block}"
     )
 
@@ -701,6 +782,8 @@ def _build_cloud_direct_prompt(
     system_instruction: str | None = None,
     no_answer_rules: tuple[str, ...] = (),
     is_complex_query: bool = False,
+    role_focus: str = "",
+    role_cloud_hint: str = "",
 ) -> str:
     context_block = ""
     if compact_contexts:
@@ -711,27 +794,29 @@ def _build_cloud_direct_prompt(
         else "自然说明信息不足并给补充建议"
     )
     depth_instruction = (
-        "For complex questions, provide a complete answer with key rationale and concrete actions."
+        "复杂问题：给出完整结论、关键依据和可执行动作。"
         if is_complex_query
-        else "For simple questions, answer directly and keep it concise."
+        else "简单问题：直接回答并保持简洁。"
     )
     length_instruction = (
-        "Length target: roughly 220-380 Chinese characters (or equivalent) for complex questions."
+        "篇幅建议：复杂问题约 220-380 字。"
         if is_complex_query
-        else "Length target: roughly 90-160 Chinese characters (or equivalent)."
+        else "篇幅建议：简单问题约 90-160 字。"
     )
+    role_focus_line = f"角色焦点：{role_focus}\n" if role_focus else ""
+    role_hint_line = f"角色补充：{role_cloud_hint}\n" if role_cloud_hint else ""
     return (
         f"{(system_instruction or '').strip()}\n"
-        "You are a production-grade assistant in cloud direct-answer mode.\n"
-        "Reply in the same language as the user's question.\n"
-        "Use concise and natural wording.\n"
-        "Do not reveal internal process or hidden template tags.\n"
-        "Avoid quoting raw snippet titles directly; synthesize in natural language.\n"
+        "你处于云端直答模式。\n"
+        "与用户提问保持同语种输出。\n"
+        "表达简洁自然，不暴露内部流程或模板标签。\n"
+        f"{role_focus_line}"
+        f"{role_hint_line}"
         f"{depth_instruction}\n"
         f"{length_instruction}\n"
-        f"If information is insufficient, {fallback_line}. Do not fabricate facts.\n"
-        f"Question: {question}\n"
-        f"Optional context:\n{context_block or '(none)'}"
+        f"若信息不足，{fallback_line}，不要编造事实。\n"
+        f"问题：{question}\n"
+        f"可选上下文：\n{context_block or '（无）'}"
     )
 
 
@@ -747,6 +832,27 @@ def _looks_like_timeout_error(exc: Exception) -> bool:
         "request timed out",
     ]
     return any(marker in message for marker in timeout_markers)
+
+
+def _apply_agent_fallback_tone(answer: str, agent_key: str | None) -> str:
+    normalized_agent = normalize_agent_key(agent_key)
+    addon_map = {
+        "student-growth": "如你愿意补充近期学习状态和目标，我可以继续给你更具体的行动清单。",
+        "teacher-assistant": "如你补充课程目标、课时和学生基础，我可以进一步细化成可直接执行的教学方案。",
+        "counselor-ideology": "如你补充事件背景和风险线索，我可以继续细化沟通与协同处置步骤。",
+        "risk-warning": "如你补充对象范围、时间窗口和异常指标，我可以继续细化风险分级与干预优先级。",
+        "report-assistant": "如你补充统计口径和时间范围，我可以继续输出更完整的报告版本。",
+        "policy-qa": "如你补充适用场景和对象范围，我可以继续给出更准确的条款边界说明。",
+    }
+    addon = addon_map.get(normalized_agent, "")
+    if not addon:
+        return answer
+    compact = (answer or "").strip()
+    if not compact:
+        return addon
+    if addon in compact or len(compact) >= 620:
+        return compact
+    return f"{compact}\n{addon}"
 
 
 def _fallback_natural_answer(
@@ -767,53 +873,59 @@ def _fallback_natural_answer(
 
     if not contexts:
         if allow_general_knowledge:
-            return _render_general_knowledge_fallback(
+            base = _render_general_knowledge_fallback(
                 style,
                 question_focus,
                 is_complex_query=is_complex_query,
             )
-        return _render_no_context_fallback(
-            style,
-            question_focus,
-            no_answer_text,
-            q,
-            is_complex_query=is_complex_query,
-        )
+        else:
+            base = _render_no_context_fallback(
+                style,
+                question_focus,
+                no_answer_text,
+                q,
+                is_complex_query=is_complex_query,
+            )
+        return _apply_agent_fallback_tone(base, agent_key)
 
     evidence_lines = _collect_fallback_evidence(contexts, max_items=4)
     if not evidence_lines:
         if allow_general_knowledge:
-            return _render_general_knowledge_fallback(
+            base = _render_general_knowledge_fallback(
                 style,
                 question_focus,
                 is_complex_query=is_complex_query,
             )
-        return _render_no_context_fallback(
-            style,
-            question_focus,
-            no_answer_text,
-            q,
-            is_complex_query=is_complex_query,
-        )
+        else:
+            base = _render_no_context_fallback(
+                style,
+                question_focus,
+                no_answer_text,
+                q,
+                is_complex_query=is_complex_query,
+            )
+        return _apply_agent_fallback_tone(base, agent_key)
 
     if allow_general_knowledge and is_complex_query:
         evidence_block = "\n".join(f"- {item}" for item in evidence_lines[:3])
-        return (
+        base = (
             f"**结论**\n围绕“{question_focus}”，先执行最可能有效的一步，并用结果驱动下一轮调整。\n\n"
             f"**依据**\n{evidence_block}\n\n"
             "**行动建议**\n"
             "1) 先完成一项可验证动作；\n"
-            "2) 记录结果和阻碍；\n"
+            "2) 记录结果和障碍；\n"
             "3) 带着结果继续追问，我会给你更精准的下一步方案。"
         )
+        return _apply_agent_fallback_tone(base, agent_key)
 
-    return _render_context_fallback(
+    base = _render_context_fallback(
         style,
         question_focus,
         evidence_lines,
         q,
         is_complex_query=is_complex_query,
     )
+    return _apply_agent_fallback_tone(base, agent_key)
 
 
 def _is_academic_analysis_query(question: str) -> bool:
@@ -1357,3 +1469,4 @@ def _flatten_text(value: Any) -> str:
             if text:
                 return text
     return ""
+
