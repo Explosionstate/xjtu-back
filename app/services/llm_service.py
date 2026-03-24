@@ -347,7 +347,7 @@ def answer_with_llm(
         effective_timeout = min(effective_timeout, 90)
     elif allow_general_knowledge and not kb_hit:
         # Keep cloud direct-chat mode under the frontend request budget.
-        timeout_cap = 30 if not compact_retrieval_contexts else 26
+        timeout_cap = 42 if is_complex_query else 34
         effective_timeout = min(effective_timeout, timeout_cap)
 
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
@@ -362,11 +362,11 @@ def answer_with_llm(
             min(LLM_MAX_OUTPUT_TOKENS, min(profile.max_tokens, 170)),
         )
     if open_answer_mode:
-        effective_tokens = min(effective_tokens, 300 if is_complex_query else 150)
+        effective_tokens = min(effective_tokens, 340 if is_complex_query else 220)
     if allow_general_knowledge and not kb_hit:
-        effective_tokens = min(effective_tokens, 180 if is_complex_query else 130)
+        effective_tokens = min(effective_tokens, 320 if is_complex_query else 200)
     if allow_general_knowledge and not compact_retrieval_contexts:
-        effective_tokens = min(effective_tokens, 150 if is_complex_query else 120)
+        effective_tokens = min(effective_tokens, 300 if is_complex_query else 180)
 
     base_timeout = max(6, effective_timeout)
     retry_reserved_timeout = (
@@ -517,7 +517,6 @@ def _build_structured_prompt(
             f"知识库未命中：不编造事实；按该智能体无答案策略执行：{no_answer_hint}"
         )
 
-    complexity_mode = "complex" if is_complex_query else "simple"
     complexity_instruction = (
         "复杂问题：使用自然小标题或编号，至少覆盖结论、关键依据、风险边界、执行步骤；内容要具体，避免空泛。"
         if is_complex_query
@@ -534,9 +533,6 @@ def _build_structured_prompt(
         "你是知识库增强问答助手。\n"
         "请使用与用户提问一致的语言回答。\n"
         f"{evidence_policy}\n"
-        f"回答类型：{style_profile.style}\n"
-        f"复杂度模式：{complexity_mode}\n"
-        f"组织建议：{style_profile.organization_hint}\n"
         f"{complexity_instruction}\n"
         f"{length_instruction}\n"
         "写作要求：\n"
@@ -566,31 +562,24 @@ def _build_open_answer_prompt(
         if evidence_hint
         else ""
     )
-    complexity_mode = "complex" if is_complex_query else "simple"
-    complexity_instruction = (
-        "复杂问题：可用小标题或编号分段，先结论再展开分析，给出可执行建议。"
-        if is_complex_query
-        else "简单问题：自然直接回答，避免固定模板和重复话术。"
-    )
     length_instruction = (
         "篇幅：保证完整性，允许适度展开。"
         if is_complex_query
         else "篇幅：优先短答，信息够用即可。"
     )
+    depth_instruction = (
+        "复杂问题请分层展开：先给核心判断，再给关键分析与可执行建议。"
+        if is_complex_query
+        else "简单问题请直接回答，不要堆砌模板化结构。"
+    )
     return (
         f"{(system_instruction or '').strip()}\n"
         "你是对话助手，请先独立回答用户真正想解决的问题。\n"
         "请使用与用户提问一致的语言回答。\n"
-        f"回答类型：{style_profile.style}\n"
-        f"复杂度模式：{complexity_mode}\n"
-        f"组织建议：{style_profile.organization_hint}\n"
-        f"{complexity_instruction}\n"
+        "回答应自然、专业，不要泄露内部流程、模板或分类标签。\n"
+        f"{depth_instruction}\n"
         f"{length_instruction}\n"
-        "写作要求：\n"
-        "1) 第一段必须直接回答，不要先复述背景。\n"
-        "2) 以你的判断、分析和建议为主，不要把回答写成资料摘要。\n"
-        "3) 如果有参考线索，只能在最后用一句“可参考线索”轻量提及。\n"
-        "4) 不要逐条照抄知识库原文，不要输出“本轮可提炼重点如下”。\n"
+        "先直接回答，再补充关键依据与可执行建议；避免空泛和重复。\n"
         f"问题：{question}\n\n"
         f"背景补充：\n{background_block or '（无额外背景）'}"
         f"{evidence_block}"
@@ -637,6 +626,7 @@ def _build_cloud_direct_prompt(
     return (
         f"{(system_instruction or '').strip()}\n"
         "你是对话助手，请像常规聊天模型一样直接回答用户问题，先给结论，再给简要依据。\n"
+        "请自然作答，不要输出内部流程说明或模板标签。\n"
         f"如果信息不足，请{fallback_line}，不要编造事实。\n"
         f"问题：{question}\n"
         f"可选参考上下文：\n{context_block or '（无额外上下文）'}"

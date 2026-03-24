@@ -98,8 +98,10 @@ def _resolve_model_route_mode(
     )
     local_enabled = bool(payload.local_transformer_enabled)
 
+    # Keep routing deterministic: cloud and local are treated as two distinct modes.
+    # When both switches are on, prioritize cloud direct-answer mode.
     if cloud_enabled and local_enabled:
-        return MODEL_ROUTE_HYBRID, cloud_enabled, local_enabled
+        return MODEL_ROUTE_CLOUD_ONLY, True, False
     if cloud_enabled:
         return MODEL_ROUTE_CLOUD_ONLY, cloud_enabled, local_enabled
     if local_enabled:
@@ -130,6 +132,258 @@ def _compact_text(text: str, max_chars: int) -> str:
     if not compact:
         return ""
     return compact[:max_chars]
+
+
+_INTERNAL_TEMPLATE_MARKERS = (
+    "回答类型",
+    "复杂度模式",
+    "组织建议",
+    "写作要求",
+    "知识库证据",
+    "背景补充",
+    "可参考线索（只在最后一句提及）",
+    "以下几个方面",
+    "按以下模板",
+    "内部模板",
+    "内部分类",
+    "处理步骤",
+    "系统策略",
+    "处理摘要",
+    "思考过程",
+)
+
+
+def _clean_answer_fragment(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"^[\-\*\d\.\)\(、\s]+", "", cleaned)
+    cleaned = re.sub(
+        r"^(结论|建议|依据|缺少的依据|缺失依据|需补充信息|需要补充信息)\s*[:：]\s*",
+        "",
+        cleaned,
+    )
+    return cleaned.strip(" ：:;-")
+
+
+def _strip_internal_template_text(raw_answer: str) -> str:
+    lines: list[str] = []
+    for raw_line in (raw_answer or "").replace("\r\n", "\n").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(marker in line for marker in _INTERNAL_TEMPLATE_MARKERS):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _extract_answer_sections(
+    cleaned_answer: str,
+) -> tuple[dict[str, str], list[str]]:
+    sections: dict[str, list[str]] = {
+        "conclusion": [],
+        "advice": [],
+        "missing": [],
+    }
+    fallback_lines: list[str] = []
+    current_key: str | None = None
+    label_patterns = {
+        "conclusion": [
+            "结论",
+            "直接回答",
+            "答复",
+            "先给结论",
+            "先给判断",
+        ],
+        "advice": [
+            "建议",
+            "行动建议",
+            "下一步",
+            "可执行方案",
+        ],
+        "missing": [
+            "缺少的依据",
+            "缺失依据",
+            "缺少依据",
+            "缺少信息",
+            "需补充信息",
+            "需要补充信息",
+            "需补充",
+            "信息不足",
+        ],
+    }
+
+    for raw_line in (cleaned_answer or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        matched_key: str | None = None
+        matched_content = ""
+        for key, aliases in label_patterns.items():
+            for alias in aliases:
+                match = re.match(rf"^{re.escape(alias)}\s*[:：]\s*(.*)$", line)
+                if match:
+                    matched_key = key
+                    matched_content = _clean_answer_fragment(match.group(1))
+                    break
+            if matched_key:
+                break
+
+        if matched_key:
+            current_key = matched_key
+            if matched_content:
+                sections[matched_key].append(matched_content)
+            continue
+
+        cleaned_line = _clean_answer_fragment(line)
+        if not cleaned_line:
+            continue
+        if current_key:
+            sections[current_key].append(cleaned_line)
+        else:
+            fallback_lines.append(cleaned_line)
+
+    flattened = {
+        key: "；".join(item for item in values if item)
+        for key, values in sections.items()
+    }
+    return flattened, fallback_lines
+
+
+def _split_brief_sentences(text: str) -> list[str]:
+    parts = re.split(r"[。！？!?;\n]+", text or "")
+    output: list[str] = []
+    for part in parts:
+        cleaned = _clean_answer_fragment(part)
+        if cleaned and cleaned not in output:
+            output.append(cleaned)
+    return output
+
+
+def _infer_missing_evidence(
+    *,
+    question: str,
+    question_mode: str,
+    retrieved: list[dict],
+) -> str:
+    lowered = (question or "").strip().lower()
+    points: list[str] = []
+
+    if question_mode == QUESTION_MODE_ACADEMIC or any(
+        token in lowered for token in ["学业", "成绩", "学分", "课程", "挂科", "重修"]
+    ):
+        points.extend(
+            [
+                "最近一学期的成绩明细（课程名、分数、学分）",
+                "课程完成情况与挂科/重修记录",
+                "当前目标方向（保研、就业或升学）",
+            ]
+        )
+    elif question_mode == QUESTION_MODE_FACT or any(
+        token in lowered for token in ["政策", "规定", "流程", "办理", "申请", "材料"]
+    ):
+        points.extend(
+            [
+                "明确的对象或事项名称（课程/政策/系统模块）",
+                "适用身份与范围（年级、学院、角色）",
+                "具体时间范围（例如本学期、近30天）",
+            ]
+        )
+    elif any(token in lowered for token in ["对比", "比较", "区别", "vs", "哪个"]):
+        points.extend(
+            [
+                "明确的对比对象 A/B",
+                "你的决策优先级（时间、成本、风险）",
+                "可量化结果指标（成功标准）",
+            ]
+        )
+    elif question_mode == QUESTION_MODE_CRISIS:
+        points.extend(
+            [
+                "你当前是否存在立即危险",
+                "你所在位置与是否有人陪同",
+                "可联系的家人/同学/老师信息",
+            ]
+        )
+    else:
+        points.extend(
+            [
+                "具体场景和目标对象",
+                "时间范围（例如本周、近一学期）",
+                "当前约束条件（可投入时间、资源限制）",
+            ]
+        )
+
+    if not retrieved:
+        points.append("可核验的现状事实或关键数据")
+
+    deduped: list[str] = []
+    for item in points:
+        normalized = _clean_answer_fragment(item)
+        if not normalized:
+            continue
+        if normalized in deduped:
+            continue
+        deduped.append(normalized)
+        if len(deduped) >= 3:
+            break
+    return "；".join(deduped)
+
+
+def _format_final_user_answer(
+    *,
+    answer: str,
+    question: str,
+    question_mode: str,
+    retrieved: list[dict],
+) -> str:
+    cleaned_answer = _strip_internal_template_text(answer)
+    extracted, fallback_lines = _extract_answer_sections(cleaned_answer)
+    sentence_pool = _split_brief_sentences(cleaned_answer)
+
+    conclusion = _clean_answer_fragment(extracted.get("conclusion", ""))
+    if not conclusion:
+        if fallback_lines:
+            conclusion = fallback_lines[0]
+        elif sentence_pool:
+            conclusion = sentence_pool[0]
+        else:
+            focus = _compact_text(question, 56) or "当前问题"
+            conclusion = f"围绕“{focus}”，先按现有信息给出可执行结论。"
+
+    advice = _clean_answer_fragment(extracted.get("advice", ""))
+    if not advice:
+        if len(fallback_lines) > 1:
+            advice = fallback_lines[1]
+        else:
+            candidate = next(
+                (
+                    item
+                    for item in sentence_pool
+                    if any(token in item for token in ["建议", "可以", "优先", "下一步", "先"])
+                    and item != conclusion
+                ),
+                "",
+            )
+            advice = candidate or "先执行最小可行步骤，再根据补充信息细化方案。"
+
+    missing = _clean_answer_fragment(extracted.get("missing", ""))
+    if not missing:
+        missing = _infer_missing_evidence(
+            question=question,
+            question_mode=question_mode,
+            retrieved=retrieved,
+        )
+
+    conclusion = _compact_text(conclusion, 130)
+    advice = _compact_text(advice, 180)
+    missing = _compact_text(missing, 190)
+    if missing and missing[-1] not in "。！？":
+        missing = f"{missing}。"
+
+    return f"结论：{conclusion}\n建议：{advice}\n缺少的依据：{missing}"
 
 
 def _is_long_term_memory_message(message: Message) -> bool:
@@ -1442,6 +1696,13 @@ def chat_completion(
         agent_key=payload.agent_key,
         question=question,
     )
+    # Explicit mode split:
+    # - Cloud mode: direct LLM answer (KB retrieval is optional, not mandatory).
+    # - Local mode: retrieval-enhanced answering only.
+    if route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
+        generation_first_mode = True
+    elif route_mode == MODEL_ROUTE_LOCAL_ONLY:
+        generation_first_mode = False
     chat_total_timeout = (
         ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS
         if is_academic_analysis
@@ -1551,7 +1812,7 @@ def chat_completion(
                 detail="正在加载用户画像上下文...",
             )
             try:
-                if route_mode == MODEL_ROUTE_CLOUD_ONLY and not is_academic_analysis:
+                if route_mode == MODEL_ROUTE_CLOUD_ONLY:
                     profile_context_text = ""
                     return ""
                 profile_executor = ThreadPoolExecutor(max_workers=1)
@@ -1844,10 +2105,14 @@ def chat_completion(
                         retrieval_contexts=llm_retrieval_contexts,
                         background_contexts=background_contexts,
                     )
-                    if prefer_model_answer and llm_result.mode in {
+                    if (
+                        route_mode == MODEL_ROUTE_HYBRID
+                        and prefer_model_answer
+                        and llm_result.mode in {
                         "timeout_fallback",
                         "error_fallback",
-                    }:
+                        }
+                    ):
                         backup_result = _attempt_local_open_backup()
                         if backup_result is not None:
                             llm_result = backup_result
@@ -1989,10 +2254,11 @@ def chat_completion(
                         retrieval_contexts=llm_retrieval_contexts,
                         background_contexts=background_contexts,
                     )
-                    if prefer_model_answer and llm_result.mode in {
-                        "timeout_fallback",
-                        "error_fallback",
-                    }:
+                    if (
+                        route_mode == MODEL_ROUTE_HYBRID
+                        and prefer_model_answer
+                        and llm_result.mode in {"timeout_fallback", "error_fallback"}
+                    ):
                         backup_result = _attempt_local_open_backup()
                         if backup_result is not None:
                             llm_result = backup_result
@@ -2058,16 +2324,17 @@ def chat_completion(
                 "blocked_stage": "",
                 "blocked_word": "",
             }
-            try:
-                _retrieve(
-                    question,
-                    runtime_top_k=min(3, max(top_k, 2)),
-                    runtime_threshold=max(score_threshold, 0.2),
-                    allow_relaxed_retry=False,
-                    detail="正在补充可参考线索...",
-                )
-            except Exception:
-                logger.debug("post-answer retrieval skipped", exc_info=True)
+            if route_mode != MODEL_ROUTE_CLOUD_ONLY:
+                try:
+                    _retrieve(
+                        question,
+                        runtime_top_k=min(3, max(top_k, 2)),
+                        runtime_threshold=max(score_threshold, 0.2),
+                        allow_relaxed_retry=False,
+                        detail="正在补充可参考线索...",
+                    )
+                except Exception:
+                    logger.debug("post-answer retrieval skipped", exc_info=True)
             workflow_stage = "done"
         else:
             workflow_budget_reserved = 2 if cloud_enabled else 6
@@ -2413,6 +2680,14 @@ def chat_completion(
             ]
         else:
             sources = []
+
+    if route_mode in {MODEL_ROUTE_LOCAL_ONLY, MODEL_ROUTE_RETRIEVAL_ONLY}:
+        answer = _format_final_user_answer(
+            answer=answer,
+            question=question,
+            question_mode=question_mode,
+            retrieved=retrieved,
+        )
 
     blocked_output_word = detect_sensitive_text(answer, sensitive_words)
     if blocked_output_word:

@@ -27,7 +27,7 @@ FIXED_LLM_TIMEOUT_SECONDS = 24
 FIXED_XJTUEXER_SSO_CONSUME_URL = "http://127.0.0.1:8080/api/sso/consume"
 FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS = 5
 FIXED_ACADEMIC_DB_URL = (
-    "mysql+pymysql://root:admin@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
+    "mysql+pymysql://root:zzyhhz19708@127.0.0.1:3306/springboot_demo?charset=utf8mb4"
 )
 FIXED_ACADEMIC_QUERY_TIMEOUT_SECONDS = 8
 FIXED_LOCAL_TRANSFORMER_ENABLED = True
@@ -90,6 +90,16 @@ def get_settings() -> Settings:
     workspace_root = project_root.parent
     data_root = project_root / "data"
     data_root.mkdir(parents=True, exist_ok=True)
+    database_url = os.getenv("DB_URL", f"sqlite:///{(data_root / 'app.db').as_posix()}")
+    academic_db_url = os.getenv("ACADEMIC_DB_URL")
+    if not academic_db_url:
+        # Reuse DB_URL when it already points to MySQL, avoiding credential drift.
+        if database_url.startswith(("mysql+pymysql://", "mysql://")):
+            academic_db_url = database_url.replace(
+                "mysql://", "mysql+pymysql://", 1
+            )
+        else:
+            academic_db_url = FIXED_ACADEMIC_DB_URL
 
     embedding_root_raw = os.getenv("EMBEDDING_MODEL_ROOT")
     local_modules_raw = os.getenv("LOCAL_MODULES_ROOT")
@@ -111,9 +121,7 @@ def get_settings() -> Settings:
     return Settings(
         app_name=os.getenv("APP_NAME", "xjtu-back"),
         app_version=os.getenv("APP_VERSION", "0.1.0"),
-        database_url=os.getenv(
-            "DB_URL", f"sqlite:///{(data_root / 'app.db').as_posix()}"
-        ),
+        database_url=database_url,
         chroma_root=Path(os.getenv("CHROMA_ROOT", (data_root / "chroma").as_posix())),
         default_embedding_model=FIXED_DEFAULT_EMBEDDING_MODEL,
         api_key=os.getenv("API_KEY"),
@@ -150,7 +158,7 @@ def get_settings() -> Settings:
         reranker_weight=FIXED_RERANKER_WEIGHT,
         xjtuexer_sso_consume_url=FIXED_XJTUEXER_SSO_CONSUME_URL,
         xjtuexer_sso_timeout_seconds=FIXED_XJTUEXER_SSO_TIMEOUT_SECONDS,
-        academic_db_url=os.getenv("ACADEMIC_DB_URL", FIXED_ACADEMIC_DB_URL),
+        academic_db_url=academic_db_url,
         academic_query_timeout_seconds=int(
             os.getenv(
                 "ACADEMIC_QUERY_TIMEOUT_SECONDS",
