@@ -346,29 +346,26 @@ def _join_rules(items: tuple[str, ...]) -> str:
 
 def build_agent_system_instruction(agent_key: str | None) -> str:
     profile = get_agent_profile(agent_key)
-    contract = "\n".join(
-        f"{index}. {item}" for index, item in enumerate(profile.response_contract, start=1)
+    style_line = "；".join(item for item in profile.answer_style[:2] if item.strip())
+    contract_line = "；".join(
+        item for item in profile.response_contract[:2] if item.strip()
+    )
+    kb_line = "；".join(item for item in profile.kb_strategy[:2] if item.strip())
+    no_answer_line = "；".join(
+        item for item in profile.no_answer_strategy[:2] if item.strip()
+    )
+    common_rules_line = "；".join(
+        item for item in COMMON_PROMPT_RULES[:2] if item.strip()
     )
     return (
         f"你是{profile.title}。\n"
         f"职责: {profile.mission}\n"
-        "适用场景:\n"
-        f"{_join_rules(profile.applicable_scenarios)}\n"
-        "禁止场景:\n"
-        f"{_join_rules(profile.forbidden_scenarios)}\n"
-        "风格要求:\n"
-        f"{_join_rules(profile.answer_style)}\n"
-        "通用硬约束:\n"
-        f"{_join_rules(COMMON_PROMPT_RULES)}\n"
-        "回答规范:\n"
-        f"{contract}\n"
-        "知识库策略:\n"
-        f"{_join_rules(profile.kb_strategy)}\n"
-        "工具策略:\n"
-        f"{_join_rules(profile.tool_strategy)}\n"
-        "无答案策略:\n"
-        f"{_join_rules(profile.no_answer_strategy)}\n"
-        "输出要求: 优先中文，结构清晰，避免答非所问。"
+        f"回答风格: {style_line or '先结论后依据，语言自然、专业、简洁'}。\n"
+        f"关键约束: {common_rules_line or '先回答用户问题，再给依据；无依据时明确边界并给下一步'}。\n"
+        f"回答规范: {contract_line or '先结论、再依据、再行动建议'}。\n"
+        f"知识策略: {kb_line or '有证据先贴证据，无证据不编造'}。\n"
+        f"无答案策略: {no_answer_line or '自然说明证据不足并给最小可执行建议'}。\n"
+        "输出要求: 中文优先，避免模板腔和重复句。"
     )
 
 
@@ -379,13 +376,15 @@ def build_agent_output_hint(
     allow_general_knowledge: bool = False,
 ) -> str:
     profile = get_agent_profile(agent_key)
-    contract = "；".join(profile.response_contract)
+    contract = "；".join(item for item in profile.response_contract[:2] if item.strip())
     if kb_hit is True:
         kb_line = f"已命中知识库，请优先执行：{'；'.join(profile.kb_strategy[:2])}"
     elif kb_hit is False and not allow_general_knowledge:
-        kb_line = f"知识库未命中，请执行无答案策略：{'；'.join(profile.no_answer_strategy[:2])}"
+        kb_line = (
+            f"知识库未命中，请执行无答案策略：{'；'.join(profile.no_answer_strategy[:2])}"
+        )
     elif kb_hit is False and allow_general_knowledge:
-        kb_line = "知识库未命中，可给通用建议，但必须明确哪些是通用判断。"
+        kb_line = "知识库未命中，可给通用建议，但需明确哪些是通用判断。"
     else:
         kb_line = "按知识库优先原则作答。"
     return (

@@ -175,6 +175,48 @@ def _is_academic_query(query: str) -> bool:
     return any(flag in q for flag in flags)
 
 
+def _is_precise_fact_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    if _is_summary_style_query(q):
+        return False
+    fact_tokens = [
+        "政策",
+        "规定",
+        "流程",
+        "步骤",
+        "办理",
+        "申请",
+        "材料",
+        "要求",
+        "时间",
+        "地点",
+        "学分",
+        "绩点",
+        "是什么",
+        "多少",
+        "几天",
+        "多久",
+        "挂失",
+        "补办",
+    ]
+    open_tokens = [
+        "焦虑",
+        "迷茫",
+        "纠结",
+        "压力",
+        "方向",
+        "职业",
+        "怎么办",
+        "怎么选",
+        "要不要",
+    ]
+    fact_hits = sum(1 for token in fact_tokens if token in q)
+    open_hits = sum(1 for token in open_tokens if token in q)
+    return fact_hits >= 2 and open_hits == 0 and len(q) <= 72
+
+
 def _token_overlap_score(query_tokens: set[str], content: str) -> float:
     if not query_tokens:
         return 0.0
@@ -371,10 +413,13 @@ def hybrid_retrieve_with_debug(
     if _is_student_growth_agent(agent_key):
         local_top_k = min(local_top_k, 12)
         local_threshold = max(local_threshold, 0.22)
+    precise_fact_query = _is_precise_fact_query(query_text)
 
-    max_candidates = min(420, max(64, int(local_top_k) * 28))
+    max_candidates = min(320, max(48, int(local_top_k) * 20))
+    if precise_fact_query:
+        max_candidates = min(max_candidates, 180)
     if document_ids:
-        max_candidates = min(420, max(max_candidates, 96))
+        max_candidates = min(360, max(max_candidates, 80))
 
     stmt = select(DocumentChunk).where(DocumentChunk.kb_id.in_(unique_kb_ids))
     if document_ids:
@@ -410,6 +455,8 @@ def hybrid_retrieve_with_debug(
     corpus = [row.content for row in chunk_rows]
     corpus_tokens = [_tokenize(text) for text in corpus]
     query_tokens = _tokenize(query_text)
+    if not query_tokens:
+        return [], []
     bm25 = BM25Okapi(corpus_tokens)
     bm25_raw_scores = bm25.get_scores(query_tokens)
 
@@ -431,35 +478,37 @@ def hybrid_retrieve_with_debug(
     dense_ranked: list[str] = []
     chunk_cache = {row.id: row for row in chunk_rows}
 
-    kb_model_map = {
-        item.id: item.embedding_model
-        for item in db.scalars(
-            select(KnowledgeBase).where(KnowledgeBase.id.in_(unique_kb_ids))
-        ).all()
-    }
+    use_dense_search = not precise_fact_query
+    if use_dense_search:
+        kb_model_map = {
+            item.id: item.embedding_model
+            for item in db.scalars(
+                select(KnowledgeBase).where(KnowledgeBase.id.in_(unique_kb_ids))
+            ).all()
+        }
 
-    dense_top_k = min(12, max(local_top_k * 2, local_top_k + 1))
-    query_embedding_cache: dict[str, list[float]] = {}
-    for kb_id in unique_kb_ids:
-        model_name = normalize_embedding_model_name(
-            kb_model_map.get(kb_id, settings.default_embedding_model)
-        )
-        query_embedding = query_embedding_cache.get(model_name)
-        if query_embedding is None:
-            query_embedding = embed_query(query=query_text, model_name=model_name)
-            query_embedding_cache[model_name] = query_embedding
+        dense_top_k = min(10, max(local_top_k + 1, local_top_k * 2 - 1))
+        query_embedding_cache: dict[str, list[float]] = {}
+        for kb_id in unique_kb_ids:
+            model_name = normalize_embedding_model_name(
+                kb_model_map.get(kb_id, settings.default_embedding_model)
+            )
+            query_embedding = query_embedding_cache.get(model_name)
+            if query_embedding is None:
+                query_embedding = embed_query(query=query_text, model_name=model_name)
+                query_embedding_cache[model_name] = query_embedding
 
-        for item in search_similar_chunks(
-            kb_id=kb_id,
-            query=query_text,
-            top_k=dense_top_k,
-            query_embedding=query_embedding,
-        ):
-            chunk_id = item["chunk_id"]
-            if chunk_id in chunk_cache:
-                dense_scores[chunk_id] = max(
-                    dense_scores.get(chunk_id, 0.0), float(item["score"])
-                )
+            for item in search_similar_chunks(
+                kb_id=kb_id,
+                query=query_text,
+                top_k=dense_top_k,
+                query_embedding=query_embedding,
+            ):
+                chunk_id = item["chunk_id"]
+                if chunk_id in chunk_cache:
+                    dense_scores[chunk_id] = max(
+                        dense_scores.get(chunk_id, 0.0), float(item["score"])
+                    )
 
     dense_ranked = [
         cid

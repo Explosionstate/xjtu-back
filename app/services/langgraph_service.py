@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Callable, TypedDict
 
 from app.services.agent_profile_service import build_agent_system_instruction
@@ -94,6 +95,7 @@ def _output_guard(state: ChatGraphState) -> ChatGraphState:
     return state
 
 
+@lru_cache(maxsize=1)
 def _build_graph():
     if StateGraph is None:
         return None

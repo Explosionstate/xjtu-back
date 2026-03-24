@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
@@ -834,24 +834,10 @@ def _is_guidance_query(question: str) -> bool:
 
 def _looks_like_fact_lookup_query(agent_key: str | None, question: str) -> bool:
     normalized_agent = normalize_agent_key(agent_key)
-    if normalized_agent == "policy-qa":
+    if normalized_agent in {"policy-qa", "teacher-assistant", "risk-warning"}:
         return True
     q = (question or "").strip().lower()
     if not q:
-        return False
-    if normalized_agent in {"teacher-assistant", "risk-warning"} and any(
-        token in q
-        for token in [
-            "焦虑",
-            "迷茫",
-            "纠结",
-            "压力",
-            "不知道",
-            "怎么办",
-            "怎么选",
-            "要不要",
-        ]
-    ):
         return False
     fact_tokens = [
         "政策",
@@ -894,21 +880,12 @@ def _looks_like_fact_lookup_query(agent_key: str | None, question: str) -> bool:
         "方向",
         "跨考",
         "实习",
+        "怎么办",
         "思路",
     ]
-    fact_hit = any(token in q for token in fact_tokens)
-    if not fact_hit:
-        return False
-    if _looks_like_service_process_query(question):
-        return True
-    open_hit_count = sum(1 for token in open_tokens if token in q)
-    if open_hit_count >= 2:
-        return False
-    if any(token in q for token in ["怎么办", "怎么处理", "如何处理"]) and any(
-        token in q for token in ["办理", "流程", "步骤", "申请", "材料"]
-    ):
-        return True
-    return True
+    return any(token in q for token in fact_tokens) and not any(
+        token in q for token in open_tokens
+    )
 
 
 def _looks_like_service_process_query(question: str) -> bool:
@@ -933,95 +910,16 @@ def _looks_like_service_process_query(question: str) -> bool:
     return any(token in q for token in service_tokens)
 
 
-def _looks_like_open_guidance_query(question: str) -> bool:
-    q = (question or "").strip().lower()
-    if not q:
-        return False
-    if _looks_like_service_process_query(question):
-        return False
-    open_tokens = [
-        "焦虑",
-        "迷茫",
-        "纠结",
-        "压力",
-        "痛苦",
-        "方向",
-        "选择",
-        "职业",
-        "还是",
-        "要不要",
-        "不知道",
-        "怎么办",
-        "怎么选",
-        "怎么做",
-        "思路",
-        "建议",
-    ]
-    fact_tokens = [
-        "政策",
-        "规定",
-        "流程",
-        "步骤",
-        "材料",
-        "申请",
-        "办理",
-        "要求",
-        "时间",
-        "地点",
-        "学分",
-        "绩点",
-        "是什么",
-        "多少",
-    ]
-    open_hits = sum(1 for token in open_tokens if token in q)
-    fact_hits = sum(1 for token in fact_tokens if token in q)
-    return open_hits >= 2 or (open_hits >= 1 and fact_hits == 0)
-
-
 def _resolve_question_mode(agent_key: str | None, question: str) -> str:
     if _looks_like_crisis_query(question):
         return QUESTION_MODE_CRISIS
     if _is_academic_analysis_query(agent_key, question):
         return QUESTION_MODE_ACADEMIC
-    if _looks_like_open_guidance_query(question):
-        return QUESTION_MODE_OPEN
     if _looks_like_fact_lookup_query(agent_key, question):
         return QUESTION_MODE_FACT
     if _is_student_growth_agent(agent_key) or _is_guidance_query(question):
         return QUESTION_MODE_OPEN
-    lowered = (question or "").lower()
-    return (
-        QUESTION_MODE_FACT
-        if any(token in lowered for token in ["什么", "what"])
-        else QUESTION_MODE_OPEN
-    )
-
-
-def _should_use_generation_first_mode(
-    *,
-    question_mode: str,
-    route_mode: str,
-    agent_key: str | None,
-    question: str,
-) -> bool:
-    if question_mode != QUESTION_MODE_OPEN:
-        return False
-    if route_mode == MODEL_ROUTE_RETRIEVAL_ONLY:
-        return False
-    if _is_academic_analysis_query(agent_key, question):
-        return False
-    if _looks_like_fact_lookup_query(agent_key, question):
-        return False
-    if _looks_like_service_process_query(question):
-        return False
-    q = (question or "").strip().lower()
-    if not q:
-        return False
-    if _looks_like_open_guidance_query(question):
-        return True
-    if any(token in q for token in ["总结", "概述", "梳理", "报告", "对比", "分析"]):
-        return False
-    return len(q) <= 120
+    return QUESTION_MODE_FACT if "什么" in (question or "") else QUESTION_MODE_OPEN
 
 
 def _build_open_question_fallback(
@@ -1370,22 +1268,6 @@ def chat_completion(
     )
     retrieval_query_cache: dict[str, str] = {}
     retrieval_result_cache: dict[tuple[str, int, float], list[dict]] = {}
-    history_context_cache: dict[str, str] = {}
-
-    def _resolve_history_context(runtime_question: str) -> str:
-        key = (runtime_question or "").strip()
-        if not key:
-            return ""
-        cached_summary = history_context_cache.get(key)
-        if cached_summary is not None:
-            return cached_summary
-        summary = _build_history_context_brief(
-            trimmed_history,
-            key,
-            long_term_memory=long_term_memory,
-        )
-        history_context_cache[key] = summary
-        return summary
 
     def _resolve_retrieval_query(runtime_question: str) -> str:
         key = (runtime_question or "").strip()
@@ -1394,11 +1276,6 @@ def chat_completion(
         cached_query = retrieval_query_cache.get(key)
         if cached_query is not None:
             return cached_query
-        if _looks_like_service_process_query(key) or _looks_like_fact_lookup_query(
-            payload.agent_key, key
-        ):
-            retrieval_query_cache[key] = key
-            return key
         built_query = _expand_academic_query(
             payload.agent_key,
             _build_retrieval_query(trimmed_history, key, long_term_memory),
@@ -1436,11 +1313,8 @@ def chat_completion(
 
     question_mode = _resolve_question_mode(payload.agent_key, question)
     is_academic_analysis = question_mode == QUESTION_MODE_ACADEMIC
-    generation_first_mode = _should_use_generation_first_mode(
-        question_mode=question_mode,
-        route_mode=route_mode,
-        agent_key=payload.agent_key,
-        question=question,
+    generation_first_mode = (
+        question_mode == QUESTION_MODE_OPEN and route_mode != MODEL_ROUTE_RETRIEVAL_ONLY
     )
     chat_total_timeout = (
         ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS
@@ -1616,7 +1490,6 @@ def chat_completion(
             *,
             runtime_top_k: int | None = None,
             runtime_threshold: float | None = None,
-            allow_relaxed_retry: bool = True,
             detail: str = "正在检索知识库资料...",
         ) -> tuple[list[str], list[dict]]:
             nonlocal retrieved, retrieval_ms, workflow_stage
@@ -1641,7 +1514,7 @@ def chat_completion(
                     effective_top_k,
                     effective_threshold,
                 )
-                if allow_relaxed_retry and not retrieved:
+                if not retrieved:
                     relaxed_top_k = min(8, max(effective_top_k + 2, 3))
                     relaxed_threshold = max(
                         MIN_RELAXED_THRESHOLD,
@@ -1709,12 +1582,12 @@ def chat_completion(
                 status="start",
                 detail="正在生成最终回答...",
             )
-            history_context = _resolve_history_context(runtime_question)
-            retrieval_contexts = (
-                contexts[:4]
-                if contexts
-                else _format_retrieval_contexts_for_generation(retrieved)
+            history_context = _build_history_context_brief(
+                trimmed_history,
+                runtime_question,
+                long_term_memory=long_term_memory,
             )
+            retrieval_contexts = _format_retrieval_contexts_for_generation(retrieved)
             background_contexts: list[str] = []
             if question_mode != QUESTION_MODE_FACT and history_context:
                 background_contexts.append(
@@ -2061,28 +1934,18 @@ def chat_completion(
             try:
                 _retrieve(
                     question,
-                    runtime_top_k=min(3, max(top_k, 2)),
-                    runtime_threshold=max(score_threshold, 0.2),
-                    allow_relaxed_retry=False,
+                    runtime_top_k=min(4, max(top_k, 2)),
+                    runtime_threshold=max(score_threshold, 0.18),
                     detail="正在补充可参考线索...",
                 )
             except Exception:
                 logger.debug("post-answer retrieval skipped", exc_info=True)
             workflow_stage = "done"
         else:
-            workflow_budget_reserved = 2 if cloud_enabled else 6
             workflow_timeout = max(
                 8,
-                min(workflow_timeout_cap, chat_total_timeout - workflow_budget_reserved),
+                min(workflow_timeout_cap, chat_total_timeout - 6),
             )
-            if cloud_enabled:
-                workflow_timeout = max(
-                    workflow_timeout,
-                    min(workflow_timeout_cap, max(12, generation_timeout + 2)),
-                )
-                workflow_timeout = min(
-                    workflow_timeout, max(8, chat_total_timeout - 1)
-                )
 
             executor = ThreadPoolExecutor(max_workers=1)
             future = executor.submit(
@@ -2139,24 +2002,6 @@ def chat_completion(
                             break
                         continue
                 workflow_wait_ms += int((perf_counter() - wait_start) * 1000)
-                if timed_out:
-                    if workflow_stage == "generation" and not future.done():
-                        remaining_total = chat_total_timeout - (
-                            perf_counter() - start
-                        )
-                        grace_timeout = min(3.0, max(0.0, remaining_total - 0.4))
-                        if grace_timeout >= 0.8:
-                            grace_start = perf_counter()
-                            try:
-                                graph_result = future.result(timeout=grace_timeout)
-                                workflow_stage = "done"
-                                timed_out = False
-                            except FuturesTimeoutError:
-                                pass
-                            finally:
-                                workflow_wait_ms += int(
-                                    (perf_counter() - grace_start) * 1000
-                                )
                 if timed_out:
                     logger.warning(
                         "workflow timeout: conversation=%s agent=%s stage=%s elapsed_ms=%s",
@@ -2285,7 +2130,11 @@ def chat_completion(
             elif (route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled) or (
                 route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not retrieved
             ):
-                fallback_history = _resolve_history_context(question)
+                fallback_history = _build_history_context_brief(
+                    trimmed_history,
+                    question,
+                    long_term_memory=long_term_memory,
+                )
                 fallback_retrieval_contexts = _format_retrieval_contexts_for_generation(
                     retrieved
                 )

@@ -46,9 +46,9 @@ LLM_MAX_OUTPUT_TOKENS = 340
 STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
     "direct": AnswerStyleProfile(
         style="direct",
-        context_limit=3,
-        context_chars=820,
-        max_tokens=220,
+        context_limit=2,
+        context_chars=620,
+        max_tokens=210,
         temperature_floor=0.12,
         top_p=0.82,
         frequency_penalty=0.2,
@@ -57,9 +57,9 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
     ),
     "analysis": AnswerStyleProfile(
         style="analysis",
-        context_limit=4,
-        context_chars=760,
-        max_tokens=300,
+        context_limit=3,
+        context_chars=640,
+        max_tokens=280,
         temperature_floor=0.18,
         top_p=0.86,
         frequency_penalty=0.25,
@@ -68,9 +68,9 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
     ),
     "comparison": AnswerStyleProfile(
         style="comparison",
-        context_limit=4,
-        context_chars=720,
-        max_tokens=300,
+        context_limit=3,
+        context_chars=620,
+        max_tokens=280,
         temperature_floor=0.2,
         top_p=0.9,
         frequency_penalty=0.2,
@@ -79,9 +79,9 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
     ),
     "guidance": AnswerStyleProfile(
         style="guidance",
-        context_limit=3,
-        context_chars=560,
-        max_tokens=300,
+        context_limit=2,
+        context_chars=500,
+        max_tokens=280,
         temperature_floor=0.2,
         top_p=0.86,
         frequency_penalty=0.3,
@@ -90,9 +90,9 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
     ),
     "summary": AnswerStyleProfile(
         style="summary",
-        context_limit=4,
-        context_chars=740,
-        max_tokens=280,
+        context_limit=3,
+        context_chars=620,
+        max_tokens=260,
         temperature_floor=0.16,
         top_p=0.84,
         frequency_penalty=0.24,
@@ -133,6 +133,7 @@ def _invoke_chat_completion_direct(
         headers={
             "Authorization": f"Bearer {settings.api_key}",
             "Content-Type": "application/json",
+            "Connection": "keep-alive",
         },
         method="POST",
     )
@@ -161,6 +162,63 @@ def _invoke_chat_completion_direct(
         message
     ) or _extract_reasoning_from_mapping(choices[0])
     return answer, reasoning
+
+
+def _compact_instruction_text(text: str | None, max_chars: int = 560) -> str:
+    compact = " ".join((text or "").split()).strip()
+    if not compact:
+        return ""
+    return compact[:max_chars]
+
+
+def _build_timeout_guided_fallback(
+    *,
+    question: str,
+    contexts: list[str],
+    allow_general_knowledge: bool,
+    agent_key: str | None,
+) -> str:
+    focus = " ".join((question or "").split()).strip()[:88] or "当前问题"
+    evidence_lines: list[str] = []
+    for ctx in contexts[:3]:
+        line = re.sub(r"\s+", " ", (ctx or "").strip())
+        if not line:
+            continue
+        line = line[:160]
+        if line not in evidence_lines:
+            evidence_lines.append(line)
+    if not evidence_lines:
+        return _fallback_natural_answer(
+            question=question,
+            contexts=contexts,
+            allow_general_knowledge=allow_general_knowledge,
+            agent_key=agent_key,
+        )
+
+    style = _detect_answer_style(question)
+    lead_map = {
+        "comparison": "先给结论",
+        "analysis": "先给判断",
+        "guidance": "先给可执行方案",
+        "summary": "先给重点",
+    }
+    lead = lead_map.get(style, "先给直接回答")
+    evidence_block = "\n".join(f"- {item}" for item in evidence_lines[:2])
+    no_answer_rules = get_agent_no_answer_strategy(agent_key)
+    no_answer_hint = (
+        "；".join(no_answer_rules[:2])
+        if no_answer_rules
+        else "补充对象、时间范围和关键约束后我可以给出更精确方案"
+    )
+    if allow_general_knowledge:
+        tail = "本轮云端响应超时，我先基于现有线索给你最稳妥的答案；你补充场景后我可继续细化。"
+    else:
+        tail = f"当前以可核验线索为准；若需要更精确结论，建议：{no_answer_hint}。"
+    return (
+        f"{lead}：围绕“{focus}”，先给你当前最稳妥的回答。\n"
+        f"{evidence_block}\n"
+        f"{tail}"
+    )
 
 
 def answer_with_llm(
@@ -207,6 +265,7 @@ def answer_with_llm(
         limit=2,
         max_chars=360,
     )
+    system_instruction_text = _compact_instruction_text(system_instruction)
     agent_hint = build_agent_output_hint(
         agent_key,
         kb_hit=kb_hit,
@@ -232,12 +291,12 @@ def answer_with_llm(
             style_profile=profile,
             background_contexts=compact_background_contexts,
             retrieval_contexts=compact_retrieval_contexts,
-            system_instruction=system_instruction,
+            system_instruction=system_instruction_text,
         )
     else:
         prompt = _build_structured_prompt(
             question=question,
-            system_instruction=system_instruction,
+            system_instruction=system_instruction_text,
             academic_prompt=academic_prompt,
             style_profile=profile,
             retrieval_contexts=compact_retrieval_contexts,
@@ -251,7 +310,7 @@ def answer_with_llm(
         prompt = _build_cloud_direct_prompt(
             question=question,
             compact_contexts=compact_background_contexts,
-            system_instruction=system_instruction,
+            system_instruction=system_instruction_text,
             no_answer_rules=get_agent_no_answer_strategy(agent_key),
         )
     if agent_hint:
@@ -282,32 +341,39 @@ def answer_with_llm(
         effective_tokens = min(effective_tokens, 140)
 
     base_timeout = max(6, effective_timeout)
+    retry_reserved_timeout = (
+        min(10, max(5, base_timeout // 5))
+        if retry_on_failure and base_timeout >= 14
+        else 0
+    )
+    primary_timeout = max(6, base_timeout - retry_reserved_timeout)
     call_plan: list[tuple[str, str, int, int]] = [
-        ("primary", prompt, base_timeout, effective_tokens)
+        ("primary", prompt, primary_timeout, effective_tokens)
     ]
-    if open_answer_mode and retry_on_failure:
-        pass
-    if (
-        allow_general_knowledge
-        and retry_on_failure
-        and not kb_hit
-        and not open_answer_mode
-    ):
+    if retry_reserved_timeout > 0:
+        retry_timeout = retry_reserved_timeout
+        retry_contexts = (
+            compact_retrieval_contexts[:1] + compact_background_contexts[:1]
+        )[:2]
         retry_prompt = _build_compact_retry_prompt(
             question=question,
-            compact_contexts=compact_background_contexts,
-            system_instruction=system_instruction,
+            compact_contexts=retry_contexts,
+            system_instruction=system_instruction_text,
             no_answer_rules=get_agent_no_answer_strategy(agent_key),
         )
         if agent_hint:
             retry_prompt = f"{agent_hint}\n{retry_prompt}"
-        retry_timeout = 6
-        retry_tokens = max(96, min(180, effective_tokens))
-        call_plan.append(("retry", retry_prompt, retry_timeout, retry_tokens))
+        retry_tokens = max(96, min(200, max(120, effective_tokens - 20)))
+        call_plan.append(("retry_compact", retry_prompt, retry_timeout, retry_tokens))
 
     timeout_detected = False
     last_exc: Exception | None = None
-    for attempt_name, attempt_prompt, attempt_timeout, attempt_tokens in call_plan:
+    for attempt_index, (
+        attempt_name,
+        attempt_prompt,
+        attempt_timeout,
+        attempt_tokens,
+    ) in enumerate(call_plan):
         started = perf_counter()
         try:
             answer, reasoning = _invoke_chat_completion_direct(
@@ -355,7 +421,8 @@ def answer_with_llm(
                     elapsed_ms,
                     exc.__class__.__name__,
                 )
-            if timeout_like:
+            has_more_attempts = attempt_index < len(call_plan) - 1
+            if timeout_like and not has_more_attempts:
                 break
             continue
 
@@ -369,15 +436,24 @@ def answer_with_llm(
     fallback_contexts: list[str] = []
     if compact_background_contexts:
         fallback_contexts.extend(compact_background_contexts[:2])
-    if compact_retrieval_contexts and not allow_general_knowledge:
+    if compact_retrieval_contexts:
         fallback_contexts.extend(compact_retrieval_contexts[:1])
-    return LLMAnswerResult(
-        answer=_fallback_natural_answer(
+    if timeout_detected:
+        fallback_answer = _build_timeout_guided_fallback(
+            question=question,
+            contexts=fallback_contexts,
+            allow_general_knowledge=allow_general_knowledge,
+            agent_key=agent_key,
+        )
+    else:
+        fallback_answer = _fallback_natural_answer(
             question,
             fallback_contexts,
             allow_general_knowledge=allow_general_knowledge,
             agent_key=agent_key,
-        ),
+        )
+    return LLMAnswerResult(
+        answer=fallback_answer,
         mode=fallback_mode,
     )
 
@@ -394,8 +470,8 @@ def _build_structured_prompt(
     allow_general_knowledge: bool,
     agent_key: str | None,
 ) -> str:
-    evidence_block = "\n".join(f"- {item}" for item in retrieval_contexts[:4])
-    background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
+    evidence_block = "\n".join(f"- {item}" for item in retrieval_contexts[:3])
+    background_block = "\n".join(f"- {item}" for item in background_contexts[:1])
     no_answer_rules = get_agent_no_answer_strategy(agent_key)
     no_answer_hint = (
         "；".join(no_answer_rules[:2]) if no_answer_rules else "明确边界并给下一步。"
@@ -438,7 +514,7 @@ def _build_open_answer_prompt(
     retrieval_contexts: list[str],
     system_instruction: str | None,
 ) -> str:
-    background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
+    background_block = "\n".join(f"- {item}" for item in background_contexts[:1])
     evidence_hint = retrieval_contexts[0] if retrieval_contexts else ""
     evidence_block = (
         f"\n可参考线索（只在最后一句提及）：\n- {evidence_hint}"
