@@ -196,6 +196,19 @@ def _build_timeout_guided_fallback(
         )
 
     style = _detect_answer_style(question)
+    complexity_mode = _detect_question_complexity(question, style)
+    is_complex_query = complexity_mode == "complex"
+    if not is_complex_query:
+        best_evidence = evidence_lines[0] if evidence_lines else ""
+        if best_evidence:
+            return (
+                f"围绕“{focus}”，我先给你一个直接结论：{best_evidence}。"
+                "当前云端响应超时，如果你愿意我可以继续补充更细的原因和执行建议。"
+            )
+        return (
+            f"围绕“{focus}”，我先给你一个简要回答。"
+            "当前云端响应超时，你补充一点场景细节后我可以继续细化。"
+        )
     lead_map = {
         "comparison": "先给结论",
         "analysis": "先给判断",
@@ -240,15 +253,19 @@ def answer_with_llm(
 
     style = _detect_answer_style(question)
     profile = STYLE_PROFILES.get(style, STYLE_PROFILES["direct"])
+    complexity_mode = _detect_question_complexity(question, style)
+    is_complex_query = complexity_mode == "complex"
     raw_retrieval_contexts = (
         list(retrieval_contexts)
         if retrieval_contexts is not None
         else ([] if kb_hit is False else list(contexts))
     )
+    retrieval_limit = profile.context_limit if is_complex_query else max(1, profile.context_limit - 1)
+    retrieval_chars = profile.context_chars if is_complex_query else max(360, profile.context_chars - 220)
     compact_retrieval_contexts = _compact_contexts(
         contexts=raw_retrieval_contexts,
-        limit=profile.context_limit,
-        max_chars=profile.context_chars,
+        limit=retrieval_limit,
+        max_chars=retrieval_chars,
     )
     if kb_hit is None:
         kb_hit = bool(compact_retrieval_contexts)
@@ -262,8 +279,8 @@ def answer_with_llm(
     )
     compact_background_contexts = _compact_contexts(
         contexts=raw_background_contexts,
-        limit=2,
-        max_chars=360,
+        limit=2 if is_complex_query else 1,
+        max_chars=360 if is_complex_query else 220,
     )
     system_instruction_text = _compact_instruction_text(system_instruction)
     agent_hint = build_agent_output_hint(
@@ -292,6 +309,7 @@ def answer_with_llm(
             background_contexts=compact_background_contexts,
             retrieval_contexts=compact_retrieval_contexts,
             system_instruction=system_instruction_text,
+            is_complex_query=is_complex_query,
         )
     else:
         prompt = _build_structured_prompt(
@@ -304,6 +322,7 @@ def answer_with_llm(
             kb_hit=bool(kb_hit),
             allow_general_knowledge=allow_general_knowledge,
             agent_key=agent_key,
+            is_complex_query=is_complex_query,
         )
 
     if allow_general_knowledge and not kb_hit and not open_answer_mode:
@@ -332,13 +351,22 @@ def answer_with_llm(
         effective_timeout = min(effective_timeout, timeout_cap)
 
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
-    effective_tokens = max(120, min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens))
+    if is_complex_query:
+        effective_tokens = max(
+            140,
+            min(LLM_MAX_OUTPUT_TOKENS, profile.max_tokens + 36),
+        )
+    else:
+        effective_tokens = max(
+            96,
+            min(LLM_MAX_OUTPUT_TOKENS, min(profile.max_tokens, 170)),
+        )
     if open_answer_mode:
-        effective_tokens = min(effective_tokens, 280)
+        effective_tokens = min(effective_tokens, 300 if is_complex_query else 150)
     if allow_general_knowledge and not kb_hit:
-        effective_tokens = min(effective_tokens, 180)
+        effective_tokens = min(effective_tokens, 180 if is_complex_query else 130)
     if allow_general_knowledge and not compact_retrieval_contexts:
-        effective_tokens = min(effective_tokens, 140)
+        effective_tokens = min(effective_tokens, 150 if is_complex_query else 120)
 
     base_timeout = max(6, effective_timeout)
     retry_reserved_timeout = (
@@ -469,9 +497,10 @@ def _build_structured_prompt(
     kb_hit: bool,
     allow_general_knowledge: bool,
     agent_key: str | None,
+    is_complex_query: bool,
 ) -> str:
     evidence_block = "\n".join(f"- {item}" for item in retrieval_contexts[:3])
-    background_block = "\n".join(f"- {item}" for item in background_contexts[:1])
+    background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
     no_answer_rules = get_agent_no_answer_strategy(agent_key)
     no_answer_hint = (
         "；".join(no_answer_rules[:2]) if no_answer_rules else "明确边界并给下一步。"
@@ -488,20 +517,35 @@ def _build_structured_prompt(
             f"知识库未命中：不编造事实；按该智能体无答案策略执行：{no_answer_hint}"
         )
 
+    complexity_mode = "complex" if is_complex_query else "simple"
+    complexity_instruction = (
+        "复杂问题：使用自然小标题或编号，至少覆盖结论、关键依据、风险边界、执行步骤；内容要具体，避免空泛。"
+        if is_complex_query
+        else "简单问题：直接自然回答，不要强行套固定三段式；1-3段即可说清楚。"
+    )
+    length_instruction = (
+        "篇幅：更详细完整，可适度展开。"
+        if is_complex_query
+        else "篇幅：尽量简洁，避免重复和冗余铺垫。"
+    )
     return (
         f"{(system_instruction or '').strip()}\n"
         f"{academic_prompt}"
         "你是知识库增强问答助手。\n"
+        "请使用与用户提问一致的语言回答。\n"
         f"{evidence_policy}\n"
         f"回答类型：{style_profile.style}\n"
+        f"复杂度模式：{complexity_mode}\n"
         f"组织建议：{style_profile.organization_hint}\n"
+        f"{complexity_instruction}\n"
+        f"{length_instruction}\n"
         "写作要求：\n"
-        "1) 第一段直接回答用户问题，不写寒暄。\n"
-        "2) 优先给你的推理与建议，不要把回答写成知识库摘录。\n"
-        "3) 有证据时只用一句“可参考线索”点到为止。\n"
-        "4) 无证据时自然说明不足，并给最小可执行建议。\n"
+        "1) 第一段直接回答问题，不写客套话。\n"
+        "2) 以分析和判断为主，不要把回答写成机械摘要。\n"
+        "3) 证据只在必要时引用，避免逐条复述原文。\n"
+        "4) 信息不足时明确边界，并给最小可执行下一步。\n"
         f"问题：{question}\n\n"
-        f"知识库证据：\n{evidence_block or '（未命中高置信知识库证据）'}\n\n"
+        f"知识库证据：\n{evidence_block or '（未命中高置信证据）'}\n\n"
         f"背景补充（可选）：\n{background_block or '（无额外背景）'}"
     )
 
@@ -513,19 +557,35 @@ def _build_open_answer_prompt(
     background_contexts: list[str],
     retrieval_contexts: list[str],
     system_instruction: str | None,
+    is_complex_query: bool,
 ) -> str:
-    background_block = "\n".join(f"- {item}" for item in background_contexts[:1])
+    background_block = "\n".join(f"- {item}" for item in background_contexts[:2])
     evidence_hint = retrieval_contexts[0] if retrieval_contexts else ""
     evidence_block = (
         f"\n可参考线索（只在最后一句提及）：\n- {evidence_hint}"
         if evidence_hint
         else ""
     )
+    complexity_mode = "complex" if is_complex_query else "simple"
+    complexity_instruction = (
+        "复杂问题：可用小标题或编号分段，先结论再展开分析，给出可执行建议。"
+        if is_complex_query
+        else "简单问题：自然直接回答，避免固定模板和重复话术。"
+    )
+    length_instruction = (
+        "篇幅：保证完整性，允许适度展开。"
+        if is_complex_query
+        else "篇幅：优先短答，信息够用即可。"
+    )
     return (
         f"{(system_instruction or '').strip()}\n"
         "你是对话助手，请先独立回答用户真正想解决的问题。\n"
+        "请使用与用户提问一致的语言回答。\n"
         f"回答类型：{style_profile.style}\n"
+        f"复杂度模式：{complexity_mode}\n"
         f"组织建议：{style_profile.organization_hint}\n"
+        f"{complexity_instruction}\n"
+        f"{length_instruction}\n"
         "写作要求：\n"
         "1) 第一段必须直接回答，不要先复述背景。\n"
         "2) 以你的判断、分析和建议为主，不要把回答写成资料摘要。\n"
@@ -604,6 +664,8 @@ def _fallback_natural_answer(
     agent_key: str | None = None,
 ) -> str:
     style = _detect_answer_style(question)
+    complexity_mode = _detect_question_complexity(question, style)
+    is_complex_query = complexity_mode == "complex"
     q = (question or "").strip().lower()
     question_focus = (question or "").strip()[:80] or "当前问题"
     no_answer_rules = get_agent_no_answer_strategy(agent_key)
@@ -613,12 +675,17 @@ def _fallback_natural_answer(
 
     if not contexts:
         if allow_general_knowledge:
-            return _render_general_knowledge_fallback(style, question_focus)
+            return _render_general_knowledge_fallback(
+                style,
+                question_focus,
+                is_complex_query=is_complex_query,
+            )
         return _render_no_context_fallback(
             style,
             question_focus,
             no_answer_text,
             q,
+            is_complex_query=is_complex_query,
         )
 
     merged = "\n".join(contexts)
@@ -658,16 +725,27 @@ def _fallback_natural_answer(
 
     if not cleaned:
         if allow_general_knowledge:
-            return _render_general_knowledge_fallback(style, question_focus)
+            return _render_general_knowledge_fallback(
+                style,
+                question_focus,
+                is_complex_query=is_complex_query,
+            )
         return _render_no_context_fallback(
             style,
             question_focus,
             no_answer_text,
             q,
+            is_complex_query=is_complex_query,
         )
 
     evidence_lines = cleaned[:4]
-    return _render_context_fallback(style, question_focus, evidence_lines, q)
+    return _render_context_fallback(
+        style,
+        question_focus,
+        evidence_lines,
+        q,
+        is_complex_query=is_complex_query,
+    )
 
 
 def _is_academic_analysis_query(question: str) -> bool:
@@ -716,6 +794,39 @@ def _detect_answer_style(question: str) -> str:
     ):
         return "analysis"
     return "direct"
+
+
+def _detect_question_complexity(question: str, style: str) -> str:
+    q = (question or "").strip().lower()
+    if not q:
+        return "simple"
+    if style in {"analysis", "comparison"}:
+        return "complex"
+    punctuation_score = q.count("，") + q.count(",") + q.count("；") + q.count(";")
+    complex_markers = [
+        "分析",
+        "对比",
+        "比较",
+        "方案",
+        "规划",
+        "步骤",
+        "风险",
+        "策略",
+        "路径",
+        "优缺点",
+        "取舍",
+        "why",
+        "how",
+        "plan",
+        "vs",
+    ]
+    if any(marker in q for marker in complex_markers):
+        return "complex"
+    if style == "guidance" and (len(q) >= 26 or punctuation_score >= 2):
+        return "complex"
+    if len(q) >= 54 or punctuation_score >= 3:
+        return "complex"
+    return "simple"
 
 
 def _looks_like_decision_guidance_query(question: str) -> bool:
@@ -921,7 +1032,13 @@ def _render_no_context_fallback(
     question_focus: str,
     no_answer_text: str,
     normalized_question: str,
+    is_complex_query: bool = True,
 ) -> str:
+    if not is_complex_query:
+        return (
+            f"关于“{question_focus}”，当前可用信息还不够完整。"
+            f"先给你一个直接建议：{no_answer_text}。"
+        )
     if style == "comparison":
         return (
             f"当前还缺少可比依据，暂时不能对“{question_focus}”给出可靠对比结论。\n"
@@ -963,7 +1080,16 @@ def _render_no_context_fallback(
     )
 
 
-def _render_general_knowledge_fallback(style: str, question_focus: str) -> str:
+def _render_general_knowledge_fallback(
+    style: str,
+    question_focus: str,
+    is_complex_query: bool = True,
+) -> str:
+    if not is_complex_query:
+        return (
+            f"关于“{question_focus}”，我先给你一个直接、可执行的通用回答。"
+            "如果你补充具体场景，我可以再细化到更贴合你的版本。"
+        )
     if style == "comparison":
         return (
             f"关于“{question_focus}”，我先按通用经验给你比较框架：\n"
@@ -1009,8 +1135,19 @@ def _render_context_fallback(
     question_focus: str,
     evidence_lines: list[str],
     normalized_question: str,
+    is_complex_query: bool = True,
 ) -> str:
     evidence_hint = (evidence_lines[0] or "").strip()[:52] if evidence_lines else ""
+    if not is_complex_query:
+        if evidence_hint:
+            return (
+                f"先直接回答：围绕“{question_focus}”，目前更稳妥的做法是先按现有信息执行。"
+                f"可参考线索：{evidence_hint}。"
+            )
+        return (
+            f"先直接回答：围绕“{question_focus}”，目前信息有限，建议先做小范围验证，"
+            "再根据结果细化方案。"
+        )
     if style == "comparison":
         return (
             f"基于当前命中内容，可先对“{question_focus}”做初步对比：\n"
