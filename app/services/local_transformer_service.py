@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -24,11 +25,60 @@ _GENERATION_SEMAPHORE = BoundedSemaphore(
     value=max(1, settings.local_transformer_max_concurrency)
 )
 _WORKER_STATE_LOCK = Lock()
-_WORKER_COOLDOWN_SECONDS = 90
-_WORKER_TIMEOUT_SECONDS = 24
+_WORKER_COOLDOWN_SECONDS = 60
+_WORKER_TIMEOUT_COOLDOWN_SECONDS = 12
+_WORKER_STARTUP_COOLDOWN_SECONDS = 24
+_WORKER_TIMEOUT_SECONDS = 130
 _worker_disabled_until = 0.0
 _worker_last_error = ""
 logger = logging.getLogger(__name__)
+
+
+def _decode_worker_stream(raw: bytes | str | None) -> tuple[str, str]:
+    if raw is None:
+        return "", "empty"
+    if isinstance(raw, str):
+        return raw, "text"
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace"), "utf-8-replace"
+
+
+def _looks_like_windows_pagefile_error(text: str) -> bool:
+    normalized = (text or "").lower()
+    return (
+        "os error 1455" in normalized
+        or "页面文件太小" in normalized
+        or "page file is too small" in normalized
+    )
+
+
+def _run_local_worker_once(
+    *,
+    cmd: list[str],
+    payload_bytes: bytes,
+    timeout_seconds: int,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        cmd,
+        input=payload_bytes,
+        capture_output=True,
+        text=False,
+        timeout=timeout_seconds,
+        check=False,
+        env=env,
+    )
+
+
+def _activate_worker_cooldown(reason: str, cooldown_seconds: int) -> None:
+    global _worker_disabled_until, _worker_last_error
+    with _WORKER_STATE_LOCK:
+        _worker_disabled_until = perf_counter() + max(1, cooldown_seconds)
+        _worker_last_error = (reason or "worker_error")[:120]
 
 
 def _load_runtime_modules():
@@ -78,8 +128,10 @@ def _get_local_model(model_reference: str):
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    force_cpu = os.getenv("XJTU_FORCE_CPU", "") == "1"
     if (
-        settings.transformer_device == "cuda"
+        not force_cpu
+        and settings.transformer_device == "cuda"
         and torch_module is not None
         and torch_module.cuda.is_available()
     ):
@@ -246,46 +298,105 @@ def _generate_answer_via_worker(
         "kb_hit": kb_hit,
     }
     cmd = [sys.executable, "-m", "app.services.local_transformer_worker"]
+    payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    worker_start = perf_counter()
     try:
-        result = subprocess.run(
-            cmd,
-            input=json.dumps(payload, ensure_ascii=False),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=_WORKER_TIMEOUT_SECONDS,
-            check=False,
+        result = _run_local_worker_once(
+            cmd=cmd,
+            payload_bytes=payload_bytes,
+            timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
-        with _WORKER_STATE_LOCK:
-            _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
-            _worker_last_error = "worker_timeout"
+        _activate_worker_cooldown(
+            reason="worker_timeout",
+            cooldown_seconds=_WORKER_TIMEOUT_COOLDOWN_SECONDS,
+        )
         raise BusinessError(
             "本地模型执行超时，已自动进入保护冷却。", status_code=503
         ) from exc
     except Exception as exc:
-        with _WORKER_STATE_LOCK:
-            _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
-            _worker_last_error = exc.__class__.__name__
+        _activate_worker_cooldown(
+            reason=exc.__class__.__name__,
+            cooldown_seconds=_WORKER_STARTUP_COOLDOWN_SECONDS,
+        )
         raise BusinessError(
             "本地模型运行时启动失败，已切换保护模式。", status_code=503
         ) from exc
 
-    if result.returncode != 0:
-        stderr_text = (result.stderr or "").strip()
-        logger.error(
-            "local worker failed: returncode=%s stderr=%s",
-            result.returncode,
-            stderr_text[:2000],
-        )
-        stderr = stderr_text.splitlines()
-        last_error = stderr[-1][:120] if stderr else f"exit_{result.returncode}"
-        with _WORKER_STATE_LOCK:
-            _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
-            _worker_last_error = last_error
-        raise BusinessError("本地模型运行异常，已自动进入保护冷却。", status_code=503)
+    worker_elapsed_ms = int((perf_counter() - worker_start) * 1000)
+    stdout_text, stdout_decode = _decode_worker_stream(result.stdout)
+    stderr_text, stderr_decode = _decode_worker_stream(result.stderr)
 
-    raw_stdout = (result.stdout or "").strip()
+    if result.returncode != 0 and _looks_like_windows_pagefile_error(stderr_text):
+        retry_env = dict(env)
+        retry_env["XJTU_FORCE_CPU"] = "1"
+        retry_env["CUDA_VISIBLE_DEVICES"] = "-1"
+        retry_start = perf_counter()
+        retry_result = _run_local_worker_once(
+            cmd=cmd,
+            payload_bytes=payload_bytes,
+            timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+            env=retry_env,
+        )
+        retry_elapsed_ms = int((perf_counter() - retry_start) * 1000)
+        retry_stdout, retry_stdout_decode = _decode_worker_stream(retry_result.stdout)
+        retry_stderr, retry_stderr_decode = _decode_worker_stream(retry_result.stderr)
+        if retry_result.returncode == 0:
+            logger.warning(
+                "local worker recovered by cpu retry: elapsed_ms=%s retry_elapsed_ms=%s",
+                worker_elapsed_ms,
+                retry_elapsed_ms,
+            )
+            result = retry_result
+            stdout_text = retry_stdout
+            stderr_text = retry_stderr
+            stdout_decode = retry_stdout_decode
+            stderr_decode = retry_stderr_decode
+            worker_elapsed_ms += retry_elapsed_ms
+        else:
+            logger.error(
+                "local worker cpu retry failed: returncode=%s elapsed_ms=%s stdout_decode=%s stderr_decode=%s stdout=%s stderr=%s",
+                retry_result.returncode,
+                retry_elapsed_ms,
+                retry_stdout_decode,
+                retry_stderr_decode,
+                (retry_stdout or "").strip()[:1000],
+                (retry_stderr or "").strip()[:2000],
+            )
+
+    if result.returncode != 0:
+        logger.error(
+            "local worker failed: returncode=%s elapsed_ms=%s stdout_decode=%s stderr_decode=%s stdout=%s stderr=%s",
+            result.returncode,
+            worker_elapsed_ms,
+            stdout_decode,
+            stderr_decode,
+            (stdout_text or "").strip()[:1000],
+            (stderr_text or "").strip()[:2000],
+        )
+        stderr = (stderr_text or "").strip().splitlines()
+        error_code = f"exit_{result.returncode}"
+        tail = stderr[-1][:90] if stderr else ""
+        last_error = f"{error_code}:{tail}" if tail else error_code
+        cooldown_seconds = (
+            _WORKER_TIMEOUT_COOLDOWN_SECONDS
+            if _looks_like_windows_pagefile_error(stderr_text)
+            else _WORKER_COOLDOWN_SECONDS
+        )
+        _activate_worker_cooldown(
+            reason=last_error,
+            cooldown_seconds=cooldown_seconds,
+        )
+        raise BusinessError(
+            f"本地模型运行异常（{error_code}），已自动进入保护冷却。",
+            status_code=503,
+        )
+
+    raw_stdout = (stdout_text or "").strip()
     parsed: dict | None = None
     if raw_stdout:
         try:
@@ -298,9 +409,18 @@ def _generate_answer_via_worker(
                 except json.JSONDecodeError:
                     parsed = None
     if not isinstance(parsed, dict):
-        with _WORKER_STATE_LOCK:
-            _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
-            _worker_last_error = "invalid_worker_json"
+        logger.error(
+            "local worker invalid json: elapsed_ms=%s stdout_decode=%s stderr_decode=%s stdout=%s stderr=%s",
+            worker_elapsed_ms,
+            stdout_decode,
+            stderr_decode,
+            raw_stdout[:1000],
+            (stderr_text or "").strip()[:1000],
+        )
+        _activate_worker_cooldown(
+            reason="invalid_worker_json",
+            cooldown_seconds=_WORKER_STARTUP_COOLDOWN_SECONDS,
+        )
         raise BusinessError("本地模型返回结果异常，已切换保护模式。", status_code=503)
     output = parsed
 
@@ -617,7 +737,7 @@ def local_transformer_runtime() -> dict[str, int | str | bool]:
         "cuda_available": cuda_available,
         "max_concurrency": settings.local_transformer_max_concurrency,
         "queue_timeout_seconds": settings.local_transformer_queue_timeout_seconds,
-        "worker_isolated": False,
+        "worker_isolated": True,
         "worker_available": worker_available,
         "worker_last_error": worker_last_error,
     }

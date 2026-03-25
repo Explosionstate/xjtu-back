@@ -8,6 +8,10 @@ from app.services.local_transformer_service import _generate_answer_in_process
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         answer, model_reference, metrics = _generate_answer_in_process(

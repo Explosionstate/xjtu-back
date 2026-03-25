@@ -50,17 +50,17 @@ from app.services.system_config_service import (
 from app.services.kb_service import resolve_agent_bound_kb_scope
 
 
-CHAT_TOTAL_TIMEOUT_SECONDS = 120
-WORKFLOW_TIMEOUT_SECONDS = 112
-GENERATION_STAGE_TIMEOUT_SECONDS = 96
-LOCAL_GENERATION_TIMEOUT_SECONDS = 20
+CHAT_TOTAL_TIMEOUT_SECONDS = 180
+WORKFLOW_TIMEOUT_SECONDS = 172
+GENERATION_STAGE_TIMEOUT_SECONDS = 156
+LOCAL_GENERATION_TIMEOUT_SECONDS = 150
 WORKFLOW_POLL_INTERVAL_SECONDS = 0.35
-NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS = 120
-NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS = 112
-NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS = 96
-ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 120
-ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 112
-ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
+NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS = 180
+NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS = 172
+NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS = 156
+ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 180
+ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 172
+ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 156
 ACADEMIC_PROFILE_TIMEOUT_SECONDS = 8.0
 DEFAULT_PROFILE_TIMEOUT_SECONDS = 1.5
 MIN_RELAXED_THRESHOLD = 0.12
@@ -144,6 +144,7 @@ def _clean_retrieval_snippet(text: str, max_chars: int = 240) -> str:
     cleaned = re.sub(r"(?m)^\|?\s*[-:|]{3,}\s*\|?$", "", cleaned)
     cleaned = re.sub(r"(?m)^[-*•]\s*", "", cleaned)
     cleaned = re.sub(r"(?m)^\d+[.)、]\s*", "", cleaned)
+    cleaned = cleaned.replace("|", " ")
     cleaned = cleaned.replace("\\.", ".").replace("\\-", "-").replace("\\+", "+")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = cleaned.strip(" ：:;；,，。-")
@@ -240,23 +241,74 @@ def _looks_like_low_quality_local_answer(answer: str | None) -> bool:
     text = _compact_text(str(answer or ""), 240).lower()
     if not text or len(text) < 18:
         return True
-    refusal_markers = (
+    hard_refusal_markers = (
         "我无法提供",
         "无法提供您所请求",
         "我不能提供",
         "对不起，我无法",
         "抱歉，我无法",
         "无法获取",
+    )
+    soft_refusal_markers = (
         "请提供更多信息",
         "如果您能提供更多",
         "作为ai",
         "没有足够信息",
     )
-    if any(marker in text for marker in refusal_markers):
+
+    has_structure = any(
+        marker in text
+        for marker in ("1)", "2)", "3)", "建议", "步骤", "先", "再", "最后")
+    )
+    has_evidence = any(
+        marker in text for marker in ("依据", "参考线索", "知识库", "命中资料", "来源")
+    )
+    structured_with_evidence = has_structure and has_evidence
+
+    if any(marker in text for marker in hard_refusal_markers):
+        return not structured_with_evidence
+
+    soft_hits = sum(1 for marker in soft_refusal_markers if marker in text)
+    if soft_hits >= 2 and len(text) < 180 and not structured_with_evidence:
         return True
+
     if text.count("human:") >= 1 or text.count("assistant:") >= 2:
         return True
+
+    if len(text) < 36 and not structured_with_evidence:
+        return True
+
     return False
+
+
+def _looks_like_unrequested_profile_leak(question: str, answer: str | None) -> bool:
+    q = (question or "").strip().lower()
+    if any(
+        token in q
+        for token in [
+            "我的成绩",
+            "我的学情",
+            "个人画像",
+            "gpa",
+            "绩点",
+            "我目前",
+            "我的平均分",
+        ]
+    ):
+        return False
+    text = (answer or "").strip().lower()
+    if not text:
+        return False
+    sensitive_markers = [
+        "学情指数",
+        "课程平均分",
+        "上月上升",
+        "同学的学习成绩",
+        "其目前的学习状态",
+    ]
+    if any(marker in text for marker in sensitive_markers):
+        return True
+    return bool(re.search(r"[\u4e00-\u9fff]{2,4}同学", text))
 
 
 def _extract_answer_sections(
@@ -975,8 +1027,11 @@ def _fast_retrieval_answer(
             )
         return f"当前未检索到足够依据（{agent_focus}）。\n建议：{no_answer_hint}。"
 
-    summarize_keywords = ["总结", "重点", "概述", "本周", "新增文档"]
-    if any(token in question for token in summarize_keywords):
+    summarize_keywords = ["总结", "重点", "概述", "梳理", "归纳", "总览", "新增文档"]
+    guidance_excludes = ["建议", "如何", "怎么", "提升", "平衡", "该怎么", "怎么办"]
+    has_summary_intent = any(token in question for token in summarize_keywords)
+    has_guidance_intent = any(token in question for token in guidance_excludes)
+    if has_summary_intent and not has_guidance_intent:
         source_names: list[str] = []
         for item in retrieved:
             name = str(item.get("source_location") or "").strip()
@@ -1049,6 +1104,71 @@ def _fast_retrieval_answer(
         f"围绕“{focus}”，建议先做 2-4 周小步验证，再决定长期路径（{agent_focus}）。\n"
         "先用小范围实践获取反馈，再把时间投入到效果更稳定的方向上。\n"
         f"依据线索：{evidence_hint or '已命中相关资料'}。"
+    )
+
+
+def _build_local_failure_answer(
+    *,
+    question: str,
+    retrieved: list[dict],
+    trimmed_history: list[Message],
+    agent_key: str | None,
+) -> str:
+    focus = _compact_text(question, 42) or "当前问题"
+    style = _detect_answer_style(question)
+    snippets: list[str] = []
+    for item in retrieved[:5]:
+        content = _clean_retrieval_snippet(str(item.get("content") or ""), 72)
+        if not content:
+            continue
+        if content in snippets:
+            continue
+        snippets.append(content)
+        if len(snippets) >= 3:
+            break
+    evidence_text = "；".join(snippets[:2]) if snippets else "已命中相关资料"
+
+    if _looks_like_course_selection_query(question):
+        return (
+            f"围绕“{focus}”，先给你一版稳妥的选课执行建议。\n"
+            "1) 要求核对：先对培养方案，确认必修/限选/任选和本学期建议修读顺序；\n"
+            "2) 限制检查：核对学分上下限、先修条件、时间冲突和课程容量；\n"
+            "3) 提交前复核：确认退补改窗口、是否需学院审批、是否影响后续课程链路。\n"
+            f"参考线索：{evidence_text}。"
+        )
+
+    q = (question or "").strip().lower()
+    if any(token in q for token in ["学习", "生活", "平衡", "焦虑", "熬夜", "效率"]):
+        return (
+            f"围绕“{focus}”，本周先按“学业优先、活动减量、睡眠止损”执行。\n"
+            "1) 学业主线：每天固定 2 个 45 分钟学习块，只做最影响成绩的课程任务；\n"
+            "2) 活动控制：社团/活动压到每周 1-2 次，超出部分本周顺延；\n"
+            "3) 睡眠底线：连续 3 天把入睡时间提前，先把熬夜拉回可恢复区间；\n"
+            "4) 两天一复盘：看完成率和精神状态，再决定是否继续减负。\n"
+            f"参考线索：{evidence_text}。"
+        )
+
+    if retrieved:
+        return (
+            f"围绕“{focus}”，先给你可执行版本。\n"
+            "1) 先确定本周唯一主目标；\n"
+            "2) 把任务拆成每天最小动作并设置截止时间；\n"
+            "3) 按结果滚动调整，不一次性铺开过多事项。\n"
+            f"参考线索：{evidence_text}。"
+        )
+
+    if style == "guidance":
+        return _build_open_question_fallback(
+            question,
+            trimmed_history,
+            agent_key=agent_key,
+        )
+
+    return _build_kb_bounded_shortfall_answer(
+        question,
+        trimmed_history,
+        route_mode=MODEL_ROUTE_LOCAL_ONLY,
+        agent_key=agent_key,
     )
 
 
@@ -1834,6 +1954,20 @@ def _build_summary_thinking(
     rounds = max(1, (len(trimmed_history) + 1) // 2) if trimmed_history else 0
     cloud_direct_mode = route_mode == MODEL_ROUTE_CLOUD_ONLY
 
+    def _local_primary_generation_mode(mode: str) -> bool:
+        degraded_markers = (
+            "timeout_degraded",
+            "error_degraded",
+            "open_timeout_fallback",
+            "open_error_fallback",
+            "quality_rewrite",
+            "low_quality_rewrite",
+            "profile_safety_rewrite",
+        )
+        return mode.startswith("local_transformer") and not any(
+            marker in mode for marker in degraded_markers
+        )
+
     if rule_answer:
         steps.append("已识别当前问题属于规则类场景，并直接给出可执行答复。")
     elif cloud_direct_mode:
@@ -1864,15 +1998,37 @@ def _build_summary_thinking(
                 f"已在{scope_text}完成检索，但当前问题缺少可直接支撑的高置信资料。"
             )
             steps.append("已基于现有资料范围给出保守回答，并提示补充所需信息。")
-        if llm_result is not None and llm_result.mode.startswith("local_transformer"):
+        if llm_result is not None and _local_primary_generation_mode(llm_result.mode):
             steps.append("已由本地模型基于检索资料生成分段回答。")
+        elif llm_result is not None and any(
+            marker in llm_result.mode
+            for marker in (
+                "quality_rewrite",
+                "low_quality_rewrite",
+                "profile_safety_rewrite",
+            )
+        ):
+            steps.append("已完成本地生成质量校正，并输出结构化回答。")
+        elif llm_result is not None and llm_result.mode.startswith("local_transformer"):
+            steps.append("本地模型响应出现超时或异常，已切换结构化兜底答复。")
         elif llm_result is not None and "fallback" in llm_result.mode:
             steps.append("生成阶段出现波动，已切换为稳定的知识库约束答复。")
 
     total_seconds = max(0.1, round(total_ms / 1000, 1))
     steps.append(f"本次处理约耗时 {total_seconds} 秒。")
     if workflow_stage and workflow_stage not in {"init", "done"}:
-        steps.append(f"当前进度：{workflow_stage} 阶段已完成。")
+        timeout_markers = (
+            "timeout",
+            "timeout_fallback",
+            "timeout_degraded",
+            "open_timeout_fallback",
+        )
+        if llm_result is not None and any(
+            marker in llm_result.mode for marker in timeout_markers
+        ):
+            steps.append(f"当前进度：{workflow_stage} 阶段超时，已切换兜底答复。")
+        else:
+            steps.append(f"当前进度：{workflow_stage} 阶段已完成。")
     steps.append("以上为可公开展示的处理过程，不包含模型私有推理内容。")
     return ChatThinking(
         title="处理摘要",
@@ -2408,7 +2564,12 @@ def chat_completion(
                 answer, model_reference, _metrics = local_future.result(
                     timeout=local_timeout
                 )
-                if _looks_like_low_quality_local_answer(answer):
+                if _looks_like_low_quality_local_answer(
+                    answer
+                ) or _looks_like_unrequested_profile_leak(
+                    runtime_question,
+                    answer,
+                ):
                     return None
                 return LLMAnswerResult(
                     answer=answer,
@@ -2479,7 +2640,11 @@ def chat_completion(
                 background_contexts.append(
                     f"[会话背景] {_compact_text(history_context, history_max_chars)}"
                 )
-            if question_mode != QUESTION_MODE_FACT and profile_context_text:
+            if (
+                question_mode != QUESTION_MODE_FACT
+                and profile_context_text
+                and not _looks_like_kb_grounded_request(runtime_question)
+            ):
                 background_contexts.append(
                     f"[用户画像] {_compact_text(profile_context_text, 320)}"
                 )
@@ -2631,15 +2796,15 @@ def chat_completion(
                             llm_result = backup_result
                 elif local_enabled and route_mode == MODEL_ROUTE_LOCAL_ONLY:
                     local_timeout = max(
-                        6,
+                        24,
                         min(LOCAL_GENERATION_TIMEOUT_SECONDS, generation_timeout - 2),
                     )
                     try:
                         runtime = local_transformer_runtime()
                         if str(runtime.get("active_device") or "").lower() != "cuda":
                             local_timeout = min(
-                                max(local_timeout, 16),
-                                24 if is_complex_query else 20,
+                                max(local_timeout, 110 if is_complex_query else 90),
+                                148 if is_complex_query else 128,
                             )
                     except Exception:
                         logger.debug("local runtime check failed", exc_info=True)
@@ -2658,24 +2823,26 @@ def chat_completion(
                         answer, model_reference, _metrics = local_future.result(
                             timeout=local_timeout
                         )
-                        if _looks_like_low_quality_local_answer(answer):
-                            recovered_answer = (
-                                _fast_retrieval_answer(
-                                    runtime_question,
-                                    retrieved,
-                                    agent_key=payload.agent_key,
-                                )
-                                if retrieved
-                                else _build_kb_bounded_shortfall_answer(
-                                    runtime_question,
-                                    trimmed_history,
-                                    route_mode=route_mode,
-                                    agent_key=payload.agent_key,
-                                )
+                        low_quality_flag = _looks_like_low_quality_local_answer(answer)
+                        profile_leak_flag = _looks_like_unrequested_profile_leak(
+                            runtime_question,
+                            answer,
+                        )
+                        if low_quality_flag or profile_leak_flag:
+                            recovered_answer = _build_local_failure_answer(
+                                question=runtime_question,
+                                retrieved=retrieved,
+                                trimmed_history=trimmed_history,
+                                agent_key=payload.agent_key,
+                            )
+                            rewrite_mode = (
+                                "quality_rewrite"
+                                if low_quality_flag
+                                else "profile_safety_rewrite"
                             )
                             llm_result = LLMAnswerResult(
                                 answer=recovered_answer,
-                                mode=f"local_transformer:low_quality_rewrite:{model_reference}",
+                                mode=f"local_transformer:{rewrite_mode}:{model_reference}",
                             )
                         else:
                             llm_result = LLMAnswerResult(
@@ -2690,20 +2857,11 @@ def chat_completion(
                         )
                         if route_mode == MODEL_ROUTE_LOCAL_ONLY:
                             llm_result = LLMAnswerResult(
-                                answer=(
-                                    _build_open_question_fallback(
-                                        runtime_question,
-                                        trimmed_history,
-                                        agent_key=payload.agent_key,
-                                        long_term_memory=long_term_memory,
-                                        profile_context=profile_context_text,
-                                    )
-                                    if prefer_model_answer
-                                    else _fast_retrieval_answer(
-                                        runtime_question,
-                                        retrieved,
-                                        agent_key=payload.agent_key,
-                                    )
+                                answer=_build_local_failure_answer(
+                                    question=runtime_question,
+                                    retrieved=retrieved,
+                                    trimmed_history=trimmed_history,
+                                    agent_key=payload.agent_key,
                                 ),
                                 mode=(
                                     "local_transformer:open_timeout_fallback"
@@ -2734,20 +2892,11 @@ def chat_completion(
                         )
                         if route_mode == MODEL_ROUTE_LOCAL_ONLY:
                             llm_result = LLMAnswerResult(
-                                answer=(
-                                    _build_open_question_fallback(
-                                        runtime_question,
-                                        trimmed_history,
-                                        agent_key=payload.agent_key,
-                                        long_term_memory=long_term_memory,
-                                        profile_context=profile_context_text,
-                                    )
-                                    if prefer_model_answer
-                                    else _fast_retrieval_answer(
-                                        runtime_question,
-                                        retrieved,
-                                        agent_key=payload.agent_key,
-                                    )
+                                answer=_build_local_failure_answer(
+                                    question=runtime_question,
+                                    retrieved=retrieved,
+                                    trimmed_history=trimmed_history,
+                                    agent_key=payload.agent_key,
                                 ),
                                 mode=(
                                     "local_transformer:open_error_fallback"
@@ -2956,7 +3105,7 @@ def chat_completion(
             ):
                 generation_guard_timeout = max(
                     12,
-                    min(generation_timeout - 4, 26 if is_academic_analysis else 20),
+                    min(generation_timeout - 4, 154 if is_academic_analysis else 150),
                 )
             else:
                 generation_guard_timeout = max(
@@ -3093,19 +3242,19 @@ def chat_completion(
                             retrieval_ms += int((perf_counter() - stage_start) * 1000)
                         except Exception:
                             retrieved = []
-                        timeout_answer = (
-                            _fast_retrieval_answer(
-                                question,
-                                retrieved,
-                                agent_key=payload.agent_key,
-                            )
-                            if retrieved
-                            else _build_kb_bounded_shortfall_answer(
-                                question,
-                                trimmed_history,
-                                route_mode=route_mode,
-                                agent_key=payload.agent_key,
-                            )
+                        timeout_answer = _build_local_failure_answer(
+                            question=question,
+                            retrieved=retrieved,
+                            trimmed_history=trimmed_history,
+                            agent_key=payload.agent_key,
+                        )
+                        llm_result = LLMAnswerResult(
+                            answer=timeout_answer,
+                            mode=(
+                                "local_transformer:open_timeout_fallback"
+                                if generation_first_mode
+                                else "local_transformer:timeout_degraded"
+                            ),
                         )
                     graph_result = {
                         "error": "WORKFLOW_TIMEOUT",
