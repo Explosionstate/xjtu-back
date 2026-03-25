@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
@@ -88,6 +88,17 @@ STYLE_PROFILES: dict[str, AnswerStyleProfile] = {
         frequency_penalty=0.3,
         presence_penalty=0.12,
         organization_hint="按可执行步骤输出，每步写清目标与动作。",
+    ),
+    "course_selection": AnswerStyleProfile(
+        style="course_selection",
+        context_limit=3,
+        context_chars=540,
+        max_tokens=260,
+        temperature_floor=0.16,
+        top_p=0.84,
+        frequency_penalty=0.2,
+        presence_penalty=0.06,
+        organization_hint="先给选课结论，再按要求、时间窗口、限制条件、注意事项说明。",
     ),
     "summary": AnswerStyleProfile(
         style="summary",
@@ -243,7 +254,9 @@ def _sanitize_context_line(raw_text: str, max_chars: int = 128) -> str:
     if (
         len(text) <= 24
         and not re.search(r"[，。；：:,.!?？！]", text)
-        and any(token in text for token in ("概述", "总结", "目录", "要点", "说明", "资源"))
+        and any(
+            token in text for token in ("概述", "总结", "目录", "要点", "说明", "资源")
+        )
     ):
         return ""
     return text[:max_chars]
@@ -266,6 +279,11 @@ def _collect_fallback_evidence(contexts: list[str], max_items: int = 3) -> list[
                     "127.0.0.1",
                     "create table",
                     "insert into",
+                    "[会话背景]",
+                    "[用户画像]",
+                    "近期用户问题",
+                    "近期助手回答",
+                    "对话上下文摘要",
                 )
             ):
                 continue
@@ -299,12 +317,17 @@ def _build_timeout_guided_fallback(
     is_complex_query = complexity_mode == "complex"
     if not is_complex_query:
         best_evidence = evidence_lines[0] if evidence_lines else ""
+        if style == "course_selection":
+            return _apply_agent_fallback_tone(
+                _render_course_selection_fallback(focus, best_evidence[:120]),
+                agent_key,
+            )
         if best_evidence:
             return _apply_agent_fallback_tone(
                 (
-                f"先给你一个直接结论：围绕“{focus}”，目前更稳妥的做法是优先按已知线索推进，"
-                f"核心依据是“{best_evidence}”。"
-                "如果你愿意，我可以继续补充更细的原因和下一步执行清单。"
+                    f"先给你一个直接结论：围绕“{focus}”，目前更稳妥的做法是优先按已知线索推进，"
+                    f"核心依据是“{best_evidence}”。"
+                    "如果你愿意，我可以继续补充更细的原因和下一步执行清单。"
                 ),
                 agent_key,
             )
@@ -316,10 +339,18 @@ def _build_timeout_guided_fallback(
             agent_key,
         )
 
+    if style == "guidance" and _looks_like_stress_conflict_query(question):
+        best_evidence = evidence_lines[0] if evidence_lines else ""
+        return _apply_agent_fallback_tone(
+            _render_stress_conflict_fallback(focus, best_evidence[:120]),
+            agent_key,
+        )
+
     lead_map = {
         "comparison": "先给你可执行结论",
         "analysis": "先给你关键判断",
         "guidance": "先给你可落地方案",
+        "course_selection": "先给你选课要求",
         "summary": "先给你核心结论",
     }
     lead = lead_map.get(style, "先给你直接结论")
@@ -476,12 +507,7 @@ def answer_with_llm(
             else settings.llm_timeout_seconds
         ),
     )
-    if open_answer_mode:
-        effective_timeout = min(effective_timeout, 72 if is_complex_query else 26)
-    elif allow_general_knowledge and not kb_hit:
-        # Keep cloud direct-chat mode under the frontend request budget.
-        timeout_cap = 36 if is_complex_query else 24
-        effective_timeout = min(effective_timeout, timeout_cap)
+    # Keep the full caller-provided timeout budget for all question modes.
 
     effective_temperature = max(settings.llm_temperature, profile.temperature_floor)
     if is_complex_query:
@@ -501,7 +527,11 @@ def answer_with_llm(
         effective_tokens = min(effective_tokens, 320 if is_complex_query else 180)
     if allow_general_knowledge and not compact_retrieval_contexts:
         effective_tokens = min(effective_tokens, 300 if is_complex_query else 165)
-    if cloud_direct_fast_mode and not is_complex_query and not compact_background_contexts:
+    if (
+        cloud_direct_fast_mode
+        and not is_complex_query
+        and not compact_background_contexts
+    ):
         effective_tokens = min(effective_tokens, 150)
 
     base_timeout = max(6, effective_timeout)
@@ -514,7 +544,9 @@ def answer_with_llm(
             retry_reserved_timeout = min(10, max(5, base_timeout // 5))
     else:
         retry_reserved_timeout = 0
-    primary_timeout = max(5 if cloud_direct_fast_mode else 6, base_timeout - retry_reserved_timeout)
+    primary_timeout = max(
+        5 if cloud_direct_fast_mode else 6, base_timeout - retry_reserved_timeout
+    )
     call_plan: list[tuple[str, str, int, int]] = [
         ("primary", prompt, primary_timeout, effective_tokens)
     ]
@@ -647,9 +679,15 @@ def _build_structured_prompt(
     )
 
     if kb_hit:
-        evidence_policy = (
-            "知识库已命中：先独立给出判断，再用1条证据做校验；不要复读证据原文。"
-        )
+        if style_profile.style == "course_selection":
+            evidence_policy = (
+                "知识库已命中：先直接给出选课要求，再按时间窗口、限制条件、注意事项组织回答；"
+                "综合2-3条证据，不要照抄表格或原文。"
+            )
+        else:
+            evidence_policy = (
+                "知识库已命中：先独立给出判断，再用1条证据做校验；不要复读证据原文。"
+            )
     elif allow_general_knowledge:
         evidence_policy = "知识库未命中：可结合通用知识回答，但需要明确哪些是通用判断。"
     else:
@@ -657,16 +695,20 @@ def _build_structured_prompt(
             f"知识库未命中：不编造事实；按该智能体无答案策略执行：{no_answer_hint}"
         )
 
-    complexity_instruction = (
-        "复杂问题：使用自然小标题或编号，至少覆盖结论、关键依据、风险边界、执行步骤；内容要具体，避免空泛。"
-        if is_complex_query
-        else "简单问题：直接自然回答，不要强行套固定三段式；1-3段即可说清楚。"
-    )
-    length_instruction = (
-        "篇幅：更详细完整，可适度展开。"
-        if is_complex_query
-        else "篇幅：尽量简洁，避免重复和冗余铺垫。"
-    )
+    if style_profile.style == "course_selection":
+        complexity_instruction = "选课/要求类问题：用清晰编号回答，至少覆盖要求、时间窗口、限制条件、注意事项。"
+        length_instruction = "篇幅：控制在 4-6 行，优先给可执行清单，不要复读原文。"
+    else:
+        complexity_instruction = (
+            "复杂问题：使用自然小标题或编号，至少覆盖结论、关键依据、风险边界、执行步骤；内容要具体，避免空泛。"
+            if is_complex_query
+            else "简单问题：直接自然回答，不要强行套固定三段式；1-3段即可说清楚。"
+        )
+        length_instruction = (
+            "篇幅：更详细完整，可适度展开。"
+            if is_complex_query
+            else "篇幅：尽量简洁，避免重复和冗余铺垫。"
+        )
     return (
         f"{(system_instruction or '').strip()}\n"
         f"{academic_prompt}"
@@ -709,29 +751,15 @@ def _build_open_answer_prompt(
     )
 
     if is_complex_query:
-        depth_instruction = (
-            "复杂问题：给出完整结论、关键依据、风险边界与可执行步骤。"
-        )
-        length_instruction = (
-            "篇幅建议：260-460 字左右，信息完整但避免冗长。"
-        )
-        structure_instruction = (
-            "可使用清晰结构，如“结论/依据/行动建议”。"
-        )
+        depth_instruction = "复杂问题：给出完整结论、关键依据、风险边界与可执行步骤。"
+        length_instruction = "篇幅建议：260-460 字左右，信息完整但避免冗长。"
+        structure_instruction = "可使用清晰结构，如“结论/依据/行动建议”。"
     else:
-        depth_instruction = (
-            "简单问题：直接回答，再给一个可执行下一步。"
-        )
-        length_instruction = (
-            "篇幅建议：90-170 字左右。"
-        )
-        structure_instruction = (
-            "不要强行套模板，用 1-2 段自然表达即可。"
-        )
+        depth_instruction = "简单问题：直接回答，再给一个可执行下一步。"
+        length_instruction = "篇幅建议：90-170 字左右。"
+        structure_instruction = "不要强行套模板，用 1-2 段自然表达即可。"
 
-    style_hint = (
-        f"组织偏好：{organization_hint}\n" if organization_hint else ""
-    )
+    style_hint = f"组织偏好：{organization_hint}\n" if organization_hint else ""
     role_focus_line = f"角色焦点：{role_focus}\n" if role_focus else ""
     role_hint_line = f"角色补充：{role_cloud_hint}\n" if role_cloud_hint else ""
     return (
@@ -938,6 +966,8 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
+    if _looks_like_course_selection_query(q):
+        return "course_selection"
     if _looks_like_club_overload_query(q):
         return "guidance"
     if _looks_like_doctoral_extension_query(q):
@@ -1080,6 +1110,8 @@ def _looks_like_service_process_query(question: str) -> bool:
     q = (question or "").strip().lower()
     if not q:
         return False
+    if _looks_like_course_selection_query(question):
+        return False
     service_tokens = [
         "挂失",
         "补办",
@@ -1092,10 +1124,36 @@ def _looks_like_service_process_query(question: str) -> bool:
         "门禁卡",
         "学生证",
         "请假",
-        "选课",
         "缴费",
     ]
     return any(token in q for token in service_tokens)
+
+
+def _looks_like_course_selection_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    if "选课" in q:
+        return True
+    course_tokens = ["课程", "学分", "绩点", "培养方案", "先修", "修读"]
+    requirement_tokens = ["要求", "规则", "限制", "时间", "窗口", "容量"]
+    return any(token in q for token in course_tokens) and any(
+        token in q for token in requirement_tokens
+    )
+
+
+def _render_course_selection_fallback(
+    question_focus: str, evidence_hint: str = ""
+) -> str:
+    hint = f"\n可参考线索：{evidence_hint}。" if evidence_hint else ""
+    return (
+        f"先直接答复：围绕“{question_focus}”，选课前要先核对培养方案要求，再确认学分限制、先修条件和选课时间窗口。\n"
+        "1) 先看培养方案：确认本学期必修、限选、任选和建议修读顺序；\n"
+        "2) 再查系统限制：核对学分上下限、先修课程、时间冲突和课程容量；\n"
+        "3) 提交前复核：确认退补改时间、是否需要学院审批、是否影响后续课程修读；\n"
+        "4) 如仍拿不准，优先联系学院教务老师或辅导员核实。"
+        f"{hint}"
+    )
 
 
 def _render_decision_guidance_fallback(question_focus: str) -> str:
@@ -1196,8 +1254,12 @@ def _normalize_answer_text(answer: str) -> str:
     text = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
     text = re.sub(r"(?is)<system-reminder>.*?</system-reminder>", "", text).strip()
     text = re.sub(r"(?m)^#{1,6}\s*([一二三四五六七八九十0-9]+[、.)．]\s*)", "", text)
-    text = re.sub(r"(?m)^#{1,6}\s*(结论|依据|行动建议|建议|补充说明)\s*$", r"**\1**", text)
-    text = re.sub(r"(?m)^(处理摘要|系统策略|内部模板|内部分类|处理步骤)\s*[:：].*$", "", text)
+    text = re.sub(
+        r"(?m)^#{1,6}\s*(结论|依据|行动建议|建议|补充说明)\s*$", r"**\1**", text
+    )
+    text = re.sub(
+        r"(?m)^(处理摘要|系统策略|内部模板|内部分类|处理步骤)\s*[:：].*$", "", text
+    )
     if re.search(r"(?i)thinking process\s*:", text):
         public_match = re.search(
             r"(?m)^(?:\*\*)?(结论|直接回答|答案|依据|行动建议|补充说明)(?:\*\*)?\s*$",
@@ -1241,6 +1303,8 @@ def _render_no_context_fallback(
             f"当前资料不足，暂时无法对“{question_focus}”做有效摘要。\n"
             f"建议：{no_answer_text}。"
         )
+    if style == "course_selection":
+        return _render_course_selection_fallback(question_focus)
     if style == "guidance":
         if _looks_like_club_overload_query(normalized_question):
             return _render_club_overload_fallback(question_focus)
@@ -1292,6 +1356,8 @@ def _render_general_knowledge_fallback(
             f"关于“{question_focus}”，我先给你一个可直接使用的通用摘要结构：\n"
             "背景、核心要点、风险提示、下一步行动。"
         )
+    if style == "course_selection":
+        return _render_course_selection_fallback(question_focus)
     if style == "guidance":
         if _looks_like_club_overload_query(question_focus):
             return _render_club_overload_fallback(question_focus)
@@ -1376,6 +1442,8 @@ def _render_context_fallback(
             "4) 按复盘结果滚动调整计划，并优先处理高收益低成本事项。\n"
             f"可参考线索：{evidence_hint or '当前命中资料'}。"
         )
+    if style == "course_selection":
+        return _render_course_selection_fallback(question_focus, evidence_hint)
     if style == "analysis" or any(
         token in normalized_question for token in ["原因", "分析", "风险"]
     ):
@@ -1469,4 +1537,3 @@ def _flatten_text(value: Any) -> str:
             if text:
                 return text
     return ""
-

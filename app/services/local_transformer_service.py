@@ -163,6 +163,7 @@ def _build_prompt(
         "analysis": "先给判断，再解释原因与影响。",
         "comparison": "按对比维度给出建议，不要流水账。",
         "guidance": "给 2-3 条可执行步骤，句子自然。",
+        "course_selection": "先回答选课要求，再按要求、时间窗口、限制条件、注意事项组织。",
         "summary": "提炼重点，不要复述原文。",
     }.get(style, "自然、清晰、简洁地回答。")
 
@@ -201,29 +202,17 @@ def generate_answer_with_local_transformer(
     if not settings.local_transformer_enabled:
         raise BusinessError("本地 Transformer 模型已禁用", status_code=400)
 
-    try:
-        return _generate_answer_in_process(
-            question=question,
-            contexts=contexts,
-            model_name=model_name,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-            system_instruction=system_instruction,
-            kb_hit=kb_hit,
-        )
-    except BusinessError:
-        raise
-    except Exception:
-        logger.warning("local in-process generation failed, fallback to worker", exc_info=True)
-        return _generate_answer_via_worker(
-            question=question,
-            contexts=contexts,
-            model_name=model_name,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-            system_instruction=system_instruction,
-            kb_hit=kb_hit,
-        )
+    # Always isolate local generation in a worker process to avoid
+    # crashing the API process on native runtime failures.
+    return _generate_answer_via_worker(
+        question=question,
+        contexts=contexts,
+        model_name=model_name,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        system_instruction=system_instruction,
+        kb_hit=kb_hit,
+    )
 
 
 def _generate_answer_via_worker(
@@ -283,7 +272,13 @@ def _generate_answer_via_worker(
         ) from exc
 
     if result.returncode != 0:
-        stderr = (result.stderr or "").strip().splitlines()
+        stderr_text = (result.stderr or "").strip()
+        logger.error(
+            "local worker failed: returncode=%s stderr=%s",
+            result.returncode,
+            stderr_text[:2000],
+        )
+        stderr = stderr_text.splitlines()
         last_error = stderr[-1][:120] if stderr else f"exit_{result.returncode}"
         with _WORKER_STATE_LOCK:
             _worker_disabled_until = perf_counter() + _WORKER_COOLDOWN_SECONDS
@@ -444,6 +439,8 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
+    if _looks_like_course_selection_question(q):
+        return "course_selection"
     if _looks_like_open_guidance_question(q):
         return "guidance"
     if any(
@@ -474,6 +471,19 @@ def _detect_answer_style(question: str) -> str:
     ):
         return "analysis"
     return "direct"
+
+
+def _looks_like_course_selection_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    if "选课" in q:
+        return True
+    course_tokens = ["课程", "学分", "绩点", "培养方案", "先修", "修读"]
+    requirement_tokens = ["要求", "规则", "限制", "时间", "窗口", "容量"]
+    return any(token in q for token in course_tokens) and any(
+        token in q for token in requirement_tokens
+    )
 
 
 def _looks_like_open_guidance_question(question: str) -> bool:
@@ -520,7 +530,9 @@ def _build_model_inputs_with_chat_template(tokenizer, prompt: str) -> dict:
             )
             return tokenizer(rendered_prompt, return_tensors="pt")
         except Exception:
-            logger.debug("chat template unavailable, fallback to plain prompt", exc_info=True)
+            logger.debug(
+                "chat template unavailable, fallback to plain prompt", exc_info=True
+            )
     return tokenizer(prompt, return_tensors="pt")
 
 
@@ -564,11 +576,11 @@ def _postprocess_local_answer(answer: str) -> str:
 
 def _local_generation_profile(style: str, model_device: str) -> tuple[int, float]:
     cpu_profile = {
-        "direct": (92, 0.0),
-        "analysis": (120, 0.0),
-        "comparison": (124, 0.0),
-        "guidance": (132, 0.0),
-        "summary": (104, 0.0),
+        "direct": (84, 0.0),
+        "analysis": (100, 0.0),
+        "comparison": (104, 0.0),
+        "guidance": (108, 0.0),
+        "summary": (92, 0.0),
     }
     cuda_profile = {
         "direct": (180, 0.2),

@@ -50,14 +50,14 @@ from app.services.system_config_service import (
 from app.services.kb_service import resolve_agent_bound_kb_scope
 
 
-CHAT_TOTAL_TIMEOUT_SECONDS = 60
-WORKFLOW_TIMEOUT_SECONDS = 52
-GENERATION_STAGE_TIMEOUT_SECONDS = 28
+CHAT_TOTAL_TIMEOUT_SECONDS = 120
+WORKFLOW_TIMEOUT_SECONDS = 112
+GENERATION_STAGE_TIMEOUT_SECONDS = 96
 LOCAL_GENERATION_TIMEOUT_SECONDS = 20
 WORKFLOW_POLL_INTERVAL_SECONDS = 0.35
-NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS = 58
-NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS = 56
-NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS = 50
+NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS = 120
+NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS = 112
+NON_ACADEMIC_CLOUD_GENERATION_TIMEOUT_SECONDS = 96
 ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS = 120
 ACADEMIC_WORKFLOW_TIMEOUT_SECONDS = 112
 ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS = 96
@@ -103,9 +103,9 @@ def _resolve_model_route_mode(
     local_enabled = bool(payload.local_transformer_enabled)
 
     # Keep routing deterministic: cloud and local are treated as two distinct modes.
-    # When both switches are on, prioritize cloud direct-answer mode.
+    # When both switches are on, prioritize cloud mode but preserve local fallback ability.
     if cloud_enabled and local_enabled:
-        return MODEL_ROUTE_CLOUD_ONLY, True, False
+        return MODEL_ROUTE_CLOUD_ONLY, True, True
     if cloud_enabled:
         return MODEL_ROUTE_CLOUD_ONLY, cloud_enabled, local_enabled
     if local_enabled:
@@ -115,7 +115,7 @@ def _resolve_model_route_mode(
 
 def _model_route_desc(route_mode: str) -> str:
     return {
-        MODEL_ROUTE_CLOUD_ONLY: "云端模型直答（Qwen 主答，不依赖知识库）",
+        MODEL_ROUTE_CLOUD_ONLY: "云端模型主答（Qwen 主答，可结合知识库）",
         MODEL_ROUTE_HYBRID: "云端+本地协同（Qwen 主答，知识库轻量补充）",
         MODEL_ROUTE_LOCAL_ONLY: "仅本地模型（知识库增强回答）",
         MODEL_ROUTE_RETRIEVAL_ONLY: "检索整理模式（未启用模型）",
@@ -1009,6 +1009,14 @@ def _fast_retrieval_answer(
         snippets = ["已检索到相关片段，但可直接引用的高置信文本较少。"]
     focus = _compact_text(question, 42) or "当前问题"
     evidence_hint = _compact_text(snippets[0], 60)
+    if _looks_like_course_selection_query(question):
+        return (
+            f"针对“{focus}”，选课前先核对培养方案要求，再确认学分限制、先修条件和选课时间窗口（{agent_focus}）。\n"
+            "1) 先看培养方案：确认必修、限选、任选及本学期建议修读顺序；\n"
+            "2) 再查系统限制：核对学分上下限、先修课程、时间冲突和课程容量；\n"
+            "3) 提交前复核：确认退补改时间、是否需要学院审批、是否影响后续课程修读。\n"
+            f"依据线索：{evidence_hint or '已命中相关资料'}。"
+        )
     if _looks_like_service_process_query(question):
         return (
             f"针对“{focus}”，建议先做止损，再按学校流程办理（{agent_focus}）。\n"
@@ -1048,6 +1056,8 @@ def _detect_answer_style(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "direct"
+    if _looks_like_course_selection_query(q):
+        return "course_selection"
     if _looks_like_decision_guidance_query(q):
         return "guidance"
     if any(
@@ -1359,7 +1369,14 @@ def _is_guidance_query(question: str, agent_key: str | None = None) -> bool:
     agent_flags: dict[str, tuple[str, ...]] = {
         "student-growth": ("学生", "学习", "生活", "成长", "学业"),
         "teacher-assistant": ("教学", "课堂", "备课", "作业", "教案", "授课", "评价"),
-        "counselor-ideology": ("辅导员", "思政", "谈心", "班级", "学生管理", "活动组织"),
+        "counselor-ideology": (
+            "辅导员",
+            "思政",
+            "谈心",
+            "班级",
+            "学生管理",
+            "活动组织",
+        ),
         "risk-warning": ("预警", "风险", "异常", "干预", "监测", "识别"),
         "report-assistant": ("报告", "汇总", "趋势", "分析", "归纳", "简报"),
     }
@@ -1449,6 +1466,8 @@ def _looks_like_service_process_query(question: str) -> bool:
     q = (question or "").strip().lower()
     if not q:
         return False
+    if _looks_like_course_selection_query(question):
+        return False
     service_tokens = [
         "挂失",
         "补办",
@@ -1461,10 +1480,63 @@ def _looks_like_service_process_query(question: str) -> bool:
         "门禁卡",
         "学生证",
         "请假",
-        "选课",
         "缴费",
     ]
     return any(token in q for token in service_tokens)
+
+
+def _looks_like_course_selection_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    if "选课" in q:
+        return True
+    course_tokens = ["课程", "学分", "绩点", "培养方案", "先修", "修读"]
+    requirement_tokens = ["要求", "规则", "限制", "时间", "窗口", "容量"]
+    return any(token in q for token in course_tokens) and any(
+        token in q for token in requirement_tokens
+    )
+
+
+def _looks_like_kb_grounded_request(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    kb_markers = ["根据知识库", "结合知识库", "按知识库", "基于知识库", "结合资料"]
+    return any(marker in q for marker in kb_markers)
+
+
+def _should_force_cloud_retrieval_generation(
+    agent_key: str | None,
+    *,
+    question_mode: str,
+    question: str,
+    cloud_enabled: bool,
+) -> bool:
+    if not cloud_enabled:
+        return False
+    if normalize_agent_key(agent_key) != "student-growth":
+        return False
+    if question_mode == QUESTION_MODE_FACT:
+        return True
+    if question_mode == QUESTION_MODE_OPEN and _looks_like_kb_grounded_request(
+        question
+    ):
+        return True
+    return False
+
+
+def _should_use_local_timeout_backup(
+    *,
+    agent_key: str | None,
+    question_mode: str,
+    question: str,
+) -> bool:
+    if normalize_agent_key(agent_key) != "student-growth":
+        return False
+    if question_mode != QUESTION_MODE_FACT:
+        return False
+    return _looks_like_course_selection_query(question)
 
 
 def _looks_like_open_guidance_query(question: str) -> bool:
@@ -1766,11 +1838,16 @@ def _build_summary_thinking(
         steps.append("已识别当前问题属于规则类场景，并直接给出可执行答复。")
     elif cloud_direct_mode:
         if rounds > 0:
-            steps.append(f"已理解你的问题重点，并结合最近 {rounds} 轮对话补充必要上下文。")
+            steps.append(
+                f"已理解你的问题重点，并结合最近 {rounds} 轮对话补充必要上下文。"
+            )
         else:
             steps.append("已理解你的问题重点，并聚焦当前提问生成回答。")
         if llm_result is not None and llm_result.mode in {"llm", "llm_retry"}:
-            steps.append("已完成云端模型回答生成，并对表述做了可读性整理。")
+            if retrieved_count > 0:
+                steps.append("已结合知识库证据组织回答，并完成云端表达优化。")
+            else:
+                steps.append("已完成云端模型回答生成，并对表述做了可读性整理。")
         elif llm_result is not None and "fallback" in llm_result.mode:
             steps.append("云端响应出现波动，已先给出稳妥的可执行答复，并可继续细化。")
         else:
@@ -1778,10 +1855,14 @@ def _build_summary_thinking(
     else:
         scope_text = _build_scope_text(kb_ids, document_ids)
         if retrieved_count > 0:
-            steps.append(f"已在{scope_text}中检索到 {retrieved_count} 条相关资料，并提炼关键线索。")
-            steps.append("已结合检索线索整理回答，确保内容与知识库信息一致。")
+            steps.append(
+                f"已在{scope_text}中检索到 {retrieved_count} 条相关资料，并提炼关键线索。"
+            )
+            steps.append("已结合知识库证据组织回答，确保内容与知识库信息一致。")
         else:
-            steps.append(f"已在{scope_text}完成检索，但当前问题缺少可直接支撑的高置信资料。")
+            steps.append(
+                f"已在{scope_text}完成检索，但当前问题缺少可直接支撑的高置信资料。"
+            )
             steps.append("已基于现有资料范围给出保守回答，并提示补充所需信息。")
         if llm_result is not None and llm_result.mode.startswith("local_transformer"):
             steps.append("已由本地模型基于检索资料生成分段回答。")
@@ -1991,7 +2072,10 @@ def chat_completion(
         cached_query = retrieval_query_cache.get(key)
         if cached_query is not None:
             return cached_query
-        if route_mode == MODEL_ROUTE_CLOUD_ONLY:
+        if (
+            route_mode == MODEL_ROUTE_CLOUD_ONLY
+            and not force_cloud_retrieval_generation
+        ):
             retrieval_query_cache[key] = key
             return key
         if not is_complex_query and len(key) <= 26:
@@ -2040,6 +2124,12 @@ def chat_completion(
     question_mode = _resolve_question_mode(payload.agent_key, question)
     is_academic_analysis = question_mode == QUESTION_MODE_ACADEMIC
     is_complex_query = _is_complex_question(question, question_mode)
+    force_cloud_retrieval_generation = _should_force_cloud_retrieval_generation(
+        payload.agent_key,
+        question_mode=question_mode,
+        question=question,
+        cloud_enabled=cloud_enabled,
+    )
 
     if question_mode == QUESTION_MODE_FACT:
         top_k = min(max(top_k, 2), 4 if is_complex_query else 3)
@@ -2065,81 +2155,17 @@ def chat_completion(
     # - Cloud mode: direct LLM answer (KB retrieval is optional, not mandatory).
     # - Local mode: retrieval-enhanced answering only.
     if route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
-        generation_first_mode = True
+        generation_first_mode = not force_cloud_retrieval_generation
     elif route_mode == MODEL_ROUTE_LOCAL_ONLY:
         generation_first_mode = False
-    chat_total_timeout = (
-        ACADEMIC_CHAT_TOTAL_TIMEOUT_SECONDS
-        if is_academic_analysis
-        else CHAT_TOTAL_TIMEOUT_SECONDS
-    )
-    workflow_timeout_cap = (
-        ACADEMIC_WORKFLOW_TIMEOUT_SECONDS
-        if is_academic_analysis
-        else WORKFLOW_TIMEOUT_SECONDS
-    )
-    generation_timeout = (
-        ACADEMIC_GENERATION_STAGE_TIMEOUT_SECONDS
-        if is_academic_analysis
-        else GENERATION_STAGE_TIMEOUT_SECONDS
-    )
+    chat_total_timeout = CHAT_TOTAL_TIMEOUT_SECONDS
+    workflow_timeout_cap = WORKFLOW_TIMEOUT_SECONDS
+    generation_timeout = GENERATION_STAGE_TIMEOUT_SECONDS
     profile_timeout_seconds = (
         ACADEMIC_PROFILE_TIMEOUT_SECONDS
         if is_academic_analysis
         else DEFAULT_PROFILE_TIMEOUT_SECONDS
     )
-    if route_mode == MODEL_ROUTE_CLOUD_ONLY:
-        if is_academic_analysis:
-            chat_total_timeout = max(chat_total_timeout, 96)
-            workflow_timeout_cap = max(workflow_timeout_cap, 90)
-            generation_timeout = max(generation_timeout, 70)
-        else:
-            # Cloud direct mode should stay responsive for simple queries.
-            if is_complex_query:
-                chat_total_timeout = min(
-                    chat_total_timeout,
-                    min(NON_ACADEMIC_CLOUD_CHAT_TIMEOUT_SECONDS, 56),
-                )
-                workflow_timeout_cap = min(
-                    workflow_timeout_cap,
-                    min(NON_ACADEMIC_CLOUD_WORKFLOW_TIMEOUT_SECONDS, 50),
-                )
-                generation_timeout = min(max(generation_timeout, 34), 44)
-            else:
-                chat_total_timeout = min(chat_total_timeout, 40)
-                workflow_timeout_cap = min(workflow_timeout_cap, 34)
-                generation_timeout = min(max(generation_timeout, 20), 28)
-    elif (
-        route_mode == MODEL_ROUTE_HYBRID and cloud_enabled and not is_academic_analysis
-    ):
-        workflow_timeout_cap = min(
-            max(workflow_timeout_cap, 40),
-            50 if is_complex_query else 38,
-        )
-        generation_timeout = max(
-            generation_timeout,
-            34 if is_complex_query else 24,
-        )
-        generation_timeout = min(generation_timeout, 46 if is_complex_query else 30)
-    if question_mode == QUESTION_MODE_OPEN and route_mode != MODEL_ROUTE_RETRIEVAL_ONLY:
-        if route_mode == MODEL_ROUTE_CLOUD_ONLY:
-            if is_complex_query:
-                chat_total_timeout = max(chat_total_timeout, 64)
-                workflow_timeout_cap = max(workflow_timeout_cap, 56)
-                generation_timeout = max(generation_timeout, 38)
-            else:
-                chat_total_timeout = min(chat_total_timeout, 44)
-                workflow_timeout_cap = min(workflow_timeout_cap, 36)
-                generation_timeout = min(generation_timeout, 26)
-        else:
-            if is_complex_query:
-                chat_total_timeout = max(chat_total_timeout, 86)
-                workflow_timeout_cap = max(workflow_timeout_cap, 74)
-                generation_timeout = max(generation_timeout, 52)
-            else:
-                chat_total_timeout = max(chat_total_timeout, 68)
-                workflow_timeout_cap = max(workflow_timeout_cap, 58)
-                generation_timeout = max(generation_timeout, 40)
 
     logger.info(
         "chat time budget: conversation=%s agent=%s route=%s mode=%s cloud=%s local=%s total=%ss workflow_cap=%ss generation=%ss top_k=%s threshold=%.3f",
@@ -2283,7 +2309,11 @@ def chat_completion(
                 detail=detail,
             )
             try:
-                if route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
+                if (
+                    route_mode == MODEL_ROUTE_CLOUD_ONLY
+                    and cloud_enabled
+                    and not force_cloud_retrieval_generation
+                ):
                     retrieval_skipped = True
                     retrieved = []
                 else:
@@ -2346,6 +2376,56 @@ def chat_completion(
                 )
             return _format_retrieval_contexts_for_generation(retrieved), retrieved
 
+        def _attempt_local_timeout_backup_for_question(
+            runtime_question: str,
+        ) -> LLMAnswerResult | None:
+            if not local_enabled:
+                return None
+            if not _should_use_local_timeout_backup(
+                agent_key=payload.agent_key,
+                question_mode=question_mode,
+                question=runtime_question,
+            ):
+                return None
+            local_timeout = min(18, max(10, generation_timeout // 4))
+            local_course_instruction = (
+                "围绕选课问题输出：先给选课要求，再写学分限制、培养方案、先修条件、"
+                "选课时间窗口与注意事项；禁止输出挂失/补办/冻结等通用事务流程。"
+            )
+            local_contexts = _format_retrieval_contexts_for_generation(retrieved)[:3]
+            local_executor = ThreadPoolExecutor(max_workers=1)
+            local_future = local_executor.submit(
+                generate_answer_with_local_transformer,
+                runtime_question,
+                local_contexts,
+                settings.local_transformer_model,
+                None,
+                360,
+                local_course_instruction,
+                bool(retrieved),
+            )
+            try:
+                answer, model_reference, _metrics = local_future.result(
+                    timeout=local_timeout
+                )
+                if _looks_like_low_quality_local_answer(answer):
+                    return None
+                return LLMAnswerResult(
+                    answer=answer,
+                    mode=f"local_transformer:timeout_backup:{model_reference}",
+                )
+            except Exception:
+                logger.warning(
+                    "local timeout backup failed: conversation=%s agent=%s",
+                    conversation_id,
+                    payload.agent_key,
+                    exc_info=True,
+                )
+                return None
+            finally:
+                local_future.cancel()
+                local_executor.shutdown(wait=False, cancel_futures=True)
+
         def _generate(
             runtime_question: str,
             contexts: list[str],
@@ -2366,7 +2446,17 @@ def chat_completion(
                 if contexts
                 else _format_retrieval_contexts_for_generation(retrieved)
             )
-            cloud_direct_mode = route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled
+            force_retrieval_generation = _should_force_cloud_retrieval_generation(
+                payload.agent_key,
+                question_mode=question_mode,
+                question=runtime_question,
+                cloud_enabled=cloud_enabled,
+            )
+            cloud_direct_mode = (
+                route_mode == MODEL_ROUTE_CLOUD_ONLY
+                and cloud_enabled
+                and not force_retrieval_generation
+            )
             history_context = (
                 _resolve_history_context(runtime_question)
                 if (
@@ -2380,7 +2470,9 @@ def chat_completion(
             background_contexts: list[str] = []
             if question_mode != QUESTION_MODE_FACT and history_context:
                 history_max_chars = (
-                    220 if (cloud_direct_mode and is_complex_query) else 140
+                    220
+                    if (cloud_direct_mode and is_complex_query)
+                    else 140
                     if cloud_direct_mode
                     else 360
                 )
@@ -2396,23 +2488,27 @@ def chat_completion(
                     compact = _compact_text(item, 280)
                     if compact:
                         background_contexts.append(compact)
-            prefer_model_answer = (
-                cloud_direct_mode
-                or (
-                    generation_first_mode
-                    and not is_academic_analysis
-                    and not bool(retrieved)
-                )
+            prefer_model_answer = cloud_direct_mode or (
+                generation_first_mode
+                and not is_academic_analysis
+                and not bool(retrieved)
             )
             if prefer_model_answer:
-                generation_contexts = background_contexts[: (3 if is_complex_query else 1)]
+                generation_contexts = background_contexts[
+                    : (3 if is_complex_query else 1)
+                ]
                 llm_retrieval_contexts: list[str] = []
             elif (
                 route_mode in {MODEL_ROUTE_CLOUD_ONLY, MODEL_ROUTE_HYBRID}
                 and cloud_enabled
             ):
-                generation_contexts = (background_contexts + retrieval_contexts[:1])[:3]
-                llm_retrieval_contexts = retrieval_contexts[:1]
+                evidence_limit = 3 if force_retrieval_generation else 1
+                llm_retrieval_contexts = retrieval_contexts[:evidence_limit]
+                generation_contexts = (
+                    llm_retrieval_contexts + background_contexts[:1]
+                    if force_retrieval_generation
+                    else (background_contexts + llm_retrieval_contexts)
+                )[:4]
             else:
                 generation_contexts = (
                     (retrieval_contexts + background_contexts)[:4]
@@ -2420,6 +2516,9 @@ def chat_completion(
                     else []
                 )
                 llm_retrieval_contexts = retrieval_contexts
+
+            def _attempt_local_timeout_backup() -> LLMAnswerResult | None:
+                return _attempt_local_timeout_backup_for_question(runtime_question)
 
             def _attempt_local_open_backup() -> LLMAnswerResult | None:
                 if not local_transformer_backup_available():
@@ -2530,7 +2629,7 @@ def chat_completion(
                         backup_result = _attempt_local_open_backup()
                         if backup_result is not None:
                             llm_result = backup_result
-                elif local_enabled:
+                elif local_enabled and route_mode == MODEL_ROUTE_LOCAL_ONLY:
                     local_timeout = max(
                         6,
                         min(LOCAL_GENERATION_TIMEOUT_SECONDS, generation_timeout - 2),
@@ -2538,7 +2637,10 @@ def chat_completion(
                     try:
                         runtime = local_transformer_runtime()
                         if str(runtime.get("active_device") or "").lower() != "cuda":
-                            local_timeout = min(local_timeout, 8 if is_complex_query else 6)
+                            local_timeout = min(
+                                max(local_timeout, 16),
+                                24 if is_complex_query else 20,
+                            )
                     except Exception:
                         logger.debug("local runtime check failed", exc_info=True)
                     local_executor = ThreadPoolExecutor(max_workers=1)
@@ -2672,8 +2774,14 @@ def chat_completion(
                         local_future.cancel()
                         local_executor.shutdown(wait=False, cancel_futures=True)
                 elif cloud_enabled:
-                    allow_general_mode = True if cloud_direct_mode else prefer_model_answer
-                    kb_hit_flag = False if (prefer_model_answer or cloud_direct_mode) else bool(retrieved)
+                    allow_general_mode = (
+                        True if cloud_direct_mode else prefer_model_answer
+                    )
+                    kb_hit_flag = (
+                        False
+                        if (prefer_model_answer or cloud_direct_mode)
+                        else bool(retrieved)
+                    )
                     cloud_system_instruction = (
                         build_agent_cloud_instruction(payload.agent_key)
                         if cloud_direct_mode
@@ -2705,6 +2813,15 @@ def chat_completion(
                         and llm_result.mode in {"timeout_fallback", "error_fallback"}
                     ):
                         backup_result = _attempt_local_open_backup()
+                        if backup_result is not None:
+                            llm_result = backup_result
+                    elif force_retrieval_generation and llm_result.mode in {
+                        "timeout_fallback",
+                        "error_fallback",
+                    }:
+                        backup_result = _attempt_local_timeout_backup_for_question(
+                            question
+                        )
                         if backup_result is not None:
                             llm_result = backup_result
                 else:
@@ -2848,7 +2965,11 @@ def chat_completion(
                         generation_timeout + 10,
                         78
                         if is_academic_analysis
-                        else (92 if route_mode == MODEL_ROUTE_CLOUD_ONLY else 42),
+                        else (
+                            108
+                            if route_mode == MODEL_ROUTE_CLOUD_ONLY
+                            else (96 if cloud_enabled else 42)
+                        ),
                     ),
                 )
             try:
@@ -2918,29 +3039,43 @@ def chat_completion(
                             mode="open_question_timeout_fallback",
                         )
                     elif route_mode == MODEL_ROUTE_CLOUD_ONLY and cloud_enabled:
-                        timeout_answer = _build_cloud_timeout_answer(
-                            question=question,
-                            retrieved=retrieved,
-                            trimmed_history=trimmed_history,
-                            long_term_memory=long_term_memory,
-                            agent_key=payload.agent_key,
+                        backup_result = _attempt_local_timeout_backup_for_question(
+                            question
                         )
-                        llm_result = LLMAnswerResult(
-                            answer=timeout_answer,
-                            mode="cloud_timeout_fast_fallback",
-                        )
+                        if backup_result is not None:
+                            llm_result = backup_result
+                            timeout_answer = backup_result.answer
+                        else:
+                            timeout_answer = _build_cloud_timeout_answer(
+                                question=question,
+                                retrieved=retrieved,
+                                trimmed_history=trimmed_history,
+                                long_term_memory=long_term_memory,
+                                agent_key=payload.agent_key,
+                            )
+                            llm_result = LLMAnswerResult(
+                                answer=timeout_answer,
+                                mode="cloud_timeout_fast_fallback",
+                            )
                     elif route_mode == MODEL_ROUTE_HYBRID and cloud_enabled:
-                        timeout_answer = _build_cloud_timeout_answer(
-                            question=question,
-                            retrieved=retrieved,
-                            trimmed_history=trimmed_history,
-                            long_term_memory=long_term_memory,
-                            agent_key=payload.agent_key,
+                        backup_result = _attempt_local_timeout_backup_for_question(
+                            question
                         )
-                        llm_result = LLMAnswerResult(
-                            answer=timeout_answer,
-                            mode="hybrid_cloud_timeout_fast_fallback",
-                        )
+                        if backup_result is not None:
+                            llm_result = backup_result
+                            timeout_answer = backup_result.answer
+                        else:
+                            timeout_answer = _build_cloud_timeout_answer(
+                                question=question,
+                                retrieved=retrieved,
+                                trimmed_history=trimmed_history,
+                                long_term_memory=long_term_memory,
+                                agent_key=payload.agent_key,
+                            )
+                            llm_result = LLMAnswerResult(
+                                answer=timeout_answer,
+                                mode="hybrid_cloud_timeout_fast_fallback",
+                            )
                     else:
                         try:
                             stage_start = perf_counter()
@@ -3143,7 +3278,9 @@ def chat_completion(
             MODEL_ROUTE_LOCAL_ONLY,
             MODEL_ROUTE_RETRIEVAL_ONLY,
         }
-        sources = _build_unique_sources(retrieved) if (show_sources and retrieved) else []
+        sources = (
+            _build_unique_sources(retrieved) if (show_sources and retrieved) else []
+        )
 
     if route_mode in {MODEL_ROUTE_LOCAL_ONLY, MODEL_ROUTE_RETRIEVAL_ONLY}:
         if route_mode == MODEL_ROUTE_RETRIEVAL_ONLY:

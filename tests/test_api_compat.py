@@ -225,7 +225,7 @@ def test_bound_agent_generation_first_prefetches_kb_context(monkeypatch) -> None
         assert observed["retrieval_contexts"]
         thinking = payload["data"].get("thinking") or {}
         content = str(thinking.get("content") or "")
-        assert "已基于检索结果组织最终回答" in content
+        assert "已结合知识库证据组织回答" in content
         assert "已先由模型独立回答" not in content
 
 
@@ -315,7 +315,247 @@ def test_bound_fact_query_prefers_retrieval_led_generation(monkeypatch) -> None:
         assert len(list(observed["retrieval_contexts"] or [])) >= 2
         thinking = payload["data"].get("thinking") or {}
         content = str(thinking.get("content") or "")
-        assert "已基于检索结果组织最终回答" in content
+        assert "已结合知识库证据组织回答" in content
+
+
+def test_course_selection_is_split_from_generic_service_process() -> None:
+    from app.services import chat_service
+
+    assert (
+        chat_service._looks_like_course_selection_query("我现在要选课，给出选课要求")
+        is True
+    )
+    assert (
+        chat_service._looks_like_service_process_query("我现在要选课，给出选课要求")
+        is False
+    )
+
+
+def test_student_growth_fact_query_uses_cloud_before_local(monkeypatch) -> None:
+    from app.services import chat_service
+
+    _ensure_active_kb("学生成长助手知识库")
+    observed = {"cloud_calls": 0, "local_calls": 0}
+
+    def _fake_answer_with_llm(*args, **kwargs):
+        observed["cloud_calls"] += 1
+        assert kwargs.get("kb_hit") is True
+        assert len(list(kwargs.get("retrieval_contexts") or [])) >= 2
+        return chat_service.LLMAnswerResult(answer="云端检索增强回答。", mode="llm")
+
+    def _unexpected_local(*args, **kwargs):
+        observed["local_calls"] += 1
+        raise AssertionError(
+            "student-growth fact query should not use local model as first answer"
+        )
+
+    def _fake_retrieve(*args, **kwargs):
+        return [
+            {
+                "content": "先核对培养方案和学分要求。",
+                "source_location": "a",
+                "score": 0.9,
+            },
+            {
+                "content": "再检查先修条件和时间冲突。",
+                "source_location": "b",
+                "score": 0.88,
+            },
+        ]
+
+    def _fake_workflow(**kwargs):
+        kwargs["load_profile_fn"](kwargs["question"])
+        contexts, _retrieved = kwargs["retrieve_fn"](kwargs["question"])
+        answer = kwargs["generate_fn"](kwargs["question"], contexts, "")
+        return {
+            "error": "",
+            "system_instruction": "",
+            "answer": answer,
+            "blocked_stage": "",
+            "blocked_word": "",
+        }
+
+    monkeypatch.setattr(chat_service, "answer_with_llm", _fake_answer_with_llm)
+    monkeypatch.setattr(
+        chat_service, "generate_answer_with_local_transformer", _unexpected_local
+    )
+    monkeypatch.setattr(chat_service, "hybrid_retrieve", _fake_retrieve)
+    monkeypatch.setattr(chat_service, "run_chat_workflow_graph", _fake_workflow)
+    monkeypatch.setattr(chat_service, "_format_rule_answer", lambda _question: "")
+    monkeypatch.setattr(chat_service, "load_user_profile_context", lambda _login: "")
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "conversationId": "student-growth-cloud-first-test",
+                "agentKey": "student-growth",
+                "llmEnabled": True,
+                "localTransformerEnabled": True,
+                "messages": [{"role": "user", "content": "我现在要选课，给出选课要求"}],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        assert observed["cloud_calls"] == 1
+        assert observed["local_calls"] == 0
+
+
+def test_course_selection_local_backup_only_for_cloud_timeout(monkeypatch) -> None:
+    from app.services import chat_service
+
+    observed: dict[str, object] = {"local_calls": 0}
+
+    def _fake_answer_with_llm(*args, **kwargs):
+        return chat_service.LLMAnswerResult(
+            answer="云端超时兜底。", mode="timeout_fallback"
+        )
+
+    def _fake_local(*args, **kwargs):
+        observed["local_calls"] = int(observed["local_calls"] or 0) + 1
+        observed["local_contexts"] = list(args[1] if len(args) > 1 else [])
+        observed["local_instruction"] = str(args[6] if len(args) > 6 else "")
+        return "本地兜底选课回答。", "qwen-local", {}
+
+    def _fake_retrieve(*args, **kwargs):
+        return [
+            {
+                "content": "先核对培养方案中的本学期课程修读要求。",
+                "source_location": "doc-a",
+                "score": 0.91,
+            },
+            {
+                "content": "再确认学分上下限、先修课程和时间冲突限制。",
+                "source_location": "doc-b",
+                "score": 0.9,
+            },
+            {
+                "content": "提交前检查退补改窗口和课程容量。",
+                "source_location": "doc-c",
+                "score": 0.88,
+            },
+        ]
+
+    def _fake_workflow(**kwargs):
+        kwargs["load_profile_fn"](kwargs["question"])
+        contexts, _retrieved = kwargs["retrieve_fn"](kwargs["question"])
+        answer = kwargs["generate_fn"](kwargs["question"], contexts, "")
+        return {
+            "error": "",
+            "system_instruction": "",
+            "answer": answer,
+            "blocked_stage": "",
+            "blocked_word": "",
+        }
+
+    monkeypatch.setattr(chat_service, "answer_with_llm", _fake_answer_with_llm)
+    monkeypatch.setattr(
+        chat_service, "generate_answer_with_local_transformer", _fake_local
+    )
+    monkeypatch.setattr(chat_service, "hybrid_retrieve", _fake_retrieve)
+    monkeypatch.setattr(chat_service, "run_chat_workflow_graph", _fake_workflow)
+    monkeypatch.setattr(chat_service, "_format_rule_answer", lambda _question: "")
+    monkeypatch.setattr(chat_service, "load_user_profile_context", lambda _login: "")
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "conversationId": "course-selection-timeout-local-backup-test",
+                "agentKey": "student-growth",
+                "llmEnabled": True,
+                "localTransformerEnabled": True,
+                "messages": [{"role": "user", "content": "我现在要选课，给出选课要求"}],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        answer = payload["data"]["choices"][0]["message"]["content"]
+        assert "本地兜底选课回答" in answer
+        assert int(observed["local_calls"] or 0) == 1
+        assert len(list(observed.get("local_contexts") or [])) >= 2
+        assert "禁止输出挂失/补办/冻结" in str(observed.get("local_instruction") or "")
+
+
+def test_non_course_fact_timeout_does_not_trigger_local_backup(monkeypatch) -> None:
+    from app.services import chat_service
+
+    observed = {"local_calls": 0}
+
+    def _fake_answer_with_llm(*args, **kwargs):
+        return chat_service.LLMAnswerResult(
+            answer="云端超时后的稳定回答。",
+            mode="timeout_fallback",
+        )
+
+    def _unexpected_local(*args, **kwargs):
+        observed["local_calls"] += 1
+        raise AssertionError("non-course fact timeout should not trigger local backup")
+
+    def _fake_retrieve(*args, **kwargs):
+        return [
+            {
+                "content": "博士生最长修业年限应以学院和研究生院最新规定为准。",
+                "source_location": "doc-x",
+                "score": 0.86,
+            },
+            {
+                "content": "涉及延期时需关注申请条件和审批流程。",
+                "source_location": "doc-y",
+                "score": 0.84,
+            },
+        ]
+
+    def _fake_workflow(**kwargs):
+        kwargs["load_profile_fn"](kwargs["question"])
+        contexts, _retrieved = kwargs["retrieve_fn"](kwargs["question"])
+        answer = kwargs["generate_fn"](kwargs["question"], contexts, "")
+        return {
+            "error": "",
+            "system_instruction": "",
+            "answer": answer,
+            "blocked_stage": "",
+            "blocked_word": "",
+        }
+
+    monkeypatch.setattr(chat_service, "answer_with_llm", _fake_answer_with_llm)
+    monkeypatch.setattr(
+        chat_service,
+        "generate_answer_with_local_transformer",
+        _unexpected_local,
+    )
+    monkeypatch.setattr(chat_service, "hybrid_retrieve", _fake_retrieve)
+    monkeypatch.setattr(chat_service, "run_chat_workflow_graph", _fake_workflow)
+    monkeypatch.setattr(chat_service, "_format_rule_answer", lambda _question: "")
+    monkeypatch.setattr(chat_service, "load_user_profile_context", lambda _login: "")
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "conversationId": "non-course-fact-timeout-test",
+                "agentKey": "student-growth",
+                "llmEnabled": True,
+                "localTransformerEnabled": True,
+                "messages": [{"role": "user", "content": "博士最长修业年限一般是多少"}],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        assert (
+            "云端超时后的稳定回答"
+            in payload["data"]["choices"][0]["message"]["content"]
+        )
+        assert observed["local_calls"] == 0
 
 
 def test_private_reasoning_is_hidden_from_thinking_payload(monkeypatch) -> None:
