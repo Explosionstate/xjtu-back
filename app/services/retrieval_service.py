@@ -6,7 +6,7 @@ from copy import deepcopy
 import time
 
 from rank_bm25 import BM25Okapi
-from sqlalchemy import desc, select
+from sqlalchemy import asc, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -28,7 +28,53 @@ _RETRIEVAL_CACHE: dict[str, tuple[float, list[dict], list[dict]]] = {}
 
 def _tokenize(text: str) -> list[str]:
     cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", (text or "").lower())
-    return [tok for tok in cleaned.split() if tok]
+    raw_tokens = [tok for tok in cleaned.split() if tok]
+    if not raw_tokens:
+        return []
+    tokens: list[str] = []
+    for token in raw_tokens:
+        if re.search(r"[\u4e00-\u9fff]", token) and len(token) >= 4:
+            # Add bi-grams to improve Chinese lexical retrieval recall.
+            tokens.extend(token[idx : idx + 2] for idx in range(0, len(token) - 1))
+            if len(token) <= 6:
+                tokens.append(token)
+        else:
+            tokens.append(token)
+    return tokens or raw_tokens
+
+
+def _sanitize_retrieval_content(content: str, max_chars: int = 360) -> str:
+    text = str(content or "").replace("\r\n", "\n")
+    if not text.strip():
+        return ""
+    text = re.sub(r"(?m)^#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\|?\s*[-:|]{3,}\s*\|?$", "", text)
+    text = re.sub(r"(?m)^[-*•]\s*", "", text)
+    text = re.sub(r"(?m)^\d+[.)、]\s*", "", text)
+    text = re.sub(r"(?m)^第[一二三四五六七八九十0-9]+[章节条点、.)]\s*", "", text)
+    text = text.replace("\\.", ".").replace("\\-", "-").replace("\\+", "+")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip(" ：:;；,，。-")
+    if len(text) < 12:
+        return ""
+    if (
+        len(text) <= 30
+        and not re.search(r"[，。；：:,.!?？！]", text)
+        and any(token in text for token in ("概述", "总结", "目录", "要点", "说明", "资源"))
+    ):
+        return ""
+    return text[:max_chars]
+
+
+def _is_low_quality_chunk(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return True
+    if len(text) < 12:
+        return True
+    if text.count("|") >= 8 and len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", text)) < 18:
+        return True
+    return False
 
 
 def _is_small_talk(query: str) -> bool:
@@ -293,6 +339,15 @@ def _keyword_bonus(query: str, source_location: str, content: str) -> float:
         ("政策", 0.10),
         ("条例", 0.08),
         ("预警", 0.09),
+        ("焦虑", 0.14),
+        ("期末", 0.12),
+        ("考试", 0.12),
+        ("社团", 0.10),
+        ("帮扶", 0.12),
+        ("辅导", 0.12),
+        ("心理", 0.12),
+        ("作息", 0.10),
+        ("时间", 0.08),
     ]
     for keyword, weight in keyword_weights:
         if keyword in q and (keyword in src or keyword in body[:260]):
@@ -447,9 +502,14 @@ def hybrid_retrieve_with_debug(
 
     local_top_k = int(top_k)
     local_threshold = float(score_threshold)
+    local_alpha = float(alpha)
     if _is_student_growth_agent(agent_key):
-        local_top_k = min(local_top_k, 12)
-        local_threshold = max(local_threshold, 0.22)
+        local_top_k = min(max(local_top_k, 4), 12)
+        if _is_stress_conflict_query(query_text) or _is_guidance_query(query_text):
+            local_threshold = min(local_threshold, 0.14)
+            local_alpha = max(local_alpha, 0.72)
+        else:
+            local_threshold = max(local_threshold, 0.18)
     precise_fact_query = _is_precise_fact_query(query_text)
     query_is_complex = _is_complex_retrieval_query(query_text)
 
@@ -466,7 +526,10 @@ def hybrid_retrieve_with_debug(
     stmt = select(DocumentChunk).where(DocumentChunk.kb_id.in_(unique_kb_ids))
     if document_ids:
         stmt = stmt.where(DocumentChunk.document_id.in_(document_ids))
-    stmt = stmt.order_by(desc(DocumentChunk.created_at)).limit(max_candidates)
+    stmt = stmt.order_by(
+        asc(DocumentChunk.document_id),
+        asc(DocumentChunk.chunk_index),
+    ).limit(max_candidates)
     chunk_rows = list(db.scalars(stmt).all())
 
     chunk_rows = [
@@ -481,20 +544,31 @@ def hybrid_retrieve_with_debug(
             row for row in chunk_rows if not _looks_like_noise_chunk(row.content)
         ]
     chunk_rows = [row for row in chunk_rows if not _is_mojibake_text(row.content)]
+    cleaned_content_map: dict[str, str] = {}
+    sanitized_rows: list[DocumentChunk] = []
+    for row in chunk_rows:
+        cleaned = _sanitize_retrieval_content(row.content)
+        if _is_low_quality_chunk(cleaned):
+            continue
+        cleaned_content_map[row.id] = cleaned
+        sanitized_rows.append(row)
+    chunk_rows = sanitized_rows
 
     if _is_guidance_query(query_text) or _is_academic_query(query_text):
         q_tokens = set(_tokenize(query_text))
         if q_tokens:
             chunk_rows = sorted(
                 chunk_rows,
-                key=lambda row: _token_overlap_score(q_tokens, row.content),
+                key=lambda row: _token_overlap_score(
+                    q_tokens, cleaned_content_map.get(row.id, "")
+                ),
                 reverse=True,
             )[: max(64, local_top_k * 16)]
 
     if not chunk_rows:
         return [], []
 
-    corpus = [row.content for row in chunk_rows]
+    corpus = [cleaned_content_map[row.id] for row in chunk_rows]
     corpus_tokens = [_tokenize(text) for text in corpus]
     query_tokens = _tokenize(query_text)
     if not query_tokens:
@@ -567,7 +641,7 @@ def hybrid_retrieve_with_debug(
     if fusion_mode == "rrf":
         fused = _fuse_rrf(bm25_ranked, dense_ranked)
     else:
-        fused = _fuse_weighted(bm25_scores, dense_scores, alpha=alpha)
+        fused = _fuse_weighted(bm25_scores, dense_scores, alpha=local_alpha)
 
     sorted_ids = [
         chunk_id
@@ -577,14 +651,27 @@ def hybrid_retrieve_with_debug(
     results: list[dict] = []
     seen_content_keys: set[str] = set()
     source_counter: dict[str, int] = defaultdict(int)
-    source_limit = 1 if precise_fact_query else 2
+    source_variety = len(
+        {
+            str(row.source_location or "").strip().lower()
+            for row in chunk_rows
+            if str(row.source_location or "").strip()
+        }
+    )
+    if source_variety <= 1:
+        source_limit = max(6, local_top_k * 2)
+    else:
+        source_limit = 1 if precise_fact_query else 2
     for chunk_id in sorted_ids:
         row = chunk_cache[chunk_id]
+        cleaned_content = cleaned_content_map.get(chunk_id, "")
+        if _is_low_quality_chunk(cleaned_content):
+            continue
         source_key = str(row.source_location or "").strip().lower()
         if source_key:
             if source_counter.get(source_key, 0) >= source_limit:
                 continue
-        compact_key = re.sub(r"\s+", " ", str(row.content or "").strip().lower())[:120]
+        compact_key = re.sub(r"\s+", " ", cleaned_content.strip().lower())[:120]
         if compact_key and compact_key in seen_content_keys:
             continue
         if compact_key:
@@ -596,7 +683,7 @@ def hybrid_retrieve_with_debug(
                 "chunk_id": row.id,
                 "document_id": row.document_id,
                 "kb_id": row.kb_id,
-                "content": row.content,
+                "content": cleaned_content,
                 "source_location": row.source_location,
                 "bm25_raw": float(bm25_scores.get(chunk_id, 0.0)),
                 "bm25_norm": float(bm25_norm.get(chunk_id, 0.0)),

@@ -29,6 +29,7 @@ from app.services.llm_service import LLMAnswerResult, answer_with_llm
 from app.services.local_transformer_service import (
     generate_answer_with_local_transformer,
     local_transformer_backup_available,
+    local_transformer_runtime,
 )
 from app.services.external_profile_service import load_user_profile_context
 from app.services.academic_service import get_my_academic_analysis
@@ -137,6 +138,20 @@ def _compact_text(text: str, max_chars: int) -> str:
     return compact[:max_chars]
 
 
+def _clean_retrieval_snippet(text: str, max_chars: int = 240) -> str:
+    cleaned = str(text or "").replace("\r\n", "\n")
+    cleaned = re.sub(r"(?m)^#{1,6}\s*", "", cleaned)
+    cleaned = re.sub(r"(?m)^\|?\s*[-:|]{3,}\s*\|?$", "", cleaned)
+    cleaned = re.sub(r"(?m)^[-*•]\s*", "", cleaned)
+    cleaned = re.sub(r"(?m)^\d+[.)、]\s*", "", cleaned)
+    cleaned = cleaned.replace("\\.", ".").replace("\\-", "-").replace("\\+", "+")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.strip(" ：:;；,，。-")
+    if len(cleaned) < 10:
+        return ""
+    return cleaned[:max_chars]
+
+
 _INTERNAL_TEMPLATE_MARKERS = (
     "回答类型",
     "复杂度模式",
@@ -181,6 +196,26 @@ def _strip_internal_template_text(raw_answer: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _polish_final_answer_text(raw_answer: str) -> str:
+    text = _strip_internal_template_text(raw_answer)
+    if not text:
+        return ""
+    text = re.sub(r"[；;]{2,}", "；", text)
+    text = re.sub(r"(?m)^(先给结论|先给判断|先直接回答|先给答复)\s*[:：]\s*", "", text)
+    text = text.replace("可参考线索：", "依据线索：")
+    cleaned_lines: list[str] = []
+    for line in text.splitlines():
+        current = line.strip()
+        if not current:
+            if cleaned_lines and cleaned_lines[-1]:
+                cleaned_lines.append("")
+            continue
+        if cleaned_lines and current == cleaned_lines[-1]:
+            continue
+        cleaned_lines.append(current)
+    return "\n".join(cleaned_lines).strip()
+
+
 _PRIVATE_REASONING_MARKERS = (
     "Thinking Process:",
     "Analyze the Request:",
@@ -199,6 +234,29 @@ def _looks_like_private_reasoning_text(text: str | None) -> bool:
     if any(marker.lower() in lowered for marker in _PRIVATE_REASONING_MARKERS):
         return True
     return bool(re.search(r"(?m)^\d+\.\s+\*\*.*\*\*", content))
+
+
+def _looks_like_low_quality_local_answer(answer: str | None) -> bool:
+    text = _compact_text(str(answer or ""), 240).lower()
+    if not text or len(text) < 18:
+        return True
+    refusal_markers = (
+        "我无法提供",
+        "无法提供您所请求",
+        "我不能提供",
+        "对不起，我无法",
+        "抱歉，我无法",
+        "无法获取",
+        "请提供更多信息",
+        "如果您能提供更多",
+        "作为ai",
+        "没有足够信息",
+    )
+    if any(marker in text for marker in refusal_markers):
+        return True
+    if text.count("human:") >= 1 or text.count("assistant:") >= 2:
+        return True
+    return False
 
 
 def _extract_answer_sections(
@@ -460,7 +518,7 @@ def _format_final_user_answer(
     if not evidence and retrieved:
         snippets: list[str] = []
         for item in retrieved[:2]:
-            text = _compact_text(str(item.get("content") or ""), 80)
+            text = _clean_retrieval_snippet(str(item.get("content") or ""), 100)
             if not text:
                 continue
             if text in snippets:
@@ -807,10 +865,10 @@ def _format_retrieval_contexts_for_generation(
     formatted: list[str] = []
     seen: set[str] = set()
     for item in retrieved:
-        content = _compact_text(str(item.get("content") or ""), 320)
+        content = _clean_retrieval_snippet(str(item.get("content") or ""), 280)
         if not content:
             continue
-        key = content[:120]
+        key = content[:120].lower()
         if key in seen:
             continue
         seen.add(key)
@@ -828,7 +886,7 @@ def _build_unique_sources(
     order: list[str] = []
     for item in retrieved:
         source_location = str(item.get("source_location") or "").strip()
-        content = str(item.get("content") or "").strip()
+        content = _clean_retrieval_snippet(str(item.get("content") or ""), 240)
         if not source_location or not content:
             continue
         score_raw = item.get("score")
@@ -929,7 +987,7 @@ def _fast_retrieval_answer(
         refs = "、".join(source_names) if source_names else "当前检索命中文档"
         highlights: list[str] = []
         for item in retrieved[:4]:
-            text = _compact_text(str(item.get("content") or ""), 80)
+            text = _clean_retrieval_snippet(str(item.get("content") or ""), 80)
             if text:
                 highlights.append(text)
         if not highlights:
@@ -939,8 +997,7 @@ def _fast_retrieval_answer(
 
     snippets: list[str] = []
     for item in retrieved[:3]:
-        content = str(item.get("content") or "").strip().replace("\n", " ")
-        content = re.sub(r"\s+", " ", content)
+        content = _clean_retrieval_snippet(str(item.get("content") or ""), 140)
         if any(
             token in content.lower()
             for token in ["create table", "insert into", " key `", "idx_"]
@@ -949,40 +1006,41 @@ def _fast_retrieval_answer(
         if content:
             snippets.append(content[:140])
     if not snippets:
-        snippets = ["已检索到相关片段，但可直接引用的文本较少。"]
-    evidence_hint = _compact_text(snippets[0], 42)
+        snippets = ["已检索到相关片段，但可直接引用的高置信文本较少。"]
+    focus = _compact_text(question, 42) or "当前问题"
+    evidence_hint = _compact_text(snippets[0], 60)
     if _looks_like_service_process_query(question):
         return (
-            f"先直接答复：像“{question[:28]}”这类事务，建议你先立刻完成挂失/冻结，再尽快按学校流程补办或线下处理（{agent_focus}）。\n"
-            "1) 先做止损：优先挂失，避免继续消费或被他人使用；\n"
-            "2) 再查办理入口：看学校的一卡通平台、校园服务大厅或后勤/信息化服务窗口；\n"
-            "3) 如果需要补办，记下是否要带证件、缴费以及领取地点；\n"
-            f"可参考线索：{evidence_hint or '当前命中资料'}。"
+            f"针对“{focus}”，建议先做止损，再按学校流程办理（{agent_focus}）。\n"
+            "1) 先挂失/冻结，避免继续损失；\n"
+            "2) 再确认办理入口与材料要求；\n"
+            "3) 记录办理进度，必要时联系辅导员或服务窗口协助。\n"
+            f"当前依据线索：{evidence_hint or '已命中相关资料'}。"
         )
     if style == "comparison":
         return (
-            f"先给结论：围绕“{question[:26]}”，建议先按“投入产出、可持续性、机会成本”三维比较（{agent_focus}）。\n"
-            "1) 给两条路径分别打分（1-5分）；2) 用你最在意的维度做加权；3) 先执行高分路径2周试运行。\n"
-            f"可参考线索：{evidence_hint or '当前命中资料'}。"
+            f"围绕“{focus}”，更稳妥的做法是先做对比再决策（{agent_focus}）。\n"
+            "建议从投入产出、可持续性和机会成本三项打分，先试运行高分方案 1-2 周，再按真实反馈调整。\n"
+            f"依据线索：{evidence_hint or '已命中相关资料'}。"
         )
     if style == "analysis":
         return (
-            f"先给判断：关于“{question[:26]}”，当前核心矛盾通常不是“选错路”，而是“没有验证闭环”（{agent_focus}）。\n"
-            "建议按“目标-行动-反馈”三步推进：先定4周目标，再做每周动作，最后按结果调整方向。\n"
-            f"可参考线索：{evidence_hint or '当前命中资料'}。"
+            f"关于“{focus}”，当前更关键的是先建立验证闭环，而不是一次性做最终选择（{agent_focus}）。\n"
+            "可以按“目标-行动-反馈”推进：先定短周期目标，再做每周动作，最后根据结果迭代。\n"
+            f"依据线索：{evidence_hint or '已命中相关资料'}。"
         )
     if style == "guidance":
         return (
-            f"先给结论：对“{question[:26]}”，先别急着二选一，先做 4 周验证更稳妥（{agent_focus}）。\n"
-            "1) 每周固定两个时间块分别验证两条路线；\n"
-            "2) 每周末记录投入时长、完成度和反馈结果；\n"
-            "3) 第4周按真实反馈决策，而不是按情绪决策。\n"
-            f"可参考线索：{evidence_hint or '当前命中资料'}。"
+            f"针对“{focus}”，建议先做短周期验证，再做二选一决策（{agent_focus}）。\n"
+            "1) 每周固定时间验证不同方案；\n"
+            "2) 记录投入时长、完成度和真实反馈；\n"
+            "3) 到第 4 周按结果决策，不按情绪决策。\n"
+            f"依据线索：{evidence_hint or '已命中相关资料'}。"
         )
     return (
-        f"先给答复：围绕“{question[:28]}”，建议先做短周期验证再做长期承诺（{agent_focus}）。\n"
-        "你可以先跑 2-4 周小步试错，再根据结果决定下一阶段主路径。\n"
-        f"可参考线索：{evidence_hint or '当前命中资料'}。"
+        f"围绕“{focus}”，建议先做 2-4 周小步验证，再决定长期路径（{agent_focus}）。\n"
+        "先用小范围实践获取反馈，再把时间投入到效果更稳定的方向上。\n"
+        f"依据线索：{evidence_hint or '已命中相关资料'}。"
     )
 
 
@@ -2262,7 +2320,7 @@ def chat_completion(
                 retrieval_ms += stage_ms
                 preview = ""
                 if retrieved:
-                    first_hit = _compact_text(
+                    first_hit = _clean_retrieval_snippet(
                         str(retrieved[0].get("content") or ""), 80
                     )
                     preview = f"已命中 {len(retrieved)} 条相关资料，正在组织答案。" + (
@@ -2477,6 +2535,12 @@ def chat_completion(
                         6,
                         min(LOCAL_GENERATION_TIMEOUT_SECONDS, generation_timeout - 2),
                     )
+                    try:
+                        runtime = local_transformer_runtime()
+                        if str(runtime.get("active_device") or "").lower() != "cuda":
+                            local_timeout = min(local_timeout, 8 if is_complex_query else 6)
+                    except Exception:
+                        logger.debug("local runtime check failed", exc_info=True)
                     local_executor = ThreadPoolExecutor(max_workers=1)
                     local_future = local_executor.submit(
                         generate_answer_with_local_transformer,
@@ -2492,10 +2556,30 @@ def chat_completion(
                         answer, model_reference, _metrics = local_future.result(
                             timeout=local_timeout
                         )
-                        llm_result = LLMAnswerResult(
-                            answer=answer,
-                            mode=f"local_transformer:{model_reference}",
-                        )
+                        if _looks_like_low_quality_local_answer(answer):
+                            recovered_answer = (
+                                _fast_retrieval_answer(
+                                    runtime_question,
+                                    retrieved,
+                                    agent_key=payload.agent_key,
+                                )
+                                if retrieved
+                                else _build_kb_bounded_shortfall_answer(
+                                    runtime_question,
+                                    trimmed_history,
+                                    route_mode=route_mode,
+                                    agent_key=payload.agent_key,
+                                )
+                            )
+                            llm_result = LLMAnswerResult(
+                                answer=recovered_answer,
+                                mode=f"local_transformer:low_quality_rewrite:{model_reference}",
+                            )
+                        else:
+                            llm_result = LLMAnswerResult(
+                                answer=answer,
+                                mode=f"local_transformer:{model_reference}",
+                            )
                     except FuturesTimeoutError:
                         logger.warning(
                             "local transformer timeout: conversation=%s agent=%s",
@@ -3062,13 +3146,16 @@ def chat_completion(
         sources = _build_unique_sources(retrieved) if (show_sources and retrieved) else []
 
     if route_mode in {MODEL_ROUTE_LOCAL_ONLY, MODEL_ROUTE_RETRIEVAL_ONLY}:
-        answer = _format_final_user_answer(
-            answer=answer,
-            question=question,
-            question_mode=question_mode,
-            retrieved=retrieved,
-            agent_key=payload.agent_key,
-        )
+        if route_mode == MODEL_ROUTE_RETRIEVAL_ONLY:
+            answer = _format_final_user_answer(
+                answer=answer,
+                question=question,
+                question_mode=question_mode,
+                retrieved=retrieved,
+                agent_key=payload.agent_key,
+            )
+        else:
+            answer = _polish_final_answer_text(answer)
 
     blocked_output_word = detect_sensitive_text(answer, sensitive_words)
     if blocked_output_word:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+import re
 
 from docx import Document as DocxDocument
 from fastapi import UploadFile
@@ -40,13 +41,54 @@ def _extract_text_from_path(path: Path, ext: str) -> str:
 
 
 def _split_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+    cleaned_text = _clean_document_text(text)
+    if not cleaned_text:
+        return []
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""],
     )
-    chunks = [item.strip() for item in splitter.split_text(text) if item.strip()]
+    raw_chunks = [item.strip() for item in splitter.split_text(cleaned_text) if item.strip()]
+    chunks: list[str] = []
+    seen: set[str] = set()
+    for item in raw_chunks:
+        normalized = _normalize_chunk_text(item)
+        if not normalized:
+            continue
+        key = normalized[:120].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        chunks.append(normalized)
     return chunks
+
+
+def _clean_document_text(text: str) -> str:
+    body = str(text or "").replace("\r\n", "\n")
+    if not body.strip():
+        return ""
+    body = body.replace("\\.", ".").replace("\\-", "-").replace("\\+", "+")
+    body = re.sub(r"(?m)^```.*$", "", body)
+    body = re.sub(r"(?m)^#{1,6}\s*", "", body)
+    body = re.sub(r"(?m)^\|?\s*[-:|]{3,}\s*\|?$", "", body)
+    body = re.sub(r"(?m)^[-*•]\s*", "", body)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    return body.strip()
+
+
+def _normalize_chunk_text(text: str) -> str:
+    compact = str(text or "").replace("\r\n", "\n")
+    compact = re.sub(r"(?m)^#{1,6}\s*", "", compact)
+    compact = re.sub(r"(?m)^\|?\s*[-:|]{3,}\s*\|?$", "", compact)
+    compact = re.sub(r"(?m)^[-*•]\s*", "", compact)
+    compact = re.sub(r"(?m)^\d+[.)、]\s*", "", compact)
+    compact = compact.replace("`", "")
+    compact = re.sub(r"\s+", " ", compact).strip()
+    compact = compact.strip(" ：:;；,，。-")
+    if len(compact) < 12:
+        return ""
+    return compact
 
 
 def _looks_like_mojibake(text: str) -> bool:
