@@ -16,12 +16,14 @@ from app.schemas.academic import (
     AcademicAnalysisResponse,
     AcademicCohortComparisonItem,
     AcademicCourseScoreItem,
+    AcademicInterpretResponse,
     AcademicMetricSnapshot,
     AcademicStudentProfile,
     AcademicTermInfo,
     AcademicTrendPoint,
     AcademicWarningItem,
 )
+from app.services.llm_service import answer_with_llm
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,105 @@ _STAGE_TIMEOUT_SECONDS = {
     "cohort": 10,
     "warnings": 6,
 }
+
+
+def interpret_my_academic_analysis(
+    login_name: str,
+    term_code: str | None = None,
+    detail_level: str = "brief",
+) -> AcademicInterpretResponse:
+    level = (
+        "detailed" if (detail_level or "").strip().lower() == "detailed" else "brief"
+    )
+    analysis = get_my_academic_analysis(login_name=login_name, term_code=term_code)
+    context = _build_academic_tool_context(analysis)
+    instruction = (
+        "你是学生成长助手的学业分析解读模块。"
+        "必须基于工具返回数据回答，不得编造未提供字段。"
+        "输出固定结构：风险结论、触发证据、处置优先级（P0/P1/P2）、本周动作、待补数据。"
+    )
+    prompt = "学业分析解读（简版）" if level == "brief" else "学业分析解读（详细版）"
+    result = answer_with_llm(
+        question=prompt,
+        contexts=[context],
+        llm_enabled=True,
+        system_instruction=instruction,
+        agent_key="student-growth",
+        timeout_seconds=95 if level == "brief" else 125,
+        allow_general_knowledge=False,
+        retry_on_failure=False,
+        kb_hit=True,
+        retrieval_contexts=[context],
+        background_contexts=[],
+    )
+    interpretation = (result.answer or "").strip()
+    if (
+        not interpretation
+        or result.mode == "disabled"
+        or "timeout_fallback" in result.mode
+        or "error_fallback" in result.mode
+    ):
+        interpretation = _build_interpretation_fallback(analysis)
+    return AcademicInterpretResponse(
+        analysis=analysis,
+        interpretation=interpretation,
+        detail_level=level,
+        llm_mode=result.mode,
+        tool_used=True,
+        generated_at=datetime.now(timezone.utc),
+    )
+
+
+def _build_academic_tool_context(analysis: AcademicAnalysisResponse) -> str:
+    warning_lines = [
+        f"- {item.warning_type} | level={item.warning_level} | score={item.risk_score:.2f}"
+        for item in analysis.warnings[:3]
+    ]
+    finding_lines = [f"- {str(item)[:80]}" for item in analysis.key_findings[:3]]
+    recommendation_lines = [
+        f"- {str(item)[:80]}" for item in analysis.recommendations[:3]
+    ]
+    missing_fields: list[str] = []
+    if not analysis.course_scores:
+        missing_fields.append("课程成绩明细")
+    if not analysis.trend:
+        missing_fields.append("趋势数据")
+    if not analysis.cohort_comparison:
+        missing_fields.append("同维度对比")
+    missing_text = "、".join(missing_fields) if missing_fields else "无"
+    return "\n".join(
+        [
+            "工具结果：get_my_academic_analysis",
+            f"学生：{analysis.student.student_name}（{analysis.student.login_name}）",
+            f"学期：{analysis.term.term_name}（{analysis.term.term_code}）",
+            f"风险等级：{analysis.risk_level}",
+            f"指标：均分={analysis.metrics.avg_score}，GPA={analysis.metrics.gpa}，"
+            f"不及格门数={analysis.metrics.failed_course_count}，已修学分={analysis.metrics.total_credits}，"
+            f"通过学分={analysis.metrics.passed_credits}",
+            "预警明细：",
+            *(warning_lines or ["- 无预警数据"]),
+            "关键发现：",
+            *(finding_lines or ["- 无关键发现"]),
+            "建议：",
+            *(recommendation_lines or ["- 无建议"]),
+            f"待补数据：{missing_text}",
+        ]
+    )
+
+
+def _build_interpretation_fallback(analysis: AcademicAnalysisResponse) -> str:
+    risk = analysis.risk_level or "unknown"
+    findings = "；".join(analysis.key_findings[:2]) or "暂无可直接引用的关键发现"
+    recommendations = (
+        "；".join(analysis.recommendations[:2]) or "建议先补齐缺失字段后再做精细判断"
+    )
+    return (
+        "风险结论：当前学业风险需持续关注。\n"
+        f"触发证据：{findings}。\n"
+        "处置优先级：P0 处理高风险事项；P1 跟进中风险问题；P2 持续监测低风险变化。\n"
+        f"本周动作：{recommendations}。\n"
+        f"待补数据：课程明细/趋势/同维度对比缺失时请优先补全（当前风险等级：{risk}）。"
+    )
 
 
 def _find_cached_analysis_any_term(

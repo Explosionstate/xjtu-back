@@ -755,3 +755,67 @@ def test_retrieval_debug_uses_agent_bound_kb_scope(monkeypatch) -> None:
         assert observed["kb_ids"] == [bound_kb_id]
         assert observed["document_ids"] is None
         assert observed["agent_key"] == "report-assistant"
+
+
+def test_risk_warning_calls_academic_tool_in_chat(monkeypatch) -> None:
+    from app.services import chat_service
+    from app.services.tooling_service import ToolCallResult
+
+    observed: dict[str, object] = {"tool_called": 0, "tool_context_seen": False}
+
+    def _fake_answer_with_llm(*args, **kwargs):
+        contexts = list(kwargs.get("contexts") or [])
+        observed["tool_context_seen"] = any(
+            "[TOOL:get_academic_analysis]" in str(item) for item in contexts
+        )
+        return chat_service.LLMAnswerResult(answer="已给出预警分级。", mode="llm")
+
+    def _fake_tool_call(tool_name, arguments, *, current_user):
+        observed["tool_called"] = int(observed["tool_called"] or 0) + 1
+        return ToolCallResult(
+            name=str(tool_name),
+            ok=True,
+            data={"risk_level": "high", "key_findings": ["最近两周缺勤次数上升"]},
+            error=None,
+            source="academic_service",
+            generated_at="2026-03-26T10:43:34+00:00",
+        )
+
+    def _fake_retrieve(*args, **kwargs):
+        return [
+            {
+                "content": "预警分级相关：一级预警、二级预警、三级预警、触发条件。",
+                "source_location": "risk-kb.md",
+                "score": 0.91,
+            }
+        ]
+
+    monkeypatch.setattr(chat_service, "answer_with_llm", _fake_answer_with_llm)
+    monkeypatch.setattr(chat_service, "execute_tool_call", _fake_tool_call)
+    monkeypatch.setattr(chat_service, "hybrid_retrieve", _fake_retrieve)
+    monkeypatch.setattr(chat_service, "_format_rule_answer", lambda _question: "")
+
+    with TestClient(app) as client:
+        token = _login_and_get_token(client)
+        resp = client.post(
+            "/api/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "conversationId": "risk-warning-tool-call-test",
+                "agentKey": "risk-warning",
+                "llmEnabled": True,
+                "localTransformerEnabled": False,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "请识别近两周学习行为中的预警信号并给出处置优先级",
+                    }
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["status"] is True
+        assert "已给出预警分级" in payload["data"]["choices"][0]["message"]["content"]
+        assert int(observed["tool_called"] or 0) >= 1
+        assert observed["tool_context_seen"] is True

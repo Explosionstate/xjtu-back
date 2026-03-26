@@ -34,6 +34,10 @@ from app.services.local_transformer_service import (
 from app.services.external_profile_service import load_user_profile_context
 from app.services.academic_service import get_my_academic_analysis
 from app.services.langgraph_service import run_chat_workflow_graph
+from app.services.tooling_service import (
+    TOOL_GET_ACADEMIC_ANALYSIS,
+    execute_tool_call,
+)
 from app.services.retrieval_config_service import get_effective_retrieval_config
 from app.services.retrieval_service import hybrid_retrieve
 from app.services.sensitive_service import (
@@ -151,6 +155,29 @@ def _clean_retrieval_snippet(text: str, max_chars: int = 240) -> str:
     if len(cleaned) < 10:
         return ""
     return cleaned[:max_chars]
+
+
+def _should_enable_academic_tool(
+    *,
+    agent_key: str | None,
+    question_mode: str,
+    current_user: User | None,
+) -> bool:
+    if current_user is None:
+        return False
+    if question_mode not in {QUESTION_MODE_FACT, QUESTION_MODE_ACADEMIC}:
+        return False
+    normalized_agent = normalize_agent_key(agent_key)
+    return normalized_agent in {
+        "teacher-assistant",
+        "counselor-ideology",
+        "risk-warning",
+        "report-assistant",
+    }
+
+
+def _format_tool_context(result: dict[str, Any]) -> str:
+    return f"[TOOL:{TOOL_GET_ACADEMIC_ANALYSIS}] {result}"
 
 
 _INTERNAL_TEMPLATE_MARKERS = (
@@ -2084,6 +2111,12 @@ def _build_summary_thinking(
         elif llm_result is not None and "fallback" in llm_result.mode:
             steps.append("生成阶段出现波动，已切换为稳定的知识库约束答复。")
 
+    if (
+        llm_result is not None
+        and f"tool_{TOOL_GET_ACADEMIC_ANALYSIS}" in llm_result.mode
+    ):
+        steps.append("已调用学业分析工具，并基于结构化数据组织回答。")
+
     total_seconds = max(0.1, round(total_ms / 1000, 1))
     steps.append(f"本次处理约耗时 {total_seconds} 秒。")
     if workflow_stage and workflow_stage not in {"init", "done"}:
@@ -2723,6 +2756,30 @@ def chat_completion(
                     compact = _compact_text(item, 280)
                     if compact:
                         background_contexts.append(compact)
+
+            tool_contexts: list[str] = []
+            tool_mode_suffix = ""
+            if _should_enable_academic_tool(
+                agent_key=payload.agent_key,
+                question_mode=question_mode,
+                current_user=current_user,
+            ):
+                tool_result = execute_tool_call(
+                    TOOL_GET_ACADEMIC_ANALYSIS,
+                    {"term_code": None},
+                    current_user=current_user,
+                )
+                if tool_result.ok and tool_result.data:
+                    tool_contexts.append(
+                        _format_tool_context(
+                            {
+                                "source": tool_result.source,
+                                "generated_at": tool_result.generated_at,
+                                "data": tool_result.data,
+                            }
+                        )
+                    )
+                    tool_mode_suffix = f":tool_{TOOL_GET_ACADEMIC_ANALYSIS}"
             prefer_model_answer = cloud_direct_mode or (
                 generation_first_mode
                 and not is_academic_analysis
@@ -2751,6 +2808,8 @@ def chat_completion(
                     else []
                 )
                 llm_retrieval_contexts = retrieval_contexts
+            if tool_contexts:
+                generation_contexts = (tool_contexts + generation_contexts)[:5]
 
             def _attempt_local_timeout_backup() -> LLMAnswerResult | None:
                 return _attempt_local_timeout_backup_for_question(runtime_question)
@@ -3082,6 +3141,16 @@ def chat_completion(
                 )
             stage_ms = int((perf_counter() - stage_start) * 1000)
             llm_ms += stage_ms
+            if (
+                llm_result is not None
+                and tool_mode_suffix
+                and tool_mode_suffix not in llm_result.mode
+            ):
+                llm_result = LLMAnswerResult(
+                    answer=llm_result.answer,
+                    mode=f"{llm_result.mode}{tool_mode_suffix}",
+                    reasoning=llm_result.reasoning,
+                )
             _emit_progress(
                 progress_callback,
                 type="stage",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -97,4 +98,18 @@ class AcademicAnalysisResponse(BaseModel):
     risk_level: str
     key_findings: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    generated_at: datetime
+
+
+class AcademicInterpretRequest(BaseModel):
+    term_code: str | None = Field(default=None, max_length=32)
+    detail_level: Literal["brief", "detailed"] = "brief"
+
+
+class AcademicInterpretResponse(BaseModel):
+    analysis: AcademicAnalysisResponse
+    interpretation: str
+    detail_level: Literal["brief", "detailed"]
+    llm_mode: str
+    tool_used: bool = True
     generated_at: datetime
