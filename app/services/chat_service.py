@@ -1116,6 +1116,7 @@ def _build_local_failure_answer(
 ) -> str:
     focus = _compact_text(question, 42) or "当前问题"
     style = _detect_answer_style(question)
+    normalized_agent = normalize_agent_key(agent_key)
     snippets: list[str] = []
     for item in retrieved[:5]:
         content = _clean_retrieval_snippet(str(item.get("content") or ""), 72)
@@ -1127,6 +1128,75 @@ def _build_local_failure_answer(
         if len(snippets) >= 3:
             break
     evidence_text = "；".join(snippets[:2]) if snippets else "已命中相关资料"
+
+    if normalized_agent == "policy-qa":
+        q = (question or "").strip().lower()
+        if any(
+            token in q for token in ["指导思想", "总体要求", "基本原则", "核心要求"]
+        ):
+            return (
+                f"根据当前知识库，围绕“{focus}”可归纳为以下要点：\n"
+                "1) 坚持立德树人，把价值引领贯穿人才培养全过程；\n"
+                "2) 推动思想政治教育与专业教育同向同行，形成协同育人；\n"
+                "3) 强化课程体系与教学环节中的育人责任，促进常态化落实。\n"
+                f"参考线索：{evidence_text}。"
+            )
+        if any(
+            token in q for token in ["申请", "流程", "步骤", "材料", "条件", "怎么"]
+        ):
+            return (
+                f"围绕“{focus}”，建议按政策办理口径执行：\n"
+                "1) 先核对适用对象与资格条件；\n"
+                "2) 再准备申请材料并按规定时间提交；\n"
+                "3) 关注审核、公示与结果复核节点，必要时及时补正材料。\n"
+                f"参考线索：{evidence_text}。"
+            )
+        return (
+            f"围绕“{focus}”，先给出政策问答版结论。\n"
+            "结论：应以政策原文口径回答核心要求，并明确适用范围与落实路径。\n"
+            "建议：如需精确条款，可继续指定“条文/章节/关键词”，我将按知识库逐条展开。\n"
+            f"参考线索：{evidence_text}。"
+        )
+
+    if normalized_agent == "teacher-assistant":
+        return (
+            f"围绕“{focus}”，先给教师助教场景可执行方案。\n"
+            "1) 教学目标：明确本节课/本周课要达成的知识点与能力目标；\n"
+            "2) 课堂活动：按“讲解-练习-反馈”组织活动，并预留5-10分钟即时诊断；\n"
+            "3) 评估方式：设置1项过程性检查+1项结果性检查，便于课后复盘；\n"
+            "4) 下一步：根据学生完成度调整作业梯度和下节课重难点。\n"
+            f"参考线索：{evidence_text}。"
+        )
+
+    if normalized_agent == "counselor-ideology":
+        return (
+            f"围绕“{focus}”，先按辅导员思政处置节奏推进。\n"
+            "1) 风险分级：先判断事件影响范围与紧急程度，避免先入为主定性；\n"
+            "2) 沟通策略：优先一对一谈心，采用低冲突表达并核对关键事实；\n"
+            "3) 协同对象：按需联动班主任、任课教师、家长或心理中心；\n"
+            "4) 复盘节点：48小时内记录处置结果与后续跟进计划。\n"
+            f"参考线索：{evidence_text}。"
+        )
+
+    if normalized_agent == "risk-warning":
+        return (
+            f"围绕“{focus}”，先给学情预警版结论与优先级。\n"
+            "1) 预警信号：先列出近两周关键异常（如缺勤、成绩波动、任务逾期）；\n"
+            "2) 风险等级：按高/中/低分级，并标注每项触发依据；\n"
+            "3) 处置优先级：P0先做高风险个体干预，P1处理中风险群体跟进，P2持续监测低风险；\n"
+            "4) 本周动作：明确责任人、完成时限和复核节点。\n"
+            f"参考线索：{evidence_text}。"
+        )
+
+    if normalized_agent == "report-assistant":
+        return (
+            f"围绕“{focus}”，先按学情报告结构输出可确认内容。\n"
+            "1) 结论摘要：先给当前阶段最重要的1-2条判断；\n"
+            "2) 关键数据：列出可核验指标及其变化方向；\n"
+            "3) 风险点：按影响程度列出主要风险与受影响对象；\n"
+            "4) 建议与下一步：给本周行动清单，并标注待确认数据项。\n"
+            f"参考线索：{evidence_text}。"
+        )
 
     if _looks_like_course_selection_query(question):
         return (
